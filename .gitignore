@@ -1,0 +1,47 @@
+# Private agent instructions, plans, and session notes
+AGENTS.md
+AGENTS.override.md
+CLAUDE.md
+GEMINI.md
+CLAUDE.local.md
+MEMORY.md
+PRD.md
+TRD.md
+ADR.md
+TASKS.md
+PLAN.md
+DONE.md
+PROGRESS.md
+HANDOFF.md
+/.codex/
+/.claude/
+/.gemini/
+/docs/private/
+/private/
+/scratch/
+
+# Local credentials and environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Dependencies, builds, and local tool caches
+node_modules/
+dist/
+build/
+coverage/
+target/
+.build-cache/
+.cache/
+*.log
+
+# Operating system and editor state
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
