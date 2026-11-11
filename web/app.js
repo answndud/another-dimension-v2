@@ -44,6 +44,10 @@ function show(view) {
   inviteView.hidden = view !== 'invite';
   chatView.hidden = view !== 'chat';
   historyDetail.hidden = view !== 'history';
+  if (view !== 'active') {
+    document.querySelector('#added-code').value = '';
+    document.querySelector('#added-code-view').hidden = true;
+  }
 }
 
 async function request(path, body = '', session = token) {
@@ -333,6 +337,39 @@ document.querySelector('#continue').addEventListener('click', async () => {
   generatedCode.value = '';
   message.textContent = '';
   try { await refreshIdentity(); } catch (_) { message.textContent = '신원을 확인할 수 없습니다.'; }
+});
+
+document.querySelector('#add-code').addEventListener('click', async () => {
+  message.textContent = '';
+  try {
+    const response = await request('/api/identity/add-code');
+    if (!response.ok) { message.textContent = '새 코드를 발급하지 못했습니다.'; return; }
+    document.querySelector('#added-code').value = await response.text();
+    document.querySelector('#added-code-view').hidden = false;
+  } catch (_) { message.textContent = '새 코드를 발급하지 못했습니다.'; }
+});
+
+document.querySelector('#copy-added-code').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(document.querySelector('#added-code').value);
+    message.textContent = '코드를 복사했습니다.';
+  } catch (_) { message.textContent = '복사하지 못했습니다. 코드를 직접 선택해 복사하세요.'; }
+});
+
+document.querySelector('#save-added-code').addEventListener('click', () => {
+  const value = document.querySelector('#added-code').value;
+  const url = URL.createObjectURL(new Blob([value + '\n'], { type: 'text/plain;charset=utf-8' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'another-dimension-code.txt';
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  message.textContent = '코드 저장을 요청했습니다.';
+});
+
+document.querySelector('#close-added-code').addEventListener('click', () => {
+  document.querySelector('#added-code').value = '';
+  document.querySelector('#added-code-view').hidden = true;
 });
 
 loginForm.addEventListener('submit', async (event) => {

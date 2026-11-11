@@ -1,3 +1,5 @@
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -5,12 +7,18 @@ use std::fs::File;
 use std::io::{self, Read};
 use zeroize::Zeroizing;
 
-const PREFIX: &str = "AD1-";
+const LEGACY_PREFIX: &str = "AD1-";
+const PREFIX: &str = "AD2-";
 const KEY_CONTEXT: &[u8] = b"another-dimension-v2/identity-signing/v1";
+const CODE_KEY_CONTEXT: &[u8] = b"another-dimension-v2/identity-code-wrap/v2";
+const CODE_AAD: &[u8] = b"another-dimension-v2/identity-code/v2";
 const STORAGE_KEY_CONTEXT: &[u8] = b"another-dimension-v2/local-history/v1";
+const CODE_KEY_BYTES: usize = 32;
+const NONCE_BYTES: usize = 12;
+const WRAPPED_SEED_BYTES: usize = 32 + 16;
 
 pub struct Identity {
-    // Retained for future independently derived storage keys; never persisted here.
+    // Retained for independently derived storage and identity-code wrapping keys.
     _seed: Zeroizing<[u8; 32]>,
     signing_key: SigningKey,
 }
@@ -19,30 +27,81 @@ impl Identity {
     pub fn create() -> io::Result<(Self, Zeroizing<String>)> {
         let mut seed = Zeroizing::new([0_u8; 32]);
         File::open("/dev/urandom")?.read_exact(seed.as_mut())?;
-        let mut code = Zeroizing::new(String::with_capacity(PREFIX.len() + 64));
-        code.push_str(PREFIX);
-        for byte in seed.iter() {
-            use std::fmt::Write;
-            write!(&mut *code, "{byte:02x}").expect("writing to a string cannot fail");
-        }
-        Ok((Self::from_seed(seed), code))
+        let identity = Self::from_seed(seed);
+        let code = identity.create_access_code()?;
+        Ok((identity, code))
     }
 
     pub fn from_code(code: &str) -> Option<Self> {
-        let hex = code.strip_prefix(PREFIX)?;
-        if hex.len() != 64
-            || !hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
+        if code.len() != LEGACY_PREFIX.len() + 64 && code.len() != 190 {
             return None;
         }
-        let mut seed = Zeroizing::new([0_u8; 32]);
-        for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
-            let digit = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
-            seed[index] = digit(chunk[0]) << 4 | digit(chunk[1]);
+        if let Some(hex) = code.strip_prefix(LEGACY_PREFIX) {
+            let mut seed = Zeroizing::new([0; 32]);
+            seed.copy_from_slice(&decode_hex::<32>(hex)?);
+            return Some(Self::from_seed(seed));
         }
-        Some(Self::from_seed(seed))
+
+        let mut parts = code.split('-');
+        if parts.next()? != "AD2" {
+            return None;
+        }
+        let wrap_key = Zeroizing::new(decode_hex::<CODE_KEY_BYTES>(parts.next()?)?);
+        let nonce = decode_hex::<NONCE_BYTES>(parts.next()?)?;
+        let ciphertext = decode_hex::<WRAPPED_SEED_BYTES>(parts.next()?)?;
+        if parts.next().is_some() {
+            return None;
+        }
+        let key = derive_code_key(&wrap_key);
+        let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref()).ok()?;
+        let seed = Zeroizing::new(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: &ciphertext,
+                        aad: CODE_AAD,
+                    },
+                )
+                .ok()?,
+        );
+        if seed.len() != 32 {
+            return None;
+        }
+        let mut seed_bytes = Zeroizing::new([0; 32]);
+        seed_bytes.copy_from_slice(seed.as_slice());
+        Some(Self::from_seed(seed_bytes))
+    }
+
+    /// Creates a fresh code that unlocks the same identity seed.
+    /// Older codes remain valid because they contain their own encrypted seed envelope.
+    pub fn create_access_code(&self) -> io::Result<Zeroizing<String>> {
+        let mut wrap_key = Zeroizing::new([0_u8; CODE_KEY_BYTES]);
+        let mut nonce = [0_u8; NONCE_BYTES];
+        File::open("/dev/urandom")?.read_exact(wrap_key.as_mut())?;
+        File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+        let key = derive_code_key(&wrap_key);
+        let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
+            .map_err(|_| io::Error::other("identity code key unavailable"))?;
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: self._seed.as_ref(),
+                    aad: CODE_AAD,
+                },
+            )
+            .map_err(|_| io::Error::other("identity code generation failed"))?;
+        let mut code = Zeroizing::new(String::with_capacity(
+            PREFIX.len() + (CODE_KEY_BYTES + NONCE_BYTES + ciphertext.len() + 2) * 2,
+        ));
+        code.push_str(PREFIX);
+        append_hex(&mut code, wrap_key.as_ref());
+        code.push('-');
+        append_hex(&mut code, &nonce);
+        code.push('-');
+        append_hex(&mut code, &ciphertext);
+        Ok(code)
     }
 
     fn from_seed(seed: Zeroizing<[u8; 32]>) -> Self {
@@ -75,12 +134,49 @@ impl Identity {
     }
 
     pub(crate) fn storage_key(&self) -> Zeroizing<[u8; 32]> {
-        let mut key = Zeroizing::new([0_u8; 32]);
+        let mut key = Zeroizing::new([0; 32]);
         Hkdf::<Sha256>::new(Some(&self.public_key()), self._seed.as_ref())
             .expand(STORAGE_KEY_CONTEXT, key.as_mut())
             .expect("32 bytes is a valid HKDF output length");
         key
     }
+}
+
+fn derive_code_key(wrap_key: &[u8; CODE_KEY_BYTES]) -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0; 32]);
+    Hkdf::<Sha256>::new(None, wrap_key)
+        .expand(CODE_KEY_CONTEXT, key.as_mut())
+        .expect("32 bytes is a valid HKDF output length");
+    key
+}
+
+fn append_hex(output: &mut String, bytes: &[u8]) {
+    use std::fmt::Write;
+    for byte in bytes {
+        write!(output, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+}
+
+fn decode_hex<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    if hex.len() != N * 2
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut output = [0; N];
+    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let digit = |byte: u8| {
+            if byte <= b'9' {
+                byte - b'0'
+            } else {
+                byte - b'a' + 10
+            }
+        };
+        output[index] = digit(pair[0]) << 4 | digit(pair[1]);
+    }
+    Some(output)
 }
 
 #[cfg(test)]

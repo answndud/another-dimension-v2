@@ -73,6 +73,22 @@
       <h2>로그인됨</h2>
       <p>신원 ID</p><p id="identity-id" class="identity-id"></p>
       <div class="panel">
+        <h3>추가 개인 접속 코드 발급</h3>
+        <p class="meta">새 코드는 같은 신원과 대화 기록을 사용합니다. 기존 백업도 그대로 열 수 있습니다. 이 기능은 유출된 코드를 무효화하지 않습니다. 서버 없이 기존 코드의 복사본을 폐기할 수 없으므로 이전 코드는 계속 유효하며, 이전 코드를 가진 사람도 이 신원에 로그인할 수 있습니다.</p>
+        <button id="add-code" type="button">새 코드 추가 발급</button>
+      </div>
+      <section id="added-code-view" hidden>
+        <h3>새 개인 접속 코드</h3>
+        <p>새 코드를 별도로 저장하세요. 화면을 닫으면 다시 표시할 수 없습니다. 이전 코드도 계속 유효합니다.</p>
+        <label for="added-code">개인 접속 코드</label>
+        <textarea id="added-code" readonly spellcheck="false"></textarea>
+        <div class="actions">
+          <button id="copy-added-code" type="button">코드 복사</button>
+          <button id="save-added-code" type="button">TXT 저장</button>
+          <button id="close-added-code" type="button">닫기</button>
+        </div>
+      </section>
+      <div class="panel">
         <h3>대화 연결</h3>
         <p class="meta">상대와 초대 코드를 별도 경로로 공유하세요. 초대 코드를 가진 사람은 방에 참가할 수 있습니다.</p>
         <div class="actions"><button id="create-invite" type="button" class="primary">초대 코드 생성</button></div>

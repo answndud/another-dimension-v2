@@ -463,6 +463,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/identity/login HTTP/1.1"
             | "POST /api/identity/status HTTP/1.1"
             | "POST /api/identity/logout HTTP/1.1"
+            | "POST /api/identity/add-code HTTP/1.1"
             | "POST /api/invite/create HTTP/1.1"
             | "POST /api/chat/create HTTP/1.1"
             | "POST /api/chat/join HTTP/1.1"
@@ -545,6 +546,21 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     if first == "POST /api/disconnect HTTP/1.1" {
         state.sessions.remove(index);
         return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
+    }
+    if first == "POST /api/identity/add-code HTTP/1.1" {
+        let Some(identity) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        if !body.is_empty() {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        let code = identity.create_access_code()?;
+        return respond(
+            &mut stream,
+            "200 OK",
+            "text/plain; charset=utf-8",
+            code.as_bytes(),
+        );
     }
     if first == "POST /api/invite/create HTTP/1.1" {
         if state.identity.is_none() {
