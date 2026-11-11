@@ -601,6 +601,49 @@ impl RelayRendezvous {
         RelaySession::from_socket(self.socket, SessionTransport::new(active))
     }
 
+    /// Establish a fresh relationship secret after both users have confirmed.
+    /// This versioned exchange must only be used when both peers support it.
+    pub fn confirm_with_contact(
+        mut self,
+        verification: VerificationPending,
+    ) -> Result<(RelaySession, Zeroizing<[u8; 32]>), RelayError> {
+        if verification.role() != self.role {
+            return Err(HandshakeError::RoleMismatch.into());
+        }
+        let (pending, frame) = verification.confirm_after_user_check()?;
+        self.publish_frame(&frame)?;
+        let peer_frame = self.receive_frame("peer confirmation")?;
+        let mut active = pending.receive_peer_confirmation(&peer_frame)?;
+        let mut secret = Zeroizing::new([0; 32]);
+        const OFFER: &[u8] = b"AD-CONTACT-OFFER-1";
+        const ACK: &[u8] = b"AD-CONTACT-ACK-1";
+        match self.role {
+            Role::Responder => {
+                File::open("/dev/urandom")?.read_exact(secret.as_mut())?;
+                let mut offer = Zeroizing::new(Vec::from(OFFER));
+                offer.extend_from_slice(secret.as_ref());
+                self.publish_frame(&active.write_message(&offer)?)?;
+                let reply = active.read_message(&self.receive_frame("contact acknowledgement")?)?;
+                if reply != ACK {
+                    return Err(RelayError::InvalidEvent);
+                }
+            }
+            Role::Initiator => {
+                let offer =
+                    Zeroizing::new(active.read_message(&self.receive_frame("contact offer")?)?);
+                if offer.len() != OFFER.len() + 32 || !offer.starts_with(OFFER) {
+                    return Err(RelayError::InvalidEvent);
+                }
+                secret.copy_from_slice(&offer[OFFER.len()..]);
+                self.publish_frame(&active.write_message(ACK)?)?;
+            }
+        }
+        Ok((
+            RelaySession::from_socket(self.socket, SessionTransport::new(active))?,
+            secret,
+        ))
+    }
+
     fn publish_frame(&mut self, frame: &[u8]) -> Result<(), RelayError> {
         if frame.is_empty() || frame.len() > MAX_BOOTSTRAP_FRAME {
             return Err(RelayError::InvalidEvent);
@@ -1021,7 +1064,14 @@ mod tests {
                 .unwrap(),
             fingerprint
         );
-        let mut session = rendezvous.confirm(verification).unwrap();
+        let (mut session, secret) = rendezvous.confirm_with_contact(verification).unwrap();
+        fingerprint_tx.send(secret.to_vec()).unwrap();
+        assert_eq!(
+            fingerprint_rx
+                .recv_timeout(Duration::from_secs(35))
+                .unwrap(),
+            secret.as_ref()
+        );
         barrier.wait();
         session.send(crate::PEER_HEARTBEAT_FRAME).unwrap();
         let heartbeat_deadline = Instant::now() + Duration::from_secs(15);
