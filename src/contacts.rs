@@ -14,6 +14,7 @@ use std::path::Path;
 use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 8] = b"ADPEER1\0";
+const BACKUP_MAGIC: &[u8; 8] = b"ADCONB1\0";
 
 /// The rendezvous secret is separate from the initial invite and identifies
 /// a single verified relationship. Never display or log it.
@@ -137,6 +138,73 @@ pub fn load(
     })
 }
 
+/// Exports a verified relationship, including its peer key, encrypted to the
+/// same personal identity. This does not include the personal access code.
+pub fn export_backup(identity: &Identity, contact: &VerifiedContact) -> io::Result<Vec<u8>> {
+    let mut nonce = [0; 12];
+    File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+    let mut plain = Zeroizing::new(Vec::with_capacity(64));
+    plain.extend_from_slice(&contact.peer_key);
+    plain.extend_from_slice(contact.rendezvous_secret.as_ref());
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(key(identity).as_ref()).map_err(io::Error::other)?;
+    let encrypted = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &plain,
+                aad: BACKUP_MAGIC,
+            },
+        )
+        .map_err(|_| io::Error::other("contact backup encryption failed"))?;
+    let mut backup = Vec::with_capacity(8 + 12 + encrypted.len());
+    backup.extend_from_slice(BACKUP_MAGIC);
+    backup.extend_from_slice(&nonce);
+    backup.extend_from_slice(&encrypted);
+    Ok(backup)
+}
+
+/// Authenticates before writing; a conflicting local record is preserved.
+pub fn import_backup(directory: &Path, identity: &Identity, backup: &[u8]) -> io::Result<[u8; 32]> {
+    if backup.len() != 8 + 12 + 64 + 16 || &backup[..8] != BACKUP_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid contact backup",
+        ));
+    }
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(key(identity).as_ref()).map_err(io::Error::other)?;
+    let plain = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(&backup[8..20]),
+                Payload {
+                    msg: &backup[20..],
+                    aad: BACKUP_MAGIC,
+                },
+            )
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "contact backup authentication failed",
+                )
+            })?,
+    );
+    let mut peer_key = [0; 32];
+    peer_key.copy_from_slice(&plain[..32]);
+    let mut rendezvous_secret = Zeroizing::new([0; 32]);
+    rendezvous_secret.copy_from_slice(&plain[32..]);
+    save(
+        directory,
+        identity,
+        &VerifiedContact {
+            peer_key,
+            rendezvous_secret,
+        },
+    )?;
+    Ok(peer_key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +223,22 @@ mod tests {
             rendezvous_secret: Zeroizing::new([8; 32]),
         };
         save(&path, &identity, &record).unwrap();
+        let backup = export_backup(&identity, &record).unwrap();
+        let restored = path.join("restored");
+        assert!(import_backup(&restored, &other, &backup).is_err());
+        let mut tampered_backup = backup.clone();
+        *tampered_backup.last_mut().unwrap() ^= 1;
+        assert!(import_backup(&restored, &identity, &tampered_backup).is_err());
+        assert_eq!(
+            import_backup(&restored, &identity, &backup).unwrap(),
+            [7; 32]
+        );
+        assert_eq!(
+            *load(&restored, &identity, [7; 32])
+                .unwrap()
+                .rendezvous_secret,
+            [8; 32]
+        );
         assert_eq!(
             *load(&path, &identity, [7; 32]).unwrap().rendezvous_secret,
             [8; 32]
@@ -169,7 +253,7 @@ mod tests {
             }
         )
         .is_err());
-        let file = fs::read_dir(&path).unwrap().next().unwrap().unwrap().path();
+        let file = path.join(format!("{}.peer", filename(&identity, &[7; 32])));
         let mut bytes = fs::read(&file).unwrap();
         *bytes.last_mut().unwrap() ^= 1;
         fs::write(file, bytes).unwrap();
