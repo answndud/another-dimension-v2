@@ -3,6 +3,8 @@ pub mod history;
 mod identity;
 pub mod relay;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use identity::Identity;
 use relay::{InviteCode, RelayRendezvous, RelaySession, RelayUpdate, DEFAULT_RELAY};
 use std::collections::{HashMap, HashSet};
@@ -19,7 +21,7 @@ use zeroize::Zeroizing;
 const PAGE: &[u8] = include_bytes!("../web/index.html");
 const SCRIPT: &[u8] = include_bytes!("../web/app.js");
 const MAX_HEADER: usize = 8192;
-const MAX_BODY: usize = 1_048_576;
+const MAX_BODY: usize = 24 * 1024 * 1024;
 const CODE_LIFETIME: Duration = Duration::from_secs(300);
 const MAX_ATTEMPTS: u8 = 5;
 
@@ -296,6 +298,15 @@ fn peer_chat_active(state: &State, peer_id: &str) -> bool {
     })
 }
 
+fn any_chat_active(state: &State) -> bool {
+    state.chats.values().any(|operation| {
+        operation
+            .snapshot
+            .lock()
+            .is_ok_and(|snapshot| !matches!(snapshot.phase, "closed" | "failed" | "disconnected"))
+    })
+}
+
 fn update_closed_chat_history(
     state: &State,
     peer_id: &str,
@@ -465,6 +476,8 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/history/delete-messages HTTP/1.1"
             | "POST /api/history/delete-range HTTP/1.1"
             | "POST /api/history/delete-conversation HTTP/1.1"
+            | "POST /api/history/export-backup HTTP/1.1"
+            | "POST /api/history/import-backup HTTP/1.1"
     ) {
         return reject(&mut stream, "404 Not Found");
     }
@@ -479,12 +492,13 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     };
     let first = first.to_owned();
     let auth = authorization.map(str::to_owned);
+    let mut body_buffer = Zeroizing::new([0; 8192]);
     while request.len() < header_end + body_len {
-        let n = stream.read(buffer.as_mut())?;
+        let n = stream.read(body_buffer.as_mut())?;
         if n == 0 {
             return reject(&mut stream, "400 Bad Request");
         }
-        request.extend_from_slice(&buffer[..n]);
+        request.extend_from_slice(&body_buffer[..n]);
     }
     if request.len() != header_end + body_len {
         return reject(&mut stream, "400 Bad Request");
@@ -842,6 +856,50 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         }
         update_closed_chat_history(&state, body, None);
         return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
+    }
+    if first == "POST /api/history/export-backup HTTP/1.1" {
+        let Some(identity) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        if peer_chat_active(&state, body) {
+            return reject(&mut stream, "409 Conflict");
+        }
+        let backup = match history::History::export_backup(identity, body) {
+            Ok(backup) => backup,
+            Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+        };
+        return respond(
+            &mut stream,
+            "200 OK",
+            "text/plain; charset=utf-8",
+            BASE64.encode(backup).as_bytes(),
+        );
+    }
+    if first == "POST /api/history/import-backup HTTP/1.1" {
+        let Some(identity) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        if any_chat_active(&state) {
+            return reject(&mut stream, "409 Conflict");
+        }
+        let backup = match BASE64.decode(body) {
+            Ok(backup) if backup.len() <= 16 * 1024 * 1024 => backup,
+            _ => return reject(&mut stream, "400 Bad Request"),
+        };
+        let (peer_id, count) = match history::History::import_backup(identity, &backup) {
+            Ok(result) => result,
+            Err(_) => return reject(&mut stream, "400 Bad Request"),
+        };
+        if let Ok((_, messages, _)) = history::History::open(identity, &peer_id) {
+            update_closed_chat_history(&state, &peer_id, Some(&messages));
+        }
+        let payload = serde_json::json!({ "peerId": peer_id, "messageCount": count }).to_string();
+        return respond(
+            &mut stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            payload.as_bytes(),
+        );
     }
     match first.as_str() {
         "POST /api/identity/create HTTP/1.1" => {

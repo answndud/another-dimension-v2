@@ -6,6 +6,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::collections::HashSet;
 use std::fs::{create_dir_all, rename, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -16,16 +17,18 @@ const MAGIC: &[u8; 8] = b"ADLOG1\0\0";
 const MAX_MESSAGE_BYTES: usize = 4096;
 const NONCE_BYTES: usize = 12;
 const INDEX_MAGIC: &[u8; 8] = b"ADIDX1\0\0";
+const BACKUP_MAGIC: &[u8; 8] = b"ADBACK1\0";
+const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
 static INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StoredMessage {
     pub unix_time: u64,
     pub sender: MessageSender,
     pub text: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MessageSender {
     Me,
     Other,
@@ -128,6 +131,8 @@ impl History {
         let result = (|| {
             let mut file = OpenOptions::new()
                 .create_new(true)
+                .read(true)
+                .append(true)
                 .write(true)
                 .open(&temporary)?;
             set_private_file(&file)?;
@@ -143,15 +148,8 @@ impl History {
                 file.write_all(&record)?;
             }
             file.sync_all()?;
-            drop(file);
             rename(&temporary, &self.path)?;
-            let mut replacement = OpenOptions::new()
-                .read(true)
-                .append(true)
-                .open(&self.path)?;
-            set_private_file(&replacement)?;
-            replacement.seek(SeekFrom::End(0))?;
-            self.file = replacement;
+            self.file = file;
             self.next_index = messages.len() as u64;
             Ok(())
         })();
@@ -215,6 +213,133 @@ impl History {
         }
         Ok(())
     }
+
+    pub fn export_backup(identity: &Identity, peer_id: &str) -> io::Result<Vec<u8>> {
+        let (_, messages, _) = Self::open(identity, peer_id)?;
+        let mut payload = Zeroizing::new(Vec::new());
+        let peer = decode_peer_id(peer_id)?;
+        payload.extend_from_slice(&peer);
+        let count = u32::try_from(messages.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many messages"))?;
+        payload.extend_from_slice(&count.to_be_bytes());
+        for message in messages {
+            let text = message.text.as_bytes();
+            payload.extend_from_slice(&message.unix_time.to_be_bytes());
+            payload.push(match message.sender {
+                MessageSender::Me => 0,
+                MessageSender::Other => 1,
+            });
+            payload.extend_from_slice(&(text.len() as u32).to_be_bytes());
+            payload.extend_from_slice(text);
+            if payload.len() + BACKUP_MAGIC.len() + NONCE_BYTES + 16 > MAX_BACKUP_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "backup is too large",
+                ));
+            }
+        }
+        let nonce = random_nonce()?;
+        let key = derive_backup_key(&identity.storage_key());
+        let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
+            .map_err(|_| io::Error::other("backup key unavailable"))?;
+        let encrypted = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &payload,
+                    aad: &backup_aad(identity),
+                },
+            )
+            .map_err(|_| io::Error::other("backup encryption failed"))?;
+        let mut backup = Vec::with_capacity(BACKUP_MAGIC.len() + NONCE_BYTES + encrypted.len());
+        backup.extend_from_slice(BACKUP_MAGIC);
+        backup.extend_from_slice(&nonce);
+        backup.extend_from_slice(&encrypted);
+        Ok(backup)
+    }
+
+    pub fn import_backup(identity: &Identity, backup: &[u8]) -> io::Result<(String, usize)> {
+        if backup.len() > MAX_BACKUP_BYTES
+            || backup.len() < BACKUP_MAGIC.len() + NONCE_BYTES + 16
+            || &backup[..BACKUP_MAGIC.len()] != BACKUP_MAGIC
+        {
+            return Err(invalid_data("invalid backup file"));
+        }
+        let nonce_start = BACKUP_MAGIC.len();
+        let key = derive_backup_key(&identity.storage_key());
+        let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
+            .map_err(|_| invalid_data("invalid backup key"))?;
+        let payload = Zeroizing::new(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(&backup[nonce_start..nonce_start + NONCE_BYTES]),
+                    Payload {
+                        msg: &backup[nonce_start + NONCE_BYTES..],
+                        aad: &backup_aad(identity),
+                    },
+                )
+                .map_err(|_| invalid_data("backup authentication failed"))?,
+        );
+        if payload.len() < 36 {
+            return Err(invalid_data("invalid backup payload"));
+        }
+        let peer_id = hex_encode(&payload[..32]);
+        let count = u32::from_be_bytes(payload[32..36].try_into().expect("fixed slice")) as usize;
+        if count > 1_000_000 || count > (payload.len() - 36) / 13 {
+            return Err(invalid_data("too many backup messages"));
+        }
+        let mut cursor = 36;
+        let mut imported = Vec::with_capacity(count);
+        for _ in 0..count {
+            if payload.len().saturating_sub(cursor) < 13 {
+                return Err(invalid_data("truncated backup message"));
+            }
+            let unix_time =
+                u64::from_be_bytes(payload[cursor..cursor + 8].try_into().expect("fixed slice"));
+            cursor += 8;
+            let sender = match payload[cursor] {
+                0 => MessageSender::Me,
+                1 => MessageSender::Other,
+                _ => return Err(invalid_data("invalid backup sender")),
+            };
+            cursor += 1;
+            let text_len =
+                u32::from_be_bytes(payload[cursor..cursor + 4].try_into().expect("fixed slice"))
+                    as usize;
+            cursor += 4;
+            if text_len == 0
+                || text_len > MAX_MESSAGE_BYTES
+                || payload.len().saturating_sub(cursor) < text_len
+            {
+                return Err(invalid_data("invalid backup message length"));
+            }
+            let text = std::str::from_utf8(&payload[cursor..cursor + text_len])
+                .map_err(|_| invalid_data("backup text is not UTF-8"))?
+                .to_owned();
+            cursor += text_len;
+            imported.push(StoredMessage {
+                unix_time,
+                sender,
+                text,
+            });
+        }
+        if cursor != payload.len() {
+            return Err(invalid_data("unexpected backup data"));
+        }
+
+        let (mut history, existing, _) = Self::open(identity, &peer_id)?;
+        let mut merged = existing;
+        let mut seen: HashSet<StoredMessage> = merged.iter().cloned().collect();
+        for message in imported {
+            if seen.insert(message.clone()) {
+                merged.push(message);
+            }
+        }
+        merged.sort_by_key(|message| message.unix_time);
+        let count = merged.len();
+        history.replace(&merged)?;
+        Ok((peer_id, count))
+    }
 }
 
 fn validate_peer_id(peer_id: &str) -> io::Result<()> {
@@ -225,6 +350,33 @@ fn validate_peer_id(peer_id: &str) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn decode_peer_id(peer_id: &str) -> io::Result<[u8; 32]> {
+    validate_peer_id(peer_id)?;
+    let mut bytes = [0; 32];
+    for (index, pair) in peer_id.as_bytes().chunks_exact(2).enumerate() {
+        bytes[index] = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
+    }
+    Ok(bytes)
+}
+
+fn derive_backup_key(key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let mut backup_key = Zeroizing::new([0; 32]);
+    Hkdf::<Sha256>::new(None, key)
+        .expand(
+            b"another-dimension-v2/portable-backup/v1",
+            backup_key.as_mut(),
+        )
+        .expect("32 bytes is a valid HKDF output length");
+    backup_key
+}
+
+fn backup_aad(identity: &Identity) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(BACKUP_MAGIC.len() + 32);
+    aad.extend_from_slice(BACKUP_MAGIC);
+    aad.extend_from_slice(&identity.public_key());
+    aad
 }
 
 fn encode_record(

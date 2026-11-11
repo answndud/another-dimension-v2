@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+base64 = "=0.22.1"
 chacha20poly1305 = { version = "=0.10.1", features = ["std"] }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "zeroize"] }
 hkdf = "=0.12.4"

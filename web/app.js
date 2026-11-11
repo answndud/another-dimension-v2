@@ -465,6 +465,51 @@ document.querySelector('#history-export').addEventListener('click', () => {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 });
 
+document.querySelector('#history-backup-export').addEventListener('click', async () => {
+  try {
+    const response = await request('/api/history/export-backup', selectedHistoryPeer);
+    if (response.status === 409) { message.textContent = '먼저 해당 대화의 연결을 종료한 뒤 다시 시도하세요.'; return; }
+    if (!response.ok) { message.textContent = '암호화 백업을 만들지 못했습니다.'; return; }
+    const binary = atob(await response.text());
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'another-dimension-backup.adbak';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    message.textContent = '암호화 백업 파일을 저장했습니다.';
+  } catch (_) {
+    message.textContent = '암호화 백업을 저장하지 못했습니다.';
+  }
+});
+
+document.querySelector('#history-backup-import').addEventListener('click', async () => {
+  const file = document.querySelector('#history-backup-file').files[0];
+  if (!file) { message.textContent = '가져올 백업 파일을 선택하세요.'; return; }
+  if (file.size > 16 * 1024 * 1024) { message.textContent = '백업 파일은 16 MB 이하여야 합니다.'; return; }
+  try {
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+    const encoded = String(dataUrl).slice(String(dataUrl).indexOf(',') + 1);
+    const response = await request('/api/history/import-backup', encoded);
+    if (response.status === 409) { message.textContent = '먼저 모든 대화 연결을 종료한 뒤 다시 시도하세요.'; return; }
+    if (!response.ok) { message.textContent = '파일이 손상되었거나 다른 신원용 백업입니다.'; return; }
+    const result = await response.json();
+    document.querySelector('#history-backup-file').value = '';
+    await refreshHistoryList();
+    await openHistory(result.peerId);
+    message.textContent = '백업을 확인해 기존 기록과 병합했습니다.';
+  } catch (_) {
+    message.textContent = '백업 파일을 읽지 못했습니다.';
+  }
+});
+
 async function reloadHistoryDetail() {
   await openHistory(selectedHistoryPeer);
   await refreshHistoryList();

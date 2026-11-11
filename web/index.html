@@ -126,7 +126,12 @@
       <div class="actions">
         <button id="history-back" type="button">대화 목록</button>
         <button id="history-export" type="button">TXT 저장</button>
+        <button id="history-backup-export" type="button">암호화 백업 저장</button>
       </div>
+      <p class="meta">백업은 개인 접속 코드로 암호화됩니다. 다른 기기에서 가져오려면 같은 코드를 사용하세요. 별도 비밀번호는 아직 지원하지 않습니다.</p>
+      <label for="history-backup-file">암호화 백업 가져오기</label>
+      <input id="history-backup-file" type="file" accept=".adbak,application/octet-stream">
+      <button id="history-backup-import" type="button">파일 가져오기</button>
       <label for="message-filter">메시지 검색</label>
       <input id="message-filter" type="search" autocomplete="off">
       <div class="panel">
