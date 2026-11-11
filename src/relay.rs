@@ -30,7 +30,7 @@ use zeroize::Zeroizing;
 const EVENT_KIND: u16 = 20_000;
 pub const DEFAULT_RELAY: &str = "wss://relay.primal.net";
 const SUBSCRIPTION_ID: &str = "ad-v2-live";
-const INVITE_PREFIX: &str = "ADI2-";
+const INVITE_PREFIX: &str = "ADI3-";
 const INVITE_TOPIC_INFO: &[u8] = b"another-dimension-v2/invite-topic/v2";
 const INVITE_KEY_INFO: &[u8] = b"another-dimension-v2/invite-relay-key/v2";
 const INVITE_DOMAIN: &[u8] = b"another-dimension-v2/invite-code/v2";
@@ -364,6 +364,9 @@ pub struct InviteCode {
 }
 
 impl InviteCode {
+    pub(crate) fn from_reconnect_secret(secret: Zeroizing<[u8; 32]>) -> Self {
+        Self::from_secret(secret)
+    }
     pub fn generate() -> io::Result<Self> {
         let mut secret = Zeroizing::new([0_u8; 32]);
         File::open("/dev/urandom")?.read_exact(secret.as_mut())?;
@@ -952,9 +955,9 @@ mod tests {
     #[test]
     fn invite_codes_mark_the_current_rendezvous_protocol_version() {
         let invite = InviteCode::generate().unwrap();
-        assert!(invite.code().starts_with("ADI2-"));
+        assert!(invite.code().starts_with("ADI3-"));
         assert!(InviteCode::parse(invite.code()).is_some());
-        let legacy = invite.code().replacen("ADI2-", "ADI1-", 1);
+        let legacy = invite.code().replacen("ADI3-", "ADI2-", 1);
         assert!(InviteCode::parse(&legacy).is_none());
     }
 
@@ -1108,5 +1111,41 @@ mod tests {
             }
         }
         assert_eq!(received.as_deref(), Some(expected));
+        drop(session);
+        fingerprint_tx.send(identity.public_key().to_vec()).unwrap();
+        let peer_key: [u8; 32] = fingerprint_rx
+            .recv_timeout(Duration::from_secs(35))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let invite = InviteCode::from_reconnect_secret(secret);
+        barrier.wait();
+        let mut reconnect = if identity.public_key() < peer_key {
+            RelayRendezvous::create(endpoint, &invite, None)
+        } else {
+            RelayRendezvous::join(endpoint, &invite, None)
+        }
+        .unwrap();
+        let channel = reconnect.complete_handshake().unwrap();
+        let verified = reconnect
+            .authenticate(channel, &identity, Some(peer_key))
+            .unwrap();
+        let mut session = reconnect.confirm(verified).unwrap();
+        barrier.wait();
+        session.send(send.as_bytes()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(35);
+        let mut got = false;
+        while Instant::now() < deadline {
+            if let Some(RelayUpdate::Messages(messages)) = session.poll().unwrap() {
+                if messages
+                    .iter()
+                    .any(|message| message == expected.as_bytes())
+                {
+                    got = true;
+                    break;
+                }
+            }
+        }
+        assert!(got);
     }
 }

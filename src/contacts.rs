@@ -11,16 +11,33 @@ use sha2::Sha256;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::sync::Mutex;
 use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 8] = b"ADPEER1\0";
 const BACKUP_MAGIC: &[u8; 8] = b"ADCONB1\0";
+static CONTACT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The rendezvous secret is separate from the initial invite and identifies
 /// a single verified relationship. Never display or log it.
 pub struct VerifiedContact {
     pub peer_key: [u8; 32],
     pub rendezvous_secret: Zeroizing<[u8; 32]>,
+}
+
+/// Enumerate authenticated contacts through the encrypted conversation index.
+/// Histories imported from old backups can have no corresponding contact.
+pub fn list_known(directory: &Path, identity: &Identity) -> io::Result<Vec<VerifiedContact>> {
+    let mut contacts = Vec::new();
+    for id in crate::history::History::known_peer_ids(identity)? {
+        let peer = crate::history::decode_peer_id(&id)?;
+        match load(directory, identity, peer) {
+            Ok(contact) => contacts.push(contact),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(contacts)
 }
 
 fn key(identity: &Identity) -> Zeroizing<[u8; 32]> {
@@ -45,6 +62,27 @@ fn filename(identity: &Identity, peer: &[u8; 32]) -> String {
 }
 
 pub fn save(directory: &Path, identity: &Identity, contact: &VerifiedContact) -> io::Result<()> {
+    save_inner(directory, identity, contact, false)
+}
+
+/// Replace the previous relationship only after a fresh mutual user check.
+pub fn save_after_confirmation(
+    directory: &Path,
+    identity: &Identity,
+    contact: &VerifiedContact,
+) -> io::Result<()> {
+    save_inner(directory, identity, contact, true)
+}
+
+fn save_inner(
+    directory: &Path,
+    identity: &Identity,
+    contact: &VerifiedContact,
+    replace_confirmed: bool,
+) -> io::Result<()> {
+    let _guard = CONTACT_WRITE_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("contact storage unavailable"))?;
     fs::create_dir_all(directory)?;
     #[cfg(unix)]
     {
@@ -59,10 +97,12 @@ pub fn save(directory: &Path, identity: &Identity, contact: &VerifiedContact) ->
         if old.rendezvous_secret.as_ref() == contact.rendezvous_secret.as_ref() {
             return Ok(());
         }
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "contact conflict",
-        ));
+        if !replace_confirmed {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "contact conflict",
+            ));
+        }
     }
     let mut nonce = [0; 12];
     File::open("/dev/urandom")?.read_exact(&mut nonce)?;
@@ -94,8 +134,12 @@ pub fn save(directory: &Path, identity: &Identity, contact: &VerifiedContact) ->
         file.write_all(&nonce)?;
         file.write_all(&encrypted)?;
         file.sync_all()?;
-        // A hard link avoids overwriting a concurrent writer.
-        fs::hard_link(&temporary, &path)?;
+        if replace_confirmed {
+            fs::rename(&temporary, &path)?;
+        } else {
+            // A hard link avoids overwriting a concurrent writer.
+            fs::hard_link(&temporary, &path)?;
+        }
         Ok(())
     })();
     let _ = fs::remove_file(&temporary);
@@ -209,6 +253,59 @@ pub fn import_backup(directory: &Path, identity: &Identity, backup: &[u8]) -> io
 mod tests {
     use super::*;
     #[test]
+    fn concurrent_conflicting_imports_preserve_one_complete_record() {
+        use std::sync::{Arc, Barrier};
+        let path = std::env::temp_dir().join(format!(
+            "ad-contact-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir(&path).unwrap();
+        let (identity, _) = Identity::create().unwrap();
+        let identity = Arc::new(identity);
+        let barrier = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = [1_u8, 2]
+            .into_iter()
+            .map(|value| {
+                let identity = Arc::clone(&identity);
+                let barrier = Arc::clone(&barrier);
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let contact = VerifiedContact {
+                        peer_key: [7; 32],
+                        rendezvous_secret: Zeroizing::new([value; 32]),
+                    };
+                    let backup = export_backup(&identity, &contact).unwrap();
+                    barrier.wait();
+                    (value, import_backup(&path, &identity, &backup))
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, result)| result
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == io::ErrorKind::AlreadyExists))
+                .count(),
+            1
+        );
+        let winner = results.iter().find(|(_, result)| result.is_ok()).unwrap().0;
+        assert_eq!(
+            *load(&path, &identity, [7; 32]).unwrap().rendezvous_secret,
+            [winner; 32]
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
     fn record_roundtrip_rejects_wrong_identity_tampering_and_conflicts() {
         let path = std::env::temp_dir().join(format!(
             "ad-contact-{}-{:?}",
@@ -253,6 +350,16 @@ mod tests {
             }
         )
         .is_err());
+        let replacement = VerifiedContact {
+            peer_key: [7; 32],
+            rendezvous_secret: Zeroizing::new([9; 32]),
+        };
+        save_after_confirmation(&path, &identity, &replacement).unwrap();
+        assert_eq!(
+            *load(&path, &identity, [7; 32]).unwrap().rendezvous_secret,
+            [9; 32]
+        );
+        assert!(import_backup(&path, &identity, &backup).is_err());
         let file = path.join(format!("{}.peer", filename(&identity, &[7; 32])));
         let mut bytes = fs::read(&file).unwrap();
         *bytes.last_mut().unwrap() ^= 1;

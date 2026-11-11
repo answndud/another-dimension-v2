@@ -161,6 +161,9 @@ fn mark_chat_disconnected(operation: &ChatOperation, reason: &str, delivery_unkn
 fn relay_failure_message(error: &RelayError, phase: &str, using_tor: bool) -> String {
     match error {
         RelayError::Cancelled => "취소되었습니다.".to_owned(),
+        RelayError::Channel(channel::HandshakeError::IdentityMismatch) => {
+            "저장된 상대와 연결된 신원이 다릅니다. 연결을 중단했습니다. 별도 경로로 상대를 다시 확인하세요.".to_owned()
+        }
         RelayError::TimedOut("relay subscription") => {
             "relay 구독이 제한 시간 안에 준비되지 않았습니다. relay 상태를 확인하고 다시 시도하세요."
                 .to_owned()
@@ -214,6 +217,7 @@ fn spawn_chat_worker(
     commands: Receiver<ChatCommand>,
     role: RoleForChat,
     code: Zeroizing<String>,
+    expected_peer: Option<[u8; 32]>,
     identity: Arc<Identity>,
     cancelled: Arc<AtomicBool>,
     tor_socks: Option<SocketAddr>,
@@ -236,16 +240,18 @@ fn spawn_chat_worker(
                 return Err("취소되었습니다.".to_owned());
             }
             let verification = rendezvous
-                .authenticate(channel, &identity, None)
+                .authenticate(channel, &identity, expected_peer)
                 .map_err(|error| relay_failure_message(&error, "identity", tor_socks.is_some()))?;
             let fingerprint = encode_hex(verification.fingerprint());
+            let peer_key = *verification.peer_public_key();
             let peer_id = encode_hex(verification.peer_public_key());
             chat_update(&operation, |snapshot| {
+                snapshot.peer_id = Some(peer_id.clone());
+                if expected_peer.is_some() { return; }
                 snapshot.phase = "verification";
                 snapshot.fingerprint = Some(fingerprint);
-                snapshot.peer_id = Some(peer_id.clone());
             });
-            let verification = loop {
+            let verification = if expected_peer.is_some() { verification } else { loop {
                 if operation.cancelled.load(Ordering::SeqCst) {
                     return Err("취소되었습니다.".to_owned());
                 }
@@ -256,11 +262,21 @@ fn spawn_chat_worker(
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return Err("취소되었습니다.".to_owned()),
                 }
-            };
+            }};
             chat_update(&operation, |snapshot| snapshot.phase = "confirming");
-            let session = rendezvous
-                .confirm(verification)
+            let session = if expected_peer.is_some() {
+                rendezvous.confirm(verification).map_err(|error| relay_failure_message(&error, "confirmation", tor_socks.is_some()))?
+            } else {
+            let (session, rendezvous_secret) = rendezvous
+                .confirm_with_contact(verification)
                 .map_err(|error| relay_failure_message(&error, "confirmation", tor_socks.is_some()))?;
+            let directory = history::data_directory()
+                .map_err(|_| "상대 확인 정보를 저장할 위치를 찾을 수 없습니다.".to_owned())?
+                .join(identity.public_id()).join("verified-contacts");
+            contacts::save_after_confirmation(&directory, &identity, &contacts::VerifiedContact { peer_key, rendezvous_secret })
+                .map_err(|_| "상대 확인 정보를 저장하지 못했습니다. 기존 확인 기록을 확인하세요.".to_owned())?;
+            session
+            };
             let (history, entries, storage_error) = match history::History::open(&identity, &peer_id) {
                 Ok((history, stored, recovered_partial)) => {
                     let entries = stored
@@ -630,6 +646,10 @@ fn issue_code(state: &mut State) -> io::Result<()> {
 }
 
 fn preferences_path() -> io::Result<PathBuf> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("ANOTHER_DIMENSION_DATA_DIR").is_some() {
+        return Ok(history::data_directory()?.join("preferences.json"));
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory is unavailable"))?;
@@ -869,6 +889,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/invite/create HTTP/1.1"
             | "POST /api/chat/create HTTP/1.1"
             | "POST /api/chat/join HTTP/1.1"
+            | "POST /api/chat/reconnect HTTP/1.1"
             | "POST /api/chat/status HTTP/1.1"
             | "POST /api/chat/confirm HTTP/1.1"
             | "POST /api/chat/cancel HTTP/1.1"
@@ -881,6 +902,8 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/history/delete-conversation HTTP/1.1"
             | "POST /api/history/export-backup HTTP/1.1"
             | "POST /api/history/import-backup HTTP/1.1"
+            | "POST /api/contacts/export-backup HTTP/1.1"
+            | "POST /api/contacts/import-backup HTTP/1.1"
     ) {
         return reject(&mut stream, "404 Not Found");
     }
@@ -1035,7 +1058,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     }
     if matches!(
         first.as_str(),
-        "POST /api/chat/create HTTP/1.1" | "POST /api/chat/join HTTP/1.1"
+        "POST /api/chat/create HTTP/1.1"
+            | "POST /api/chat/join HTTP/1.1"
+            | "POST /api/chat/reconnect HTTP/1.1"
     ) {
         if state.tor_socks != state.settings.tor_socks {
             return reject(&mut stream, "409 Conflict");
@@ -1043,16 +1068,45 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some(identity) = state.identity.as_ref().cloned() else {
             return reject(&mut stream, "401 Unauthorized");
         };
-        if InviteCode::parse(body).is_none() {
-            return reject(&mut stream, "400 Bad Request");
-        }
+        let (code, expected_peer, reconnect_role) = if first == "POST /api/chat/reconnect HTTP/1.1"
+        {
+            let Ok(peer) = history::decode_peer_id(body) else {
+                return reject(&mut stream, "400 Bad Request");
+            };
+            if peer == identity.public_key() || peer_chat_active(&state, body) {
+                return reject(&mut stream, "409 Conflict");
+            }
+            let directory = history::data_directory()?
+                .join(identity.public_id())
+                .join("verified-contacts");
+            let contact = match contacts::load(&directory, &identity, peer) {
+                Ok(contact) => contact,
+                Err(_) => return reject(&mut stream, "404 Not Found"),
+            };
+            let invite = InviteCode::from_reconnect_secret(contact.rendezvous_secret);
+            let role = if identity.public_key() < peer {
+                RoleForChat::Create
+            } else {
+                RoleForChat::Join
+            };
+            (
+                Zeroizing::new(invite.code().to_owned()),
+                Some(peer),
+                Some(role),
+            )
+        } else {
+            if InviteCode::parse(body).is_none() {
+                return reject(&mut stream, "400 Bad Request");
+            }
+            (Zeroizing::new(body.to_owned()), None, None)
+        };
         let operation_id = random_token()?;
         let (sender, receiver) = mpsc::channel();
         let operation = Arc::new(ChatOperation {
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connecting",
                 fingerprint: None,
-                peer_id: None,
+                peer_id: expected_peer.as_ref().map(|peer| encode_hex(peer)),
                 error: None,
                 storage_error: None,
                 messages: Vec::new(),
@@ -1066,12 +1120,11 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let tor_socks = state.tor_socks;
         let notifications_enabled = Arc::clone(&state.notifications_enabled);
         let last_notification = Arc::clone(&state.last_notification);
-        let role = if first == "POST /api/chat/create HTTP/1.1" {
+        let role = reconnect_role.unwrap_or(if first == "POST /api/chat/create HTTP/1.1" {
             RoleForChat::Create
         } else {
             RoleForChat::Join
-        };
-        let code = Zeroizing::new(body.to_owned());
+        });
         state
             .chats
             .insert(operation_id.clone(), Arc::clone(&operation));
@@ -1081,6 +1134,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             receiver,
             role,
             code,
+            expected_peer,
             identity,
             cancelled,
             tor_socks,
@@ -1205,6 +1259,62 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             serde_json::to_string(&messages)?.as_bytes(),
         );
     }
+    if first == "POST /api/contacts/export-backup HTTP/1.1" {
+        let Some(identity) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        let Ok(peer) = history::decode_peer_id(body) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let directory = history::data_directory()?
+            .join(identity.public_id())
+            .join("verified-contacts");
+        let contact = match contacts::load(&directory, identity, peer) {
+            Ok(contact) => contact,
+            Err(_) => return reject(&mut stream, "404 Not Found"),
+        };
+        let backup = contacts::export_backup(identity, &contact)?;
+        return respond(
+            &mut stream,
+            "200 OK",
+            "text/plain; charset=utf-8",
+            BASE64.encode(backup).as_bytes(),
+        );
+    }
+    if first == "POST /api/contacts/import-backup HTTP/1.1" {
+        let Some(identity) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        if any_chat_active(&state) {
+            return reject(&mut stream, "409 Conflict");
+        }
+        if body.len() > 256 {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        let Ok(backup) = BASE64.decode(body) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let directory = history::data_directory()?
+            .join(identity.public_id())
+            .join("verified-contacts");
+        let peer = match contacts::import_backup(&directory, identity, &backup) {
+            Ok(peer) => peer,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return reject(&mut stream, "409 Conflict")
+            }
+            Err(_) => return reject(&mut stream, "400 Bad Request"),
+        };
+        let peer_id = encode_hex(&peer);
+        if history::History::open(identity, &peer_id).is_err() {
+            return reject(&mut stream, "500 Internal Server Error");
+        }
+        return respond(
+            &mut stream,
+            "200 OK",
+            "text/plain; charset=utf-8",
+            peer_id.as_bytes(),
+        );
+    }
     if first == "POST /api/history/list HTTP/1.1" {
         let Some(identity) = state.identity.as_ref() else {
             return reject(&mut stream, "401 Unauthorized");
@@ -1213,11 +1323,22 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             Ok(summaries) => summaries,
             Err(_) => return reject(&mut stream, "500 Internal Server Error"),
         };
+        let directory = history::data_directory()?
+            .join(identity.public_id())
+            .join("verified-contacts");
+        let verified: HashSet<_> = match contacts::list_known(&directory, identity) {
+            Ok(contacts) => contacts
+                .into_iter()
+                .map(|contact| encode_hex(&contact.peer_key))
+                .collect(),
+            Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+        };
         let payload: Vec<_> = summaries
             .into_iter()
             .map(|item| {
                 serde_json::json!({
                     "peerId": item.peer_id,
+                    "verified": verified.contains(&item.peer_id),
                     "messageCount": item.message_count,
                     "lastMessage": item.last_message
                 })

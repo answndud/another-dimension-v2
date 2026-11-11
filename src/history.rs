@@ -59,6 +59,16 @@ pub struct History {
 }
 
 impl History {
+    /// Read the existing encrypted index without opening or creating histories.
+    pub(crate) fn known_peer_ids(identity: &Identity) -> io::Result<Vec<String>> {
+        let identity_id = identity.public_id();
+        let directory = data_directory()?.join(&identity_id);
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        read_index(identity, &identity_id, &directory)
+    }
+
     pub fn open(
         identity: &Identity,
         peer_id: &str,
@@ -457,7 +467,7 @@ fn validate_peer_id(peer_id: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn decode_peer_id(peer_id: &str) -> io::Result<[u8; 32]> {
+pub(crate) fn decode_peer_id(peer_id: &str) -> io::Result<[u8; 32]> {
     validate_peer_id(peer_id)?;
     let mut bytes = [0; 32];
     for (index, pair) in peer_id.as_bytes().chunks_exact(2).enumerate() {
@@ -810,9 +820,20 @@ fn random_nonce() -> io::Result<[u8; NONCE_BYTES]> {
     Ok(nonce)
 }
 
-fn data_directory() -> io::Result<PathBuf> {
+pub(crate) fn data_directory() -> io::Result<PathBuf> {
     #[cfg(test)]
     if let Some(path) = TEST_DATA_DIRECTORY.with(|directory| directory.borrow().clone()) {
+        return Ok(path);
+    }
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("ANOTHER_DIMENSION_DATA_DIR") {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "data directory must be absolute",
+            ));
+        }
         return Ok(path);
     }
     #[cfg(target_os = "macos")]
@@ -876,6 +897,39 @@ mod tests {
             sender: MessageSender::Me,
             text: text.to_owned(),
         }
+    }
+
+    #[test]
+    fn verified_contact_listing_skips_legacy_histories_and_rejects_corruption() {
+        let data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let verified = "11".repeat(32);
+        let legacy = "22".repeat(32);
+        History::open(&identity, &verified).unwrap();
+        History::open(&identity, &legacy).unwrap();
+        let directory = data.0.join(identity.public_id()).join("verified-contacts");
+        let contact = crate::contacts::VerifiedContact {
+            peer_key: [0x11; 32],
+            rendezvous_secret: zeroize::Zeroizing::new([3; 32]),
+        };
+        crate::contacts::save(&directory, &identity, &contact).unwrap();
+        let contacts = crate::contacts::list_known(&directory, &identity).unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].peer_key, [0x11; 32]);
+        let record = std::fs::read_dir(directory)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut bytes = std::fs::read(&record).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(record, bytes).unwrap();
+        assert!(crate::contacts::list_known(
+            &data.0.join(identity.public_id()).join("verified-contacts"),
+            &identity
+        )
+        .is_err());
     }
 
     fn legacy_password_backup(

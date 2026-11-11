@@ -36,6 +36,7 @@ let sendingMessage = false;
 let selectedHistoryPeer = '';
 let selectedHistoryMessages = [];
 let selectedHistoryIndices = new Set();
+let verifiedPeers = new Set();
 
 function show(view) {
   bridgeForm.hidden = view !== 'bridge';
@@ -102,6 +103,7 @@ async function refreshHistoryList() {
     historyList.append(error);
     return;
   }
+  verifiedPeers = new Set(items.filter(item => item.verified).map(item => item.peerId));
   for (const item of items) {
     const button = document.createElement('button');
     button.type = 'button';
@@ -111,7 +113,7 @@ async function refreshHistoryList() {
     label.textContent = `대화 ${item.peerId.slice(0, 12)}`;
     const details = document.createElement('small');
     const lastMessage = item.lastMessage ? formatTime(item.lastMessage) : '메시지 없음';
-    details.textContent = `${item.messageCount}개 메시지 · ${lastMessage}`;
+    details.textContent = `${item.messageCount}개 메시지 · ${lastMessage} · ${item.verified ? '상대 확인 기록 있음' : '상대 확인 필요'}`;
     button.append(label, details);
     button.addEventListener('click', () => openHistory(item.peerId).catch(() => {
       message.textContent = '대화 기록을 열지 못했습니다.';
@@ -186,6 +188,8 @@ async function openHistory(peerId) {
   selectedHistoryMessages = await response.json();
   selectedHistoryIndices.clear();
   document.querySelector('#history-peer').textContent = peerId;
+  document.querySelector('#contact-reconnect').hidden = !verifiedPeers.has(peerId);
+  document.querySelector('#contact-export').hidden = !verifiedPeers.has(peerId);
   messageFilter.value = '';
   updateSelectionCount();
   renderHistoryMessages();
@@ -523,7 +527,7 @@ joinForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const code = joinCode.value.trim();
   joinCode.value = '';
-  if (code.startsWith('ADI1-')) {
+  if (code.startsWith('ADI1-') || code.startsWith('ADI2-')) {
     message.textContent = '이 초대 코드는 이전 연결 프로토콜용입니다. 두 기기에서 같은 앱 버전을 사용해 새 코드를 만드세요.';
     return;
   }
@@ -575,6 +579,36 @@ document.querySelector('#close-chat').addEventListener('click', async () => {
 historyFilter.addEventListener('input', filterHistoryList);
 messageFilter.addEventListener('input', renderHistoryMessages);
 document.querySelector('#history-back').addEventListener('click', () => show('active'));
+document.querySelector('#contact-reconnect').addEventListener('click', () => startChat('/api/chat/reconnect', selectedHistoryPeer));
+document.querySelector('#contact-export').addEventListener('click', async () => {
+  try {
+    const response = await request('/api/contacts/export-backup', selectedHistoryPeer);
+    if (!response.ok) throw new Error('backup unavailable');
+    const binary = atob(await response.text());
+    const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'another-dimension-contact.adcontact';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    message.textContent = '상대 확인 백업을 저장했습니다.';
+  } catch (_) { message.textContent = '상대 확인 기록을 백업하지 못했습니다.'; }
+});
+document.querySelector('#contact-import').addEventListener('click', async () => {
+  const input = document.querySelector('#contact-file');
+  const file = input.files[0];
+  if (!file || file.size > 256) { message.textContent = '상대 확인 백업 파일을 선택하세요.'; return; }
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const response = await request('/api/contacts/import-backup', btoa(String.fromCharCode(...bytes)));
+    if (response.status === 409) { message.textContent = '연결을 종료하세요. 기존 확인 기록과 충돌하는 백업은 가져올 수 없습니다.'; return; }
+    if (!response.ok) throw new Error('invalid backup');
+    input.value = '';
+    await refreshHistoryList();
+    message.textContent = '상대 확인 기록을 복원했습니다. 오래된 백업의 최신 여부는 확인할 수 없습니다.';
+  } catch (_) { message.textContent = '백업을 읽지 못했거나 개인 접속 코드가 다릅니다.'; }
+});
 document.querySelector('#history-export').addEventListener('click', () => {
   const lines = selectedHistoryMessages.map((item) => `${formatTime(item.time)} [${item.sender}]: ${item.text}`);
   const url = URL.createObjectURL(new Blob([lines.join('\n') + (lines.length ? '\n' : '')], { type: 'text/plain;charset=utf-8' }));
