@@ -7,7 +7,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs::{create_dir_all, rename, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -23,6 +23,10 @@ const BACKUP_PASSWORD_MAGIC: &[u8; 8] = b"ADBACK2\0";
 const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
 const BACKUP_SALT_BYTES: usize = 16;
 static INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static TEST_DATA_DIRECTORY: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StoredMessage {
@@ -224,6 +228,20 @@ impl History {
     ) -> io::Result<Vec<u8>> {
         let (_, messages, _) = Self::open(identity, peer_id)?;
         let mut payload = Zeroizing::new(Vec::new());
+        if let Some(password) = password {
+            validate_backup_password(password)?;
+        }
+        let salt_len = if password.is_some() {
+            BACKUP_SALT_BYTES
+        } else {
+            0
+        };
+        let header_len = if password.is_some() {
+            BACKUP_PASSWORD_MAGIC.len()
+        } else {
+            BACKUP_MAGIC.len()
+        } + salt_len
+            + NONCE_BYTES;
         let peer = decode_peer_id(peer_id)?;
         payload.extend_from_slice(&peer);
         let count = u32::try_from(messages.len())
@@ -238,15 +256,12 @@ impl History {
             });
             payload.extend_from_slice(&(text.len() as u32).to_be_bytes());
             payload.extend_from_slice(text);
-            if payload.len() + BACKUP_MAGIC.len() + NONCE_BYTES + 16 > MAX_BACKUP_BYTES {
+            if payload.len().saturating_add(header_len + 16) > MAX_BACKUP_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "backup is too large",
                 ));
             }
-        }
-        if let Some(password) = password {
-            validate_backup_password(password)?;
         }
         let mut salt = [0; BACKUP_SALT_BYTES];
         File::open("/dev/urandom")?.read_exact(&mut salt)?;
@@ -269,11 +284,6 @@ impl History {
                 },
             )
             .map_err(|_| io::Error::other("backup encryption failed"))?;
-        let salt_len = if password.is_some() {
-            BACKUP_SALT_BYTES
-        } else {
-            0
-        };
         let mut backup = Vec::with_capacity(magic.len() + salt_len + NONCE_BYTES + encrypted.len());
         backup.extend_from_slice(magic);
         if password.is_some() {
@@ -383,18 +393,35 @@ impl History {
         }
 
         let (mut history, existing, _) = Self::open(identity, &peer_id)?;
-        let mut merged = existing;
-        let mut seen: HashSet<StoredMessage> = merged.iter().cloned().collect();
-        for message in imported {
-            if seen.insert(message.clone()) {
-                merged.push(message);
-            }
-        }
-        merged.sort_by_key(|message| message.unix_time);
+        let merged = merge_snapshot(existing, imported);
         let count = merged.len();
         history.replace(&merged)?;
         Ok((peer_id, count))
     }
+}
+
+/// Backups contain snapshots without record IDs. Preserve the greatest count of
+/// each exact message found in either copy: this makes re-import idempotent while
+/// retaining identical messages already repeated within either snapshot.
+fn merge_snapshot(
+    existing: Vec<StoredMessage>,
+    imported: Vec<StoredMessage>,
+) -> Vec<StoredMessage> {
+    let mut existing_counts = HashMap::<StoredMessage, usize>::new();
+    let mut imported_counts = HashMap::<StoredMessage, usize>::new();
+    let mut merged = existing;
+    for message in &merged {
+        *existing_counts.entry(message.clone()).or_default() += 1;
+    }
+    for message in imported {
+        let count = imported_counts.entry(message.clone()).or_default();
+        *count += 1;
+        if *count > existing_counts.get(&message).copied().unwrap_or(0) {
+            merged.push(message);
+        }
+    }
+    merged.sort_by_key(|message| message.unix_time);
+    merged
 }
 
 fn validate_peer_id(peer_id: &str) -> io::Result<()> {
@@ -747,6 +774,10 @@ fn random_nonce() -> io::Result<[u8; NONCE_BYTES]> {
 }
 
 fn data_directory() -> io::Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = TEST_DATA_DIRECTORY.with(|directory| directory.borrow().clone()) {
+        return Ok(path);
+    }
     #[cfg(target_os = "macos")]
     {
         return home_dir()
@@ -765,6 +796,126 @@ fn data_directory() -> io::Result<PathBuf> {
             return Ok(PathBuf::from(path).join("another-dimension-v2"));
         }
         home_dir().map(|home| home.join(".local/share/another-dimension-v2"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{History, MessageSender, StoredMessage, MAX_BACKUP_BYTES, MAX_MESSAGE_BYTES};
+    use crate::identity::Identity;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    struct IsolatedData(PathBuf);
+
+    impl IsolatedData {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ad2-history-test-{}-{}",
+                std::process::id(),
+                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            super::TEST_DATA_DIRECTORY
+                .with(|directory| *directory.borrow_mut() = Some(path.clone()));
+            Self(path)
+        }
+    }
+
+    impl Drop for IsolatedData {
+        fn drop(&mut self) {
+            super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn message(time: u64, text: &str) -> StoredMessage {
+        StoredMessage {
+            unix_time: time,
+            sender: MessageSender::Me,
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn backup_import_preserves_repeats_and_reads_existing_legacy_format() {
+        let _data = IsolatedData::new();
+        let identity = Identity::from_code(&Identity::create().unwrap().1).unwrap();
+        let peer = "ab".repeat(32);
+        let repeated = message(1_700_000_000, "same message");
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history
+            .replace(&[repeated.clone(), repeated.clone()])
+            .unwrap();
+
+        // The original ADBACK1 envelope is unchanged and can be imported twice.
+        let backup = History::export_backup(&identity, &peer, None).unwrap();
+        assert_eq!(&backup[..8], b"ADBACK1\0");
+        assert_eq!(
+            History::import_backup(&identity, &backup, None).unwrap().1,
+            2
+        );
+        assert_eq!(
+            History::import_backup(&identity, &backup, None).unwrap().1,
+            2
+        );
+        let (_, messages, _) = History::open(&identity, &peer).unwrap();
+        assert_eq!(messages, vec![repeated.clone(), repeated]);
+
+        let password_backup =
+            History::export_backup(&identity, &peer, Some("correct horse battery")).unwrap();
+        assert_eq!(&password_backup[..8], b"ADBACK2\0");
+        assert_eq!(
+            History::import_backup(&identity, &password_backup, Some("correct horse battery"))
+                .unwrap()
+                .1,
+            2
+        );
+    }
+
+    fn messages_with_payload_len(payload_len: usize) -> Vec<StoredMessage> {
+        let record_bytes = payload_len - 36;
+        let count = record_bytes.div_ceil(MAX_MESSAGE_BYTES + 13);
+        let mut remaining = record_bytes;
+        let mut messages = Vec::with_capacity(count);
+        for index in 0..count {
+            let slots_left = count - index - 1;
+            let size = remaining.saturating_sub(slots_left * (MAX_MESSAGE_BYTES + 13));
+            let text_len = (size - 13).clamp(1, MAX_MESSAGE_BYTES);
+            messages.push(message(index as u64, &"x".repeat(text_len)));
+            remaining -= text_len + 13;
+        }
+        assert_eq!(remaining, 0);
+        messages
+    }
+
+    #[test]
+    fn exports_enforce_the_final_file_size_limit_for_both_formats() {
+        let _data = IsolatedData::new();
+        let identity = Identity::create().unwrap().0;
+        let peer = "cd".repeat(32);
+        for password in [None, Some("correct horse battery")] {
+            let envelope_len = 8 + password.map_or(0, |_| 16) + 12 + 16;
+            let exact_payload_len = MAX_BACKUP_BYTES - envelope_len;
+            let mut history = History::open(&identity, &peer).unwrap().0;
+            history
+                .replace(&messages_with_payload_len(exact_payload_len))
+                .unwrap();
+            let backup = History::export_backup(&identity, &peer, password).unwrap();
+            assert_eq!(backup.len(), MAX_BACKUP_BYTES);
+
+            history
+                .replace(&messages_with_payload_len(exact_payload_len + 1))
+                .unwrap();
+            assert_eq!(
+                History::export_backup(&identity, &peer, password)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
     }
 }
 
