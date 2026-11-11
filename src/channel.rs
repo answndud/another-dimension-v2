@@ -3,8 +3,11 @@
 //! an encrypted peer confirmation frame.
 
 use ed25519_dalek::{Signature, VerifyingKey};
+use nostr::prelude::{Keys, PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Read;
 use zeroize::Zeroizing;
 
 use crate::identity::Identity;
@@ -21,7 +24,7 @@ const MAX_REORDER: u64 = 32;
 const ENVELOPE_MAGIC: &[u8; 4] = b"ADV2";
 const ROUTE_DOMAIN: &[u8] = b"another-dimension-v2/relay-route/v1";
 const HASH_SIZE: usize = 32;
-const PROOF_SIZE: usize = 1 + 32 + 64;
+const PROOF_SIZE: usize = 1 + 32 + 32 + 64;
 const CONFIRM_SIZE: usize = 1 + 32 + HASH_SIZE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +64,7 @@ pub enum HandshakeError {
     OutsideReorderWindow,
     SequenceExhausted,
     Closed,
+    InvalidRelayKey,
 }
 
 impl From<snow::Error> for HandshakeError {
@@ -169,11 +173,14 @@ impl PendingChannel {
         identity: &Identity,
     ) -> Result<(IdentityPending, Vec<u8>), HandshakeError> {
         let public_key = identity.public_key();
-        let signed = identity_proof_input(&self.hash, self.role, &public_key);
+        let relay_keys = generate_relay_keys()?;
+        let relay_public_key = relay_keys.public_key().to_bytes();
+        let signed = identity_proof_input(&self.hash, self.role, &public_key, &relay_public_key);
         let signature = identity.sign(&signed);
         let mut proof = Vec::with_capacity(PROOF_SIZE);
         proof.push(self.role.byte());
         proof.extend_from_slice(&public_key);
+        proof.extend_from_slice(&relay_public_key);
         proof.extend_from_slice(&signature);
         let frame = encrypt(&mut self.transport, &proof)?;
         Ok((
@@ -181,6 +188,7 @@ impl PendingChannel {
                 hash: self.hash,
                 role: self.role,
                 local_key: public_key,
+                relay_keys,
                 transport: self.transport,
             },
             frame,
@@ -193,6 +201,7 @@ pub struct IdentityPending {
     hash: [u8; HASH_SIZE],
     role: Role,
     local_key: [u8; 32],
+    relay_keys: Keys,
     transport: snow::TransportState,
 }
 
@@ -217,11 +226,15 @@ impl IdentityPending {
         if expected_peer.is_some_and(|expected| expected != peer_key) {
             return Err(HandshakeError::IdentityMismatch);
         }
+        let peer_relay_key =
+            PublicKey::from_slice(&proof[33..65]).map_err(|_| HandshakeError::InvalidRelayKey)?;
         let verifying_key =
             VerifyingKey::from_bytes(&peer_key).map_err(|_| HandshakeError::InvalidIdentity)?;
         let signature =
-            Signature::from_slice(&proof[33..]).map_err(|_| HandshakeError::InvalidProof)?;
-        let signed = identity_proof_input(&self.hash, self.role.peer(), &peer_key);
+            Signature::from_slice(&proof[65..]).map_err(|_| HandshakeError::InvalidProof)?;
+        let relay_key_bytes = peer_relay_key.to_bytes();
+        let signed =
+            identity_proof_input(&self.hash, self.role.peer(), &peer_key, &relay_key_bytes);
         verifying_key
             .verify_strict(&signed, &signature)
             .map_err(|_| HandshakeError::InvalidProof)?;
@@ -234,6 +247,8 @@ impl IdentityPending {
             role: self.role,
             local_key: self.local_key,
             peer_key,
+            local_relay_keys: self.relay_keys,
+            peer_relay_key,
             fingerprint,
             transport: self.transport,
         })
@@ -248,6 +263,8 @@ pub struct VerificationPending {
     role: Role,
     local_key: [u8; 32],
     peer_key: [u8; 32],
+    local_relay_keys: Keys,
+    peer_relay_key: PublicKey,
     fingerprint: [u8; HASH_SIZE],
     transport: snow::TransportState,
 }
@@ -279,6 +296,8 @@ impl VerificationPending {
                 session_tag: self.session_tag,
                 local_key: self.local_key,
                 peer_key: self.peer_key,
+                local_relay_keys: self.local_relay_keys,
+                peer_relay_key: self.peer_relay_key,
                 fingerprint: self.fingerprint,
                 transport: self.transport,
             },
@@ -294,6 +313,8 @@ pub struct ConfirmationPending {
     session_tag: [u8; 16],
     local_key: [u8; 32],
     peer_key: [u8; 32],
+    local_relay_keys: Keys,
+    peer_relay_key: PublicKey,
     fingerprint: [u8; HASH_SIZE],
     transport: snow::TransportState,
 }
@@ -315,6 +336,8 @@ impl ConfirmationPending {
             role: self.role,
             local_key: self.local_key,
             peer_key: self.peer_key,
+            local_relay_keys: self.local_relay_keys,
+            peer_relay_key: self.peer_relay_key,
             fingerprint: self.fingerprint,
             session_tag: self.session_tag,
             transport: self.transport,
@@ -329,6 +352,8 @@ pub struct ActiveChannel {
     role: Role,
     local_key: [u8; 32],
     peer_key: [u8; 32],
+    local_relay_keys: Keys,
+    peer_relay_key: PublicKey,
     fingerprint: [u8; HASH_SIZE],
     session_tag: [u8; 16],
     transport: snow::TransportState,
@@ -366,6 +391,14 @@ impl ActiveChannel {
 
     pub fn local_public_key(&self) -> &[u8; 32] {
         &self.local_key
+    }
+
+    pub(crate) fn relay_credentials(&self) -> (&Keys, PublicKey, &[u8; 16]) {
+        (
+            &self.local_relay_keys,
+            self.peer_relay_key,
+            &self.session_tag,
+        )
     }
 }
 
@@ -468,6 +501,10 @@ impl SessionTransport {
         self.closed
     }
 
+    pub(crate) fn relay_credentials(&self) -> (&Keys, PublicKey, &[u8; 16]) {
+        self.channel.relay_credentials()
+    }
+
     fn ensure_open(&self) -> Result<(), HandshakeError> {
         if self.closed {
             Err(HandshakeError::Closed)
@@ -477,13 +514,32 @@ impl SessionTransport {
     }
 }
 
-fn identity_proof_input(hash: &[u8; HASH_SIZE], role: Role, key: &[u8; 32]) -> Vec<u8> {
-    let mut input = Vec::with_capacity(SIGN_DOMAIN.len() + 1 + HASH_SIZE + 32);
+fn identity_proof_input(
+    hash: &[u8; HASH_SIZE],
+    role: Role,
+    key: &[u8; 32],
+    relay_key: &[u8; 32],
+) -> Vec<u8> {
+    let mut input = Vec::with_capacity(SIGN_DOMAIN.len() + 1 + HASH_SIZE + 64);
     input.extend_from_slice(SIGN_DOMAIN);
     input.push(role.byte());
     input.extend_from_slice(hash);
     input.extend_from_slice(key);
+    input.extend_from_slice(relay_key);
     input
+}
+
+fn generate_relay_keys() -> Result<Keys, HandshakeError> {
+    for _ in 0..8 {
+        let mut secret = Zeroizing::new([0_u8; 32]);
+        File::open("/dev/urandom")
+            .and_then(|mut random| random.read_exact(secret.as_mut()))
+            .map_err(|_| HandshakeError::InvalidRelayKey)?;
+        if let Ok(secret) = SecretKey::from_slice(secret.as_ref()) {
+            return Ok(Keys::new(secret));
+        }
+    }
+    Err(HandshakeError::InvalidRelayKey)
 }
 
 fn fingerprint(

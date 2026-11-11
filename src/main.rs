@@ -1,5 +1,6 @@
 pub mod channel;
 mod identity;
+pub mod relay;
 
 use identity::Identity;
 use std::fs::File;
