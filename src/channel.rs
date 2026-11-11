@@ -4,6 +4,7 @@
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
 use crate::identity::Identity;
@@ -15,6 +16,10 @@ const CONFIRM_DOMAIN: &[u8] = b"another-dimension-v2/user-confirmation/v1";
 const MAX_HANDSHAKE_MESSAGE: usize = 128;
 const MAX_FRAME: usize = 4096;
 const FRAME_TAG: usize = 16;
+const ENVELOPE_HEADER: usize = 4 + 16 + 8;
+const MAX_REORDER: u64 = 32;
+const ENVELOPE_MAGIC: &[u8; 4] = b"ADV2";
+const ROUTE_DOMAIN: &[u8] = b"another-dimension-v2/relay-route/v1";
 const HASH_SIZE: usize = 32;
 const PROOF_SIZE: usize = 1 + 32 + 64;
 const CONFIRM_SIZE: usize = 1 + 32 + HASH_SIZE;
@@ -52,6 +57,10 @@ pub enum HandshakeError {
     InvalidProof,
     SelfConnection,
     PeerNotConfirmed,
+    InvalidEnvelope,
+    OutsideReorderWindow,
+    SequenceExhausted,
+    Closed,
 }
 
 impl From<snow::Error> for HandshakeError {
@@ -221,6 +230,7 @@ impl IdentityPending {
         let fingerprint = fingerprint(&self.hash, self.role, &self.local_key, &peer_key);
         Ok(VerificationPending {
             hash: self.hash,
+            session_tag: session_tag(&self.hash),
             role: self.role,
             local_key: self.local_key,
             peer_key,
@@ -234,6 +244,7 @@ impl IdentityPending {
 /// The fingerprint must be compared out of band by the users.
 pub struct VerificationPending {
     hash: [u8; HASH_SIZE],
+    session_tag: [u8; 16],
     role: Role,
     local_key: [u8; 32],
     peer_key: [u8; 32],
@@ -265,6 +276,7 @@ impl VerificationPending {
             ConfirmationPending {
                 role: self.role,
                 hash: self.hash,
+                session_tag: self.session_tag,
                 local_key: self.local_key,
                 peer_key: self.peer_key,
                 fingerprint: self.fingerprint,
@@ -279,6 +291,7 @@ impl VerificationPending {
 pub struct ConfirmationPending {
     role: Role,
     hash: [u8; HASH_SIZE],
+    session_tag: [u8; 16],
     local_key: [u8; 32],
     peer_key: [u8; 32],
     fingerprint: [u8; HASH_SIZE],
@@ -303,6 +316,7 @@ impl ConfirmationPending {
             local_key: self.local_key,
             peer_key: self.peer_key,
             fingerprint: self.fingerprint,
+            session_tag: self.session_tag,
             transport: self.transport,
         })
     }
@@ -316,6 +330,7 @@ pub struct ActiveChannel {
     local_key: [u8; 32],
     peer_key: [u8; 32],
     fingerprint: [u8; HASH_SIZE],
+    session_tag: [u8; 16],
     transport: snow::TransportState,
 }
 
@@ -354,6 +369,114 @@ impl ActiveChannel {
     }
 }
 
+/// Relay-compatible envelope ordering for one confirmed Noise session. The
+/// relay sees a per-session tag, direction-local sequence, and ciphertext; it
+/// cannot read the application payload. The tag is linkable within this
+/// session, but is derived from fresh handshake material, not the identity.
+pub struct SessionTransport {
+    channel: ActiveChannel,
+    send_sequence: u64,
+    receive_sequence: u64,
+    buffered: BTreeMap<u64, Vec<u8>>,
+    closed: bool,
+}
+
+impl SessionTransport {
+    pub fn new(channel: ActiveChannel) -> Self {
+        Self {
+            channel,
+            send_sequence: 0,
+            receive_sequence: 0,
+            buffered: BTreeMap::new(),
+            closed: false,
+        }
+    }
+
+    /// Encodes one encrypted message for relay forwarding.
+    pub fn send(&mut self, message: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+        self.ensure_open()?;
+        let sequence = self.send_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(HandshakeError::SequenceExhausted)?;
+        let ciphertext = self.channel.write_message(message)?;
+        self.send_sequence = next_sequence;
+        let mut envelope = Vec::with_capacity(ENVELOPE_HEADER + ciphertext.len());
+        envelope.extend_from_slice(ENVELOPE_MAGIC);
+        envelope.extend_from_slice(&self.channel.session_tag);
+        envelope.extend_from_slice(&sequence.to_be_bytes());
+        envelope.extend_from_slice(&ciphertext);
+        Ok(envelope)
+    }
+
+    /// Accepts one relay frame. Out-of-order frames are held in a bounded
+    /// window; duplicates already delivered or buffered are ignored. Returns
+    /// zero or more application messages in sequence order.
+    pub fn receive(&mut self, envelope: &[u8]) -> Result<Vec<Vec<u8>>, HandshakeError> {
+        self.ensure_open()?;
+        if envelope.len() < ENVELOPE_HEADER + FRAME_TAG
+            || envelope.len() > ENVELOPE_HEADER + MAX_FRAME
+        {
+            return Err(HandshakeError::InvalidEnvelope);
+        }
+        if &envelope[..4] != ENVELOPE_MAGIC || envelope[4..20] != self.channel.session_tag {
+            return Err(HandshakeError::InvalidEnvelope);
+        }
+        let sequence = u64::from_be_bytes(
+            envelope[20..28]
+                .try_into()
+                .map_err(|_| HandshakeError::InvalidEnvelope)?,
+        );
+        if sequence < self.receive_sequence {
+            return Ok(Vec::new());
+        }
+        if sequence - self.receive_sequence >= MAX_REORDER {
+            return Err(HandshakeError::OutsideReorderWindow);
+        }
+        let ciphertext = &envelope[ENVELOPE_HEADER..];
+        if let Some(buffered) = self.buffered.get(&sequence) {
+            if buffered == ciphertext {
+                return Ok(Vec::new());
+            }
+            self.closed = true;
+            self.buffered.clear();
+            return Err(HandshakeError::InvalidEnvelope);
+        }
+        self.buffered.insert(sequence, ciphertext.to_vec());
+
+        let mut messages = Vec::new();
+        while let Some(ciphertext) = self.buffered.remove(&self.receive_sequence) {
+            match self.channel.read_message(&ciphertext) {
+                Ok(message) => messages.push(message),
+                Err(error) => {
+                    self.closed = true;
+                    self.buffered.clear();
+                    return Err(error);
+                }
+            }
+            let Some(next) = self.receive_sequence.checked_add(1) else {
+                self.closed = true;
+                self.buffered.clear();
+                return Err(HandshakeError::SequenceExhausted);
+            };
+            self.receive_sequence = next;
+        }
+        Ok(messages)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    fn ensure_open(&self) -> Result<(), HandshakeError> {
+        if self.closed {
+            Err(HandshakeError::Closed)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 fn identity_proof_input(hash: &[u8; HASH_SIZE], role: Role, key: &[u8; 32]) -> Vec<u8> {
     let mut input = Vec::with_capacity(SIGN_DOMAIN.len() + 1 + HASH_SIZE + 32);
     input.extend_from_slice(SIGN_DOMAIN);
@@ -379,6 +502,14 @@ fn fingerprint(
     digest.update(initiator);
     digest.update(responder);
     digest.finalize().into()
+}
+
+fn session_tag(hash: &[u8; HASH_SIZE]) -> [u8; 16] {
+    let mut digest = Sha256::new();
+    digest.update(ROUTE_DOMAIN);
+    digest.update(hash);
+    let full: [u8; HASH_SIZE] = digest.finalize().into();
+    full[..16].try_into().expect("fixed digest prefix")
 }
 
 fn encrypt(
@@ -563,5 +694,60 @@ mod tests {
         let mut frame = a.write_message(b"test").unwrap();
         frame[0] ^= 1;
         assert!(b.read_message(&frame).is_err());
+    }
+
+    #[test]
+    fn relay_frames_buffer_reordering_and_drop_duplicates() {
+        let (a, b) = exchange();
+        let (a, b) = confirm_pair(a, b);
+        let mut sender = super::SessionTransport::new(a);
+        let mut receiver = super::SessionTransport::new(b);
+        let first = sender.send(b"first").unwrap();
+        let second = sender.send(b"second").unwrap();
+
+        assert!(receiver.receive(&second).unwrap().is_empty());
+        assert_eq!(
+            receiver.receive(&first).unwrap(),
+            vec![b"first".to_vec(), b"second".to_vec()]
+        );
+        assert!(receiver.receive(&first).unwrap().is_empty());
+        assert!(!receiver.is_closed());
+    }
+
+    #[test]
+    fn wrong_session_and_out_of_window_frames_are_rejected() {
+        let (a, b) = exchange();
+        let (a, b) = confirm_pair(a, b);
+        let mut sender = super::SessionTransport::new(a);
+        let mut receiver = super::SessionTransport::new(b);
+        let mut wrong_tag = sender.send(b"hello").unwrap();
+        wrong_tag[4] ^= 1;
+        assert!(matches!(
+            receiver.receive(&wrong_tag),
+            Err(HandshakeError::InvalidEnvelope)
+        ));
+
+        let mut far_future = sender.send(b"next").unwrap();
+        far_future[20..28].copy_from_slice(&32_u64.to_be_bytes());
+        assert!(matches!(
+            receiver.receive(&far_future),
+            Err(HandshakeError::OutsideReorderWindow)
+        ));
+    }
+
+    #[test]
+    fn ciphertext_failure_closes_session_transport() {
+        let (a, b) = exchange();
+        let (a, b) = confirm_pair(a, b);
+        let mut sender = super::SessionTransport::new(a);
+        let mut receiver = super::SessionTransport::new(b);
+        let mut tampered = sender.send(b"hello").unwrap();
+        tampered[super::ENVELOPE_HEADER] ^= 1;
+        assert!(receiver.receive(&tampered).is_err());
+        assert!(receiver.is_closed());
+        assert!(matches!(
+            receiver.receive(&tampered),
+            Err(HandshakeError::Closed)
+        ));
     }
 }
