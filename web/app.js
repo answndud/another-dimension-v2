@@ -61,13 +61,30 @@ async function refreshIdentity() {
   if (response.status === 401) { show('entry'); return false; }
   if (!response.ok) throw new Error('status failed');
   identityId.textContent = await response.text();
-  const networkMode = await request('/api/network/mode');
-  document.querySelector('#network-mode').textContent = networkMode.ok
-    ? `${await networkMode.text()} · SOCKS 서비스가 실제 Tor인지는 확인하지 않습니다.`
-    : '연결 모드를 확인할 수 없습니다.';
+  await refreshNetworkSettings();
   show('active');
   await refreshHistoryList();
   return true;
+}
+
+async function refreshNetworkSettings() {
+  const response = await request('/api/settings/get');
+  if (!response.ok) throw new Error('settings unavailable');
+  const settings = await response.json();
+  const modeChoice = document.querySelector('#network-mode-choice');
+  const torAddress = document.querySelector('#tor-socks-address');
+  const notificationChoice = document.querySelector('#notifications-enabled');
+  const status = document.querySelector('#settings-status');
+  modeChoice.value = settings.savedMode;
+  torAddress.value = settings.socks || '127.0.0.1:9050';
+  notificationChoice.checked = settings.notifications;
+  document.querySelector('#tor-settings').hidden = modeChoice.value !== 'tor';
+  document.querySelector('#network-mode').textContent = settings.activeMode === 'tor'
+    ? `현재 연결: Tor SOCKS (${settings.activeSocks}) · 서비스를 Tor로 검증하지 않습니다.`
+    : '현재 연결: 일반 연결 · relay에 실제 IP가 보일 수 있습니다.';
+  status.textContent = settings.restartRequired
+    ? '저장된 모드가 실행 중인 모드와 다릅니다. 터미널에서 프로그램을 종료하고 다시 실행하세요.'
+    : '';
 }
 
 async function refreshHistoryList() {
@@ -268,7 +285,11 @@ async function startChat(path, code) {
   try {
     const response = await request(path, code);
     if (!response.ok) {
-      message.textContent = response.status === 401 ? '로그인이 필요합니다.' : '초대 코드를 확인하거나 relay 연결을 다시 시도하세요.';
+      message.textContent = response.status === 401
+        ? '로그인이 필요합니다.'
+        : response.status === 409
+          ? '연결 모드 설정을 적용하려면 터미널에서 프로그램을 종료한 뒤 다시 실행하세요.'
+          : '초대 코드를 확인하거나 relay 연결을 다시 시도하세요.';
       return;
     }
     await attachChat(await response.text());
@@ -376,6 +397,37 @@ document.querySelector('#close-added-code').addEventListener('click', () => {
   document.querySelector('#added-code-view').hidden = true;
 });
 
+document.querySelector('#network-mode-choice').addEventListener('change', (event) => {
+  document.querySelector('#tor-settings').hidden = event.target.value !== 'tor';
+});
+
+document.querySelector('#save-settings').addEventListener('click', async () => {
+  const mode = document.querySelector('#network-mode-choice').value;
+  const socks = document.querySelector('#tor-socks-address').value.trim();
+  const notifications = document.querySelector('#notifications-enabled').checked;
+  const status = document.querySelector('#settings-status');
+  try {
+    const response = await request('/api/settings/save', JSON.stringify({ mode, socks, notifications }));
+    if (response.status === 409) {
+      status.textContent = '연결 중인 대화를 먼저 종료하세요.';
+      return;
+    }
+    if (!response.ok) {
+      status.textContent = '설정을 저장하지 못했습니다. SOCKS 주소를 확인하세요.';
+      return;
+    }
+    const saved = await response.json();
+    status.textContent = saved.restartRequired
+      ? '설정을 저장했습니다. 모드 적용을 위해 터미널에서 프로그램을 종료한 뒤 다시 실행하세요. 터미널의 새 주소와 로컬 연결 코드를 사용하고, 다시 연 화면에서 개인 접속 코드로 로그인하세요.'
+      : '설정을 저장했습니다.';
+    document.querySelector('#network-mode').textContent = saved.activeMode === 'tor'
+      ? `현재 연결: Tor SOCKS (${saved.activeSocks}) · 서비스를 Tor로 검증하지 않습니다.`
+      : '현재 연결: 일반 연결 · relay에 실제 IP가 보일 수 있습니다.';
+  } catch (_) {
+    status.textContent = '설정을 저장하지 못했습니다.';
+  }
+});
+
 loginForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   message.textContent = '';
@@ -419,6 +471,7 @@ document.querySelector('#create-invite').addEventListener('click', async () => {
   message.textContent = '';
   try {
     const response = await request('/api/invite/create');
+    if (response.status === 409) { message.textContent = '연결 모드 설정을 적용하려면 프로그램을 다시 실행하세요.'; return; }
     if (!response.ok) throw new Error('invite generation failed');
     currentInvite = await response.text();
     inviteCode.value = currentInvite;

@@ -8,9 +8,12 @@ use base64::Engine;
 use identity::Identity;
 use relay::{InviteCode, RelayRendezvous, RelaySession, RelayUpdate, DEFAULT_RELAY};
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::fs::{create_dir_all, rename, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -33,6 +36,15 @@ struct State {
     identity: Option<Arc<Identity>>,
     chats: HashMap<String, Arc<ChatOperation>>,
     tor_socks: Option<SocketAddr>,
+    settings: AppSettings,
+    notifications_enabled: Arc<AtomicBool>,
+    last_notification: Arc<Mutex<Option<Instant>>>,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct AppSettings {
+    tor_socks: Option<SocketAddr>,
+    notifications: bool,
 }
 
 enum ChatCommand {
@@ -78,6 +90,8 @@ fn spawn_chat_worker(
     identity: Arc<Identity>,
     cancelled: Arc<AtomicBool>,
     tor_socks: Option<SocketAddr>,
+    notifications_enabled: Arc<AtomicBool>,
+    last_notification: Arc<Mutex<Option<Instant>>>,
 ) {
     thread::spawn(move || {
         let result = (|| -> Result<(RelaySession, Option<history::History>, Vec<ChatEntry>, Option<String>), String> {
@@ -237,6 +251,11 @@ fn spawn_chat_worker(
                                 if save_error.is_some() {
                                     history = None;
                                 }
+                                if notifications_enabled.load(Ordering::SeqCst)
+                                    && should_send_notification(&last_notification)
+                                {
+                                    notify_incoming_message();
+                                }
                                 chat_update(&operation, |snapshot| {
                                     snapshot.messages.push(ChatEntry {
                                         unix_time: entry.unix_time,
@@ -315,6 +334,34 @@ fn any_chat_active(state: &State) -> bool {
     })
 }
 
+fn respond_settings(stream: &mut TcpStream, state: &State) -> io::Result<()> {
+    let active_mode = if state.tor_socks.is_some() {
+        "tor"
+    } else {
+        "general"
+    };
+    let saved_mode = if state.settings.tor_socks.is_some() {
+        "tor"
+    } else {
+        "general"
+    };
+    let payload = serde_json::json!({
+        "activeMode": active_mode,
+        "savedMode": saved_mode,
+        "socks": state.settings.tor_socks.map(|address| address.to_string()),
+        "activeSocks": state.tor_socks.map(|address| address.to_string()),
+        "notifications": state.settings.notifications,
+        "restartRequired": state.tor_socks != state.settings.tor_socks,
+    })
+    .to_string();
+    respond(
+        stream,
+        "200 OK",
+        "application/json; charset=utf-8",
+        payload.as_bytes(),
+    )
+}
+
 fn update_closed_chat_history(
     state: &State,
     peer_id: &str,
@@ -377,6 +424,147 @@ fn issue_code(state: &mut State) -> io::Result<()> {
     println!("로컬 연결 코드: {}", state.code);
     println!("새 연결 코드를 발급하려면 Enter를 누르세요.");
     Ok(())
+}
+
+fn preferences_path() -> io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory is unavailable"))?;
+    Ok(home
+        .join("Library/Application Support/Another Dimension v2")
+        .join("preferences.json"))
+}
+
+fn load_settings() -> io::Result<AppSettings> {
+    let path = preferences_path()?;
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(AppSettings::default()),
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.len() > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "settings file is too large",
+        ));
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    let value: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "settings file is invalid"))?;
+    let tor_socks = match value.get("torSocks") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => Some(parse_loopback_socks(value)?),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "settings SOCKS address is invalid",
+            ))
+        }
+    };
+    let notifications = value
+        .get("notifications")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(AppSettings {
+        tor_socks,
+        notifications,
+    })
+}
+
+fn save_settings(settings: &AppSettings) -> io::Result<()> {
+    let path = preferences_path()?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| io::Error::other("settings directory unavailable"))?;
+    create_dir_all(directory)?;
+    set_private_directory(directory)?;
+    let contents = serde_json::to_vec(&serde_json::json!({
+        "torSocks": settings.tor_socks.map(|address| address.to_string()),
+        "notifications": settings.notifications,
+    }))?;
+    let temporary = path.with_extension(format!("{}.tmp", random_token()?));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        set_private_file(&file)?;
+        file.write_all(&contents)?;
+        file.sync_all()?;
+        rename(&temporary, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+fn parse_loopback_socks(value: &str) -> io::Result<SocketAddr> {
+    let address: SocketAddr = value.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SOCKS 주소는 127.0.0.1:9050 형식이어야 합니다.",
+        )
+    })?;
+    if !address.ip().is_loopback() || address.port() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SOCKS 주소는 loopback과 유효한 포트만 허용합니다.",
+        ));
+    }
+    Ok(address)
+}
+
+#[cfg(unix)]
+fn set_private_directory(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_private_directory(_path: &std::path::Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file(file: &File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_file(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
+fn notify_incoming_message() {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = thread::Builder::new()
+            .name("local-notification".to_owned())
+            .spawn(|| {
+                let _ = Command::new("/usr/bin/osascript")
+                    .args([
+                        "-e",
+                        "display notification \"새 메시지가 도착했습니다\" with title \"Another Dimension\"",
+                    ])
+                    .status();
+            });
+    }
+}
+
+fn should_send_notification(last_notification: &Mutex<Option<Instant>>) -> bool {
+    let Ok(mut last_notification) = last_notification.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    if last_notification.is_some_and(|last| now.duration_since(last) < Duration::from_secs(5)) {
+        return false;
+    }
+    *last_notification = Some(now);
+    true
 }
 
 fn respond(
@@ -473,6 +661,8 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/identity/logout HTTP/1.1"
             | "POST /api/identity/add-code HTTP/1.1"
             | "POST /api/network/mode HTTP/1.1"
+            | "POST /api/settings/get HTTP/1.1"
+            | "POST /api/settings/save HTTP/1.1"
             | "POST /api/invite/create HTTP/1.1"
             | "POST /api/chat/create HTTP/1.1"
             | "POST /api/chat/join HTTP/1.1"
@@ -560,16 +750,55 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         if !body.is_empty() {
             return reject(&mut stream, "400 Bad Request");
         }
-        let mode = match state.tor_socks {
-            Some(proxy) => format!("Tor/SOCKS 전용 · {proxy}"),
-            None => "일반 연결 · relay에 실제 IP가 보일 수 있습니다".to_owned(),
+        return respond_settings(&mut stream, &state);
+    }
+    if first == "POST /api/settings/get HTTP/1.1" {
+        if !body.is_empty() {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        return respond_settings(&mut stream, &state);
+    }
+    if first == "POST /api/settings/save HTTP/1.1" {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return reject(&mut stream, "400 Bad Request");
         };
-        return respond(
-            &mut stream,
-            "200 OK",
-            "text/plain; charset=utf-8",
-            mode.as_bytes(),
-        );
+        let Some(mode) = value.get("mode").and_then(serde_json::Value::as_str) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let tor_socks = match mode {
+            "general" => None,
+            "tor" => {
+                let Some(address) = value.get("socks").and_then(serde_json::Value::as_str) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                match parse_loopback_socks(address) {
+                    Ok(address) => Some(address),
+                    Err(_) => return reject(&mut stream, "400 Bad Request"),
+                }
+            }
+            _ => return reject(&mut stream, "400 Bad Request"),
+        };
+        let Some(notifications) = value
+            .get("notifications")
+            .and_then(serde_json::Value::as_bool)
+        else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        if tor_socks != state.tor_socks && any_chat_active(&state) {
+            return reject(&mut stream, "409 Conflict");
+        }
+        let settings = AppSettings {
+            tor_socks,
+            notifications,
+        };
+        if save_settings(&settings).is_err() {
+            return reject(&mut stream, "500 Internal Server Error");
+        }
+        state
+            .notifications_enabled
+            .store(notifications, Ordering::SeqCst);
+        state.settings = settings;
+        return respond_settings(&mut stream, &state);
     }
     if first == "POST /api/identity/add-code HTTP/1.1" {
         let Some(identity) = state.identity.as_ref() else {
@@ -587,6 +816,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         );
     }
     if first == "POST /api/invite/create HTTP/1.1" {
+        if state.tor_socks != state.settings.tor_socks {
+            return reject(&mut stream, "409 Conflict");
+        }
         if state.identity.is_none() {
             return reject(&mut stream, "401 Unauthorized");
         }
@@ -602,6 +834,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         first.as_str(),
         "POST /api/chat/create HTTP/1.1" | "POST /api/chat/join HTTP/1.1"
     ) {
+        if state.tor_socks != state.settings.tor_socks {
+            return reject(&mut stream, "409 Conflict");
+        }
         let Some(identity) = state.identity.as_ref().cloned() else {
             return reject(&mut stream, "401 Unauthorized");
         };
@@ -625,6 +860,8 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         });
         let cancelled = Arc::clone(&operation.cancelled);
         let tor_socks = state.tor_socks;
+        let notifications_enabled = Arc::clone(&state.notifications_enabled);
+        let last_notification = Arc::clone(&state.last_notification);
         let role = if first == "POST /api/chat/create HTTP/1.1" {
             RoleForChat::Create
         } else {
@@ -636,7 +873,15 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             .insert(operation_id.clone(), Arc::clone(&operation));
         drop(state);
         spawn_chat_worker(
-            operation, receiver, role, code, identity, cancelled, tor_socks,
+            operation,
+            receiver,
+            role,
+            code,
+            identity,
+            cancelled,
+            tor_socks,
+            notifications_enabled,
+            last_notification,
         );
         return respond(
             &mut stream,
@@ -1015,43 +1260,16 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok")
 }
 
-fn parse_tor_socks_arg() -> io::Result<Option<SocketAddr>> {
-    let mut args = std::env::args().skip(1);
-    let Some(option) = args.next() else {
-        return Ok(None);
-    };
-    if option != "--tor-socks" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "사용법: another-dimension-v2 [--tor-socks 127.0.0.1:9050]",
-        ));
-    }
-    let endpoint = args.next().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "Tor SOCKS 주소가 필요합니다.")
-    })?;
-    if args.next().is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "사용법: another-dimension-v2 [--tor-socks 127.0.0.1:9050]",
-        ));
-    }
-    let endpoint: SocketAddr = endpoint.parse().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Tor SOCKS 주소는 127.0.0.1:9050 형식이어야 합니다.",
-        )
-    })?;
-    if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Tor SOCKS는 로컬 loopback 주소와 유효한 포트만 허용합니다.",
-        ));
-    }
-    Ok(Some(endpoint))
-}
-
 fn main() -> io::Result<()> {
-    let tor_socks = parse_tor_socks_arg()?;
+    if std::env::args().nth(1).is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "실행 옵션은 지원하지 않습니다. 연결 모드는 앱 설정에서 선택하세요.",
+        ));
+    }
+    let settings = load_settings()?;
+    let tor_socks = settings.tor_socks;
+    let notifications_enabled = Arc::new(AtomicBool::new(settings.notifications));
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
     let state = Arc::new(Mutex::new(State {
@@ -1062,6 +1280,9 @@ fn main() -> io::Result<()> {
         identity: None,
         chats: HashMap::new(),
         tor_socks,
+        settings,
+        notifications_enabled,
+        last_notification: Arc::new(Mutex::new(None)),
     }));
     println!("http://{address}/");
     if let Some(proxy) = tor_socks {
