@@ -1,3 +1,4 @@
+pub mod channel;
 mod identity;
 
 use identity::Identity;
