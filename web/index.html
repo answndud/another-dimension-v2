@@ -28,6 +28,9 @@
     .meta { color: #59636e; font-size: .92rem; }
     .panel { padding: 1rem; border: 1px solid #e0e4e8; border-radius: .5rem; background: #fafbfc; }
     .conversation { display: grid; gap: .65rem; max-height: 28rem; overflow: auto; margin: 1rem 0; padding: .75rem; border: 1px solid #e0e4e8; border-radius: .5rem; background: #fafbfc; }
+    .history-list { display: grid; gap: .5rem; margin-top: .8rem; }
+    .history-item { display: grid; width: 100%; gap: .15rem; text-align: left; }
+    .history-item small { color: #59636e; font-weight: 400; }
     .entry { padding: .65rem .75rem; border: 1px solid #e0e4e8; border-radius: .5rem; background: #fff; overflow-wrap: anywhere; white-space: pre-wrap; }
     .entry.mine { margin-left: 12%; background: #f1f5f9; }
     .entry time { display: block; margin-bottom: .25rem; color: #69737d; font-size: .78rem; }
@@ -78,6 +81,12 @@
         </form>
       </div>
       <div class="actions"><button id="logout" type="button">로그아웃</button><button class="disconnect" type="button">로컬 연결 해제</button></div>
+      <section aria-labelledby="history-heading">
+        <h3 id="history-heading">대화 기록</h3>
+        <label for="history-filter">상대 ID 검색</label>
+        <input id="history-filter" type="search" autocomplete="off">
+        <div id="history-list" class="history-list" aria-live="polite"></div>
+      </section>
     </section>
     <section id="invite-view" hidden>
       <h2>초대 코드</h2>
@@ -108,6 +117,17 @@
         <div class="actions"><button type="submit" class="primary">전송</button></div>
       </form>
       <div class="actions"><button id="close-chat" type="button">연결 종료</button></div>
+    </section>
+    <section id="history-detail" hidden>
+      <h2>대화 기록</h2>
+      <p id="history-peer" class="identity-id"></p>
+      <div class="actions">
+        <button id="history-back" type="button">대화 목록</button>
+        <button id="history-export" type="button">TXT 저장</button>
+      </div>
+      <label for="message-filter">메시지 검색</label>
+      <input id="message-filter" type="search" autocomplete="off">
+      <div id="history-messages" class="conversation" aria-live="polite"></div>
     </section>
     <p id="message" role="status" aria-live="polite"></p>
   </main>

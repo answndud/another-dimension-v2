@@ -413,6 +413,8 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/chat/cancel HTTP/1.1"
             | "POST /api/chat/send HTTP/1.1"
             | "POST /api/chat/messages HTTP/1.1"
+            | "POST /api/history/list HTTP/1.1"
+            | "POST /api/history/messages HTTP/1.1"
     ) {
         return reject(&mut stream, "404 Not Found");
     }
@@ -648,6 +650,59 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             "200 OK",
             "application/json; charset=utf-8",
             serde_json::to_string(&messages)?.as_bytes(),
+        );
+    }
+    if first == "POST /api/history/list HTTP/1.1" {
+        let Some(identity) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        let summaries = match history::History::list(identity) {
+            Ok(summaries) => summaries,
+            Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+        };
+        let payload: Vec<_> = summaries
+            .into_iter()
+            .map(|item| {
+                serde_json::json!({
+                    "peerId": item.peer_id,
+                    "messageCount": item.message_count,
+                    "lastMessage": item.last_message
+                })
+            })
+            .collect();
+        return respond(
+            &mut stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            serde_json::to_string(&payload)?.as_bytes(),
+        );
+    }
+    if first == "POST /api/history/messages HTTP/1.1" {
+        let Some(identity) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        let (_, messages, _) = match history::History::open(identity, body) {
+            Ok(history) => history,
+            Err(_) => return reject(&mut stream, "400 Bad Request"),
+        };
+        let payload: Vec<_> = messages
+            .into_iter()
+            .map(|item| {
+                serde_json::json!({
+                    "time": item.unix_time,
+                    "sender": match item.sender {
+                        history::MessageSender::Me => "나",
+                        history::MessageSender::Other => "상대방",
+                    },
+                    "text": item.text
+                })
+            })
+            .collect();
+        return respond(
+            &mut stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            serde_json::to_string(&payload)?.as_bytes(),
         );
     }
     match first.as_str() {

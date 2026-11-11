@@ -6,14 +6,17 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::fs::{create_dir_all, File, OpenOptions};
+use std::fs::{create_dir_all, rename, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 8] = b"ADLOG1\0\0";
 const MAX_MESSAGE_BYTES: usize = 4096;
 const NONCE_BYTES: usize = 12;
+const INDEX_MAGIC: &[u8; 8] = b"ADIDX1\0\0";
+static INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredMessage {
@@ -26,6 +29,13 @@ pub struct StoredMessage {
 pub enum MessageSender {
     Me,
     Other,
+}
+
+#[derive(Clone, Debug)]
+pub struct Summary {
+    pub peer_id: String,
+    pub message_count: usize,
+    pub last_message: Option<u64>,
 }
 
 pub struct History {
@@ -78,6 +88,7 @@ impl History {
         let (messages, next_index, recovered_partial) =
             read_records(&mut file, Zeroizing::new(*key), &identity_id, &peer_id)?;
         file.seek(SeekFrom::End(0))?;
+        register_conversation(identity, &identity_id, &peer_id, &directory)?;
 
         Ok((
             Self {
@@ -134,6 +145,146 @@ impl History {
             .ok_or_else(|| io::Error::other("history record limit reached"))?;
         Ok(())
     }
+
+    pub fn list(identity: &Identity) -> io::Result<Vec<Summary>> {
+        let identity_id = identity.public_id();
+        let directory = data_directory()?.join(&identity_id);
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        let peers = read_index(identity, &identity_id, &directory)?;
+        let mut summaries = Vec::with_capacity(peers.len());
+        for peer_id in peers {
+            let (_, messages, _) = Self::open(identity, &peer_id)?;
+            summaries.push(Summary {
+                peer_id,
+                message_count: messages.len(),
+                last_message: messages.last().map(|item| item.unix_time),
+            });
+        }
+        summaries.sort_by(|left, right| right.last_message.cmp(&left.last_message));
+        Ok(summaries)
+    }
+}
+
+fn register_conversation(
+    identity: &Identity,
+    identity_id: &str,
+    peer_id: &str,
+    directory: &std::path::Path,
+) -> io::Result<()> {
+    let lock = INDEX_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| io::Error::other("history index unavailable"))?;
+    let mut peers = read_index(identity, identity_id, directory)?;
+    if peers.iter().any(|existing| existing == peer_id) {
+        return Ok(());
+    }
+    peers.push(peer_id.to_owned());
+    write_index(identity, identity_id, directory, &peers)
+}
+
+fn read_index(
+    identity: &Identity,
+    identity_id: &str,
+    directory: &std::path::Path,
+) -> io::Result<Vec<String>> {
+    let path = directory.join("conversations.idx");
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    if bytes.len() < INDEX_MAGIC.len() + NONCE_BYTES + 16 || &bytes[..8] != INDEX_MAGIC {
+        return Err(invalid_data("invalid history index"));
+    }
+    let key = derive_index_key(&identity.storage_key());
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
+        .map_err(|_| invalid_data("invalid history index key"))?;
+    let nonce = &bytes[INDEX_MAGIC.len()..INDEX_MAGIC.len() + NONCE_BYTES];
+    let payload = cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: &bytes[INDEX_MAGIC.len() + NONCE_BYTES..],
+                aad: identity_id.as_bytes(),
+            },
+        )
+        .map_err(|_| invalid_data("history index authentication failed"))?;
+    if payload.len() < 4 {
+        return Err(invalid_data("invalid history index payload"));
+    }
+    let count = u32::from_be_bytes(payload[..4].try_into().expect("fixed slice")) as usize;
+    if count > 100_000 || payload.len() != 4 + count * 32 {
+        return Err(invalid_data("invalid history index count"));
+    }
+    Ok(payload[4..]
+        .chunks_exact(32)
+        .map(|chunk| chunk.iter().map(|byte| format!("{byte:02x}")).collect())
+        .collect())
+}
+
+fn write_index(
+    identity: &Identity,
+    identity_id: &str,
+    directory: &std::path::Path,
+    peers: &[String],
+) -> io::Result<()> {
+    let count = u32::try_from(peers.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many conversations"))?;
+    let mut payload = Vec::with_capacity(4 + peers.len() * 32);
+    payload.extend_from_slice(&count.to_be_bytes());
+    for peer in peers {
+        for chunk in peer.as_bytes().chunks_exact(2) {
+            payload.push((hex_digit(chunk[0])? << 4) | hex_digit(chunk[1])?);
+        }
+    }
+    let nonce = random_nonce()?;
+    let key = derive_index_key(&identity.storage_key());
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
+        .map_err(|_| io::Error::other("history index key unavailable"))?;
+    let encrypted = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &payload,
+                aad: identity_id.as_bytes(),
+            },
+        )
+        .map_err(|_| io::Error::other("history index encryption failed"))?;
+    let temporary = directory.join(format!(
+        ".index-{}.tmp",
+        opaque_conversation_name(&key, &hex_encode(&nonce))
+    ));
+    let path = directory.join("conversations.idx");
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    set_private_file(&file)?;
+    file.write_all(INDEX_MAGIC)?;
+    file.write_all(&nonce)?;
+    file.write_all(&encrypted)?;
+    file.sync_all()?;
+    drop(file);
+    rename(temporary, path)?;
+    Ok(())
+}
+
+fn hex_digit(byte: u8) -> io::Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid peer id",
+        )),
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn read_records(

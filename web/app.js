@@ -14,6 +14,11 @@ const joinCode = document.querySelector('#join-code');
 const chatView = document.querySelector('#chat-view');
 const chatStatus = document.querySelector('#chat-status');
 const storageStatus = document.querySelector('#storage-status');
+const historyList = document.querySelector('#history-list');
+const historyDetail = document.querySelector('#history-detail');
+const historyMessages = document.querySelector('#history-messages');
+const historyFilter = document.querySelector('#history-filter');
+const messageFilter = document.querySelector('#message-filter');
 const verification = document.querySelector('#verification');
 const sendForm = document.querySelector('#send-form');
 const chatText = document.querySelector('#chat-text');
@@ -27,6 +32,8 @@ let operationId = null;
 let messageCursor = 0;
 let pollTimer = null;
 let lastPhase = '';
+let selectedHistoryPeer = '';
+let selectedHistoryMessages = [];
 
 function show(view) {
   bridgeForm.hidden = view !== 'bridge';
@@ -35,6 +42,7 @@ function show(view) {
   active.hidden = view !== 'active';
   inviteView.hidden = view !== 'invite';
   chatView.hidden = view !== 'chat';
+  historyDetail.hidden = view !== 'history';
 }
 
 async function request(path, body = '', session = token) {
@@ -49,7 +57,93 @@ async function refreshIdentity() {
   if (!response.ok) throw new Error('status failed');
   identityId.textContent = await response.text();
   show('active');
+  await refreshHistoryList();
   return true;
+}
+
+async function refreshHistoryList() {
+  historyList.replaceChildren();
+  let items;
+  try {
+    const response = await request('/api/history/list');
+    if (!response.ok) throw new Error('history list unavailable');
+    items = await response.json();
+  } catch (_) {
+    const error = document.createElement('p');
+    error.className = 'meta';
+    error.textContent = '대화 기록 목록을 불러오지 못했습니다.';
+    historyList.append(error);
+    return;
+  }
+  for (const item of items) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'history-item';
+    button.dataset.peerId = item.peerId;
+    const label = document.createElement('span');
+    label.textContent = `대화 ${item.peerId.slice(0, 12)}`;
+    const details = document.createElement('small');
+    const lastMessage = item.lastMessage ? formatTime(item.lastMessage) : '메시지 없음';
+    details.textContent = `${item.messageCount}개 메시지 · ${lastMessage}`;
+    button.append(label, details);
+    button.addEventListener('click', () => openHistory(item.peerId).catch(() => {
+      message.textContent = '대화 기록을 열지 못했습니다.';
+    }));
+    historyList.append(button);
+  }
+  filterHistoryList();
+  if (!items.length) {
+    const empty = document.createElement('p');
+    empty.className = 'meta';
+    empty.textContent = '저장된 대화가 없습니다.';
+    historyList.append(empty);
+  } else if (!historyList.querySelector('button:not([hidden])')) {
+    const empty = document.createElement('p');
+    empty.className = 'meta';
+    empty.textContent = '검색 결과가 없습니다.';
+    historyList.append(empty);
+  }
+}
+
+function filterHistoryList() {
+  const query = historyFilter.value.trim().toLowerCase();
+  for (const item of historyList.querySelectorAll('button[data-peer-id]')) {
+    item.hidden = !item.dataset.peerId.toLowerCase().includes(query);
+  }
+}
+
+function renderHistoryMessages() {
+  const query = messageFilter.value.trim().toLocaleLowerCase();
+  historyMessages.replaceChildren();
+  for (const item of selectedHistoryMessages) {
+    if (query && !item.text.toLocaleLowerCase().includes(query)) continue;
+    const card = document.createElement('article');
+    card.className = `entry${item.sender === '나' ? ' mine' : ''}`;
+    const time = document.createElement('time');
+    time.dateTime = new Date(item.time * 1000).toISOString();
+    time.textContent = `${formatTime(item.time)} [${item.sender}]`;
+    const body = document.createElement('div');
+    body.textContent = item.text;
+    card.append(time, body);
+    historyMessages.append(card);
+  }
+  if (!historyMessages.childElementCount) {
+    const empty = document.createElement('p');
+    empty.className = 'meta';
+    empty.textContent = query ? '검색 결과가 없습니다.' : '저장된 메시지가 없습니다.';
+    historyMessages.append(empty);
+  }
+}
+
+async function openHistory(peerId) {
+  const response = await request('/api/history/messages', peerId);
+  if (!response.ok) { message.textContent = '대화 기록을 열지 못했습니다.'; return; }
+  selectedHistoryPeer = peerId;
+  selectedHistoryMessages = await response.json();
+  document.querySelector('#history-peer').textContent = peerId;
+  messageFilter.value = '';
+  renderHistoryMessages();
+  show('history');
 }
 
 function stopPolling() {
@@ -239,6 +333,10 @@ document.querySelector('#logout').addEventListener('click', async () => {
     operationId = null;
     sessionStorage.removeItem(operationKey);
     identityId.textContent = '';
+    selectedHistoryPeer = '';
+    selectedHistoryMessages = [];
+    historyMessages.replaceChildren();
+    historyList.replaceChildren();
     show('entry');
     message.textContent = '';
   } catch (_) { message.textContent = '로그아웃하지 못했습니다. 로컬 프로그램을 종료하세요.'; }
@@ -331,6 +429,20 @@ document.querySelector('#close-chat').addEventListener('click', async () => {
   sessionStorage.removeItem(operationKey);
   conversation.replaceChildren();
   show('active');
+  refreshHistoryList().catch(() => {});
+});
+
+historyFilter.addEventListener('input', filterHistoryList);
+messageFilter.addEventListener('input', renderHistoryMessages);
+document.querySelector('#history-back').addEventListener('click', () => show('active'));
+document.querySelector('#history-export').addEventListener('click', () => {
+  const lines = selectedHistoryMessages.map((item) => `${formatTime(item.time)} [${item.sender}]: ${item.text}`);
+  const url = URL.createObjectURL(new Blob([lines.join('\n') + (lines.length ? '\n' : '')], { type: 'text/plain;charset=utf-8' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `another-dimension-${selectedHistoryPeer.slice(0, 12)}.txt`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 });
 
 restoreSession();
