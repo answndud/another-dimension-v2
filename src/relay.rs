@@ -30,10 +30,10 @@ use zeroize::Zeroizing;
 const EVENT_KIND: u16 = 20_000;
 pub const DEFAULT_RELAY: &str = "wss://relay.primal.net";
 const SUBSCRIPTION_ID: &str = "ad-v2-live";
-const INVITE_PREFIX: &str = "ADI1-";
-const INVITE_TOPIC_INFO: &[u8] = b"another-dimension-v2/invite-topic/v1";
-const INVITE_KEY_INFO: &[u8] = b"another-dimension-v2/invite-relay-key/v1";
-const INVITE_DOMAIN: &[u8] = b"another-dimension-v2/invite-code/v1";
+const INVITE_PREFIX: &str = "ADI2-";
+const INVITE_TOPIC_INFO: &[u8] = b"another-dimension-v2/invite-topic/v2";
+const INVITE_KEY_INFO: &[u8] = b"another-dimension-v2/invite-relay-key/v2";
+const INVITE_DOMAIN: &[u8] = b"another-dimension-v2/invite-code/v2";
 const READY_REQUEST_PREFIX: &[u8] = b"\0AD2-READY-1:";
 const READY_ACK_PREFIX: &[u8] = b"\0AD2-READY-ACK-1:";
 const MAX_BOOTSTRAP_FRAME: usize = 256;
@@ -907,6 +907,15 @@ mod tests {
     }
 
     #[test]
+    fn invite_codes_mark_the_current_rendezvous_protocol_version() {
+        let invite = InviteCode::generate().unwrap();
+        assert!(invite.code().starts_with("ADI2-"));
+        assert!(InviteCode::parse(invite.code()).is_some());
+        let legacy = invite.code().replacen("ADI2-", "ADI1-", 1);
+        assert!(InviteCode::parse(&legacy).is_none());
+    }
+
+    #[test]
     fn socks_connection_sends_the_relay_hostname_to_the_proxy() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let proxy = listener.local_addr().unwrap();
@@ -1014,6 +1023,20 @@ mod tests {
         );
         let mut session = rendezvous.confirm(verification).unwrap();
         barrier.wait();
+        session.send(crate::PEER_HEARTBEAT_FRAME).unwrap();
+        let heartbeat_deadline = Instant::now() + Duration::from_secs(15);
+        let mut saw_peer_heartbeat = false;
+        while Instant::now() < heartbeat_deadline {
+            if let Some(RelayUpdate::Messages(messages)) = session.poll().unwrap() {
+                saw_peer_heartbeat |= messages
+                    .iter()
+                    .any(|message| message.as_slice() == crate::PEER_HEARTBEAT_FRAME);
+                if saw_peer_heartbeat {
+                    break;
+                }
+            }
+        }
+        assert!(saw_peer_heartbeat);
         let (send, expected) = match role {
             Role::Initiator => ("initiator message", "responder message"),
             Role::Responder => ("responder message", "initiator message"),

@@ -27,6 +27,9 @@ const MAX_HEADER: usize = 8192;
 const MAX_BODY: usize = 24 * 1024 * 1024;
 const CODE_LIFETIME: Duration = Duration::from_secs(300);
 const MAX_ATTEMPTS: u8 = 5;
+const PEER_HEARTBEAT_FRAME: &[u8] = &[0xff, b'A', b'D', b'2', b'-', b'H', b'B', b'2'];
+const PEER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const PEER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 
 struct State {
     code: String,
@@ -81,6 +84,21 @@ fn chat_update(operation: &ChatOperation, update: impl FnOnce(&mut ChatSnapshot)
     if let Ok(mut snapshot) = operation.snapshot.lock() {
         update(&mut snapshot);
     }
+}
+
+fn mark_chat_disconnected(operation: &ChatOperation, reason: &str, delivery_unknown: bool) {
+    chat_update(operation, |snapshot| {
+        snapshot.phase = "disconnected";
+        if delivery_unknown {
+            snapshot.relay_ack = Some("unknown".to_owned());
+            snapshot.pending_sends = 0;
+            snapshot.error = Some(format!(
+                "{reason} 마지막 메시지의 전달 결과를 알 수 없습니다. 로컬 기록을 확인하고 다시 보낼 때는 중복 가능성을 고려하세요."
+            ));
+        } else {
+            snapshot.error = Some(reason.to_owned());
+        }
+    });
 }
 
 fn relay_failure_message(error: &RelayError, phase: &str, using_tor: bool) -> String {
@@ -230,8 +248,32 @@ fn spawn_chat_worker(
             }
         };
         let mut pending_events = HashSet::<String>::new();
+        let mut last_peer_activity = Instant::now();
+        let mut last_heartbeat = Instant::now();
 
         while !operation.cancelled.load(Ordering::SeqCst) {
+            let now = Instant::now();
+            if now.duration_since(last_peer_activity) >= PEER_HEARTBEAT_TIMEOUT {
+                drop(history.take());
+                mark_chat_disconnected(
+                    &operation,
+                    "상대 응답이 45초 동안 없어 연결을 종료했습니다.",
+                    !pending_events.is_empty(),
+                );
+                return;
+            }
+            if now.duration_since(last_heartbeat) >= PEER_HEARTBEAT_INTERVAL {
+                if session.send(PEER_HEARTBEAT_FRAME).is_err() {
+                    drop(history.take());
+                    mark_chat_disconnected(
+                        &operation,
+                        "relay 연결이 끊겼습니다.",
+                        !pending_events.is_empty(),
+                    );
+                    return;
+                }
+                last_heartbeat = Instant::now();
+            }
             loop {
                 match commands.try_recv() {
                     Ok(ChatCommand::Send(text)) => match session.send(text.as_bytes()) {
@@ -306,6 +348,11 @@ fn spawn_chat_worker(
             match session.poll() {
                 Ok(Some(RelayUpdate::Messages(messages))) => {
                     for message in messages {
+                        if message == PEER_HEARTBEAT_FRAME {
+                            last_peer_activity = Instant::now();
+                            continue;
+                        }
+                        last_peer_activity = Instant::now();
                         match String::from_utf8(message) {
                             Ok(text) => {
                                 let entry = history::StoredMessage {

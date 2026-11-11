@@ -522,6 +522,10 @@ joinForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const code = joinCode.value.trim();
   joinCode.value = '';
+  if (code.startsWith('ADI1-')) {
+    message.textContent = '이 초대 코드는 이전 연결 프로토콜용입니다. 두 기기에서 같은 앱 버전을 사용해 새 코드를 만드세요.';
+    return;
+  }
   await startChat('/api/chat/join', code);
 });
 
