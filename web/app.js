@@ -466,8 +466,23 @@ document.querySelector('#history-export').addEventListener('click', () => {
 });
 
 document.querySelector('#history-backup-export').addEventListener('click', async () => {
+  const passwordField = document.querySelector('#history-backup-export-password');
+  const confirmationField = document.querySelector('#history-backup-export-password-confirm');
+  const password = passwordField.value;
+  if (password !== confirmationField.value) {
+    passwordField.value = '';
+    confirmationField.value = '';
+    message.textContent = '백업 비밀번호가 일치하지 않습니다.';
+    return;
+  }
+  if (password && [...password].length < 12) {
+    passwordField.value = '';
+    confirmationField.value = '';
+    message.textContent = '백업 비밀번호는 12자 이상이어야 합니다.';
+    return;
+  }
   try {
-    const response = await request('/api/history/export-backup', selectedHistoryPeer);
+    const response = await request('/api/history/export-backup', JSON.stringify({ peerId: selectedHistoryPeer, password }));
     if (response.status === 409) { message.textContent = '먼저 해당 대화의 연결을 종료한 뒤 다시 시도하세요.'; return; }
     if (!response.ok) { message.textContent = '암호화 백업을 만들지 못했습니다.'; return; }
     const binary = atob(await response.text());
@@ -482,13 +497,31 @@ document.querySelector('#history-backup-export').addEventListener('click', async
     message.textContent = '암호화 백업 파일을 저장했습니다.';
   } catch (_) {
     message.textContent = '암호화 백업을 저장하지 못했습니다.';
+  } finally {
+    passwordField.value = '';
+    confirmationField.value = '';
   }
 });
 
 document.querySelector('#history-backup-import').addEventListener('click', async () => {
   const file = document.querySelector('#history-backup-file').files[0];
-  if (!file) { message.textContent = '가져올 백업 파일을 선택하세요.'; return; }
-  if (file.size > 16 * 1024 * 1024) { message.textContent = '백업 파일은 16 MB 이하여야 합니다.'; return; }
+  const passwordField = document.querySelector('#history-backup-import-password');
+  const password = passwordField.value;
+  if (!file) {
+    passwordField.value = '';
+    message.textContent = '가져올 백업 파일을 선택하세요.';
+    return;
+  }
+  if (file.size > 16 * 1024 * 1024) {
+    passwordField.value = '';
+    message.textContent = '백업 파일은 16 MB 이하여야 합니다.';
+    return;
+  }
+  if (password && [...password].length < 12) {
+    passwordField.value = '';
+    message.textContent = '백업 비밀번호는 12자 이상이어야 합니다.';
+    return;
+  }
   try {
     const dataUrl = await new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -497,9 +530,9 @@ document.querySelector('#history-backup-import').addEventListener('click', async
       reader.readAsDataURL(file);
     });
     const encoded = String(dataUrl).slice(String(dataUrl).indexOf(',') + 1);
-    const response = await request('/api/history/import-backup', encoded);
+    const response = await request('/api/history/import-backup', JSON.stringify({ backup: encoded, password }));
     if (response.status === 409) { message.textContent = '먼저 모든 대화 연결을 종료한 뒤 다시 시도하세요.'; return; }
-    if (!response.ok) { message.textContent = '파일이 손상되었거나 다른 신원용 백업입니다.'; return; }
+    if (!response.ok) { message.textContent = '파일, 비밀번호 또는 신원 코드가 맞지 않습니다.'; return; }
     const result = await response.json();
     document.querySelector('#history-backup-file').value = '';
     await refreshHistoryList();
@@ -507,6 +540,8 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     message.textContent = '백업을 확인해 기존 기록과 병합했습니다.';
   } catch (_) {
     message.textContent = '백업 파일을 읽지 못했습니다.';
+  } finally {
+    passwordField.value = '';
   }
 });
 

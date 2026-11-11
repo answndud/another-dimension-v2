@@ -1,6 +1,7 @@
 //! Per-identity encrypted append-only message history.
 
 use crate::identity::Identity;
+use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
@@ -18,7 +19,9 @@ const MAX_MESSAGE_BYTES: usize = 4096;
 const NONCE_BYTES: usize = 12;
 const INDEX_MAGIC: &[u8; 8] = b"ADIDX1\0\0";
 const BACKUP_MAGIC: &[u8; 8] = b"ADBACK1\0";
+const BACKUP_PASSWORD_MAGIC: &[u8; 8] = b"ADBACK2\0";
 const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
+const BACKUP_SALT_BYTES: usize = 16;
 static INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -214,7 +217,11 @@ impl History {
         Ok(())
     }
 
-    pub fn export_backup(identity: &Identity, peer_id: &str) -> io::Result<Vec<u8>> {
+    pub fn export_backup(
+        identity: &Identity,
+        peer_id: &str,
+        password: Option<&str>,
+    ) -> io::Result<Vec<u8>> {
         let (_, messages, _) = Self::open(identity, peer_id)?;
         let mut payload = Zeroizing::new(Vec::new());
         let peer = decode_peer_id(peer_id)?;
@@ -238,8 +245,19 @@ impl History {
                 ));
             }
         }
+        if let Some(password) = password {
+            validate_backup_password(password)?;
+        }
+        let mut salt = [0; BACKUP_SALT_BYTES];
+        File::open("/dev/urandom")?.read_exact(&mut salt)?;
         let nonce = random_nonce()?;
-        let key = derive_backup_key(&identity.storage_key());
+        let (magic, key) = match password {
+            Some(password) => (
+                BACKUP_PASSWORD_MAGIC,
+                derive_password_backup_key(password, &salt)?,
+            ),
+            None => (BACKUP_MAGIC, derive_backup_key(&identity.storage_key())),
+        };
         let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
             .map_err(|_| io::Error::other("backup key unavailable"))?;
         let encrypted = cipher
@@ -247,26 +265,63 @@ impl History {
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: &payload,
-                    aad: &backup_aad(identity),
+                    aad: &backup_aad(identity, magic, password.is_some().then_some(&salt)),
                 },
             )
             .map_err(|_| io::Error::other("backup encryption failed"))?;
-        let mut backup = Vec::with_capacity(BACKUP_MAGIC.len() + NONCE_BYTES + encrypted.len());
-        backup.extend_from_slice(BACKUP_MAGIC);
+        let salt_len = if password.is_some() {
+            BACKUP_SALT_BYTES
+        } else {
+            0
+        };
+        let mut backup = Vec::with_capacity(magic.len() + salt_len + NONCE_BYTES + encrypted.len());
+        backup.extend_from_slice(magic);
+        if password.is_some() {
+            backup.extend_from_slice(&salt);
+        }
         backup.extend_from_slice(&nonce);
         backup.extend_from_slice(&encrypted);
         Ok(backup)
     }
 
-    pub fn import_backup(identity: &Identity, backup: &[u8]) -> io::Result<(String, usize)> {
-        if backup.len() > MAX_BACKUP_BYTES
-            || backup.len() < BACKUP_MAGIC.len() + NONCE_BYTES + 16
-            || &backup[..BACKUP_MAGIC.len()] != BACKUP_MAGIC
-        {
+    pub fn import_backup(
+        identity: &Identity,
+        backup: &[u8],
+        password: Option<&str>,
+    ) -> io::Result<(String, usize)> {
+        if backup.len() > MAX_BACKUP_BYTES || backup.len() < BACKUP_MAGIC.len() + NONCE_BYTES + 16 {
             return Err(invalid_data("invalid backup file"));
         }
-        let nonce_start = BACKUP_MAGIC.len();
-        let key = derive_backup_key(&identity.storage_key());
+        let magic = &backup[..BACKUP_MAGIC.len()];
+        let (salt, nonce_start, key) = if magic == BACKUP_MAGIC {
+            if password.is_some() {
+                return Err(invalid_data("legacy backup does not use a password"));
+            }
+            let nonce_start = BACKUP_MAGIC.len();
+            (
+                None,
+                nonce_start,
+                derive_backup_key(&identity.storage_key()),
+            )
+        } else if magic == BACKUP_PASSWORD_MAGIC {
+            let password = password.ok_or_else(|| invalid_data("backup password required"))?;
+            validate_backup_password(password)?;
+            let salt_start = BACKUP_MAGIC.len();
+            let nonce_start = salt_start + BACKUP_SALT_BYTES;
+            if backup.len() < nonce_start + NONCE_BYTES + 16 {
+                return Err(invalid_data("invalid backup file"));
+            }
+            let salt: [u8; BACKUP_SALT_BYTES] = backup[salt_start..nonce_start]
+                .try_into()
+                .expect("fixed-size salt slice");
+            (
+                Some(salt),
+                nonce_start,
+                derive_password_backup_key(password, &salt)?,
+            )
+        } else {
+            return Err(invalid_data("invalid backup file"));
+        };
         let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
             .map_err(|_| invalid_data("invalid backup key"))?;
         let payload = Zeroizing::new(
@@ -275,7 +330,7 @@ impl History {
                     Nonce::from_slice(&backup[nonce_start..nonce_start + NONCE_BYTES]),
                     Payload {
                         msg: &backup[nonce_start + NONCE_BYTES..],
-                        aad: &backup_aad(identity),
+                        aad: &backup_aad(identity, magic, salt.as_ref()),
                     },
                 )
                 .map_err(|_| invalid_data("backup authentication failed"))?,
@@ -372,9 +427,40 @@ fn derive_backup_key(key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     backup_key
 }
 
-fn backup_aad(identity: &Identity) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(BACKUP_MAGIC.len() + 32);
-    aad.extend_from_slice(BACKUP_MAGIC);
+fn validate_backup_password(password: &str) -> io::Result<()> {
+    if password.chars().count() < 12 || password.len() > 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "backup password must be 12 to 1024 bytes/chars",
+        ));
+    }
+    Ok(())
+}
+
+fn derive_password_backup_key(
+    password: &str,
+    salt: &[u8; BACKUP_SALT_BYTES],
+) -> io::Result<Zeroizing<[u8; 32]>> {
+    let params = Params::new(19 * 1024, 2, 1, Some(32))
+        .map_err(|_| io::Error::other("backup KDF parameters unavailable"))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = Zeroizing::new([0; 32]);
+    argon2
+        .hash_password_into(password.as_bytes(), salt, key.as_mut())
+        .map_err(|_| io::Error::other("backup key derivation failed"))?;
+    Ok(key)
+}
+
+fn backup_aad(
+    identity: &Identity,
+    magic: &[u8],
+    salt: Option<&[u8; BACKUP_SALT_BYTES]>,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(magic.len() + BACKUP_SALT_BYTES + 32);
+    aad.extend_from_slice(magic);
+    if let Some(salt) = salt {
+        aad.extend_from_slice(salt);
+    }
     aad.extend_from_slice(&identity.public_key());
     aad
 }

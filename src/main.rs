@@ -861,11 +861,24 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some(identity) = state.identity.as_ref() else {
             return reject(&mut stream, "401 Unauthorized");
         };
-        if peer_chat_active(&state, body) {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Some(peer_id) = payload.get("peerId").and_then(serde_json::Value::as_str) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let password = payload
+            .get("password")
+            .and_then(serde_json::Value::as_str)
+            .filter(|password| !password.is_empty());
+        if peer_chat_active(&state, peer_id) {
             return reject(&mut stream, "409 Conflict");
         }
-        let backup = match history::History::export_backup(identity, body) {
+        let backup = match history::History::export_backup(identity, peer_id, password) {
             Ok(backup) => backup,
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                return reject(&mut stream, "400 Bad Request");
+            }
             Err(_) => return reject(&mut stream, "500 Internal Server Error"),
         };
         return respond(
@@ -882,11 +895,21 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         if any_chat_active(&state) {
             return reject(&mut stream, "409 Conflict");
         }
-        let backup = match BASE64.decode(body) {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Some(encoded) = payload.get("backup").and_then(serde_json::Value::as_str) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let password = payload
+            .get("password")
+            .and_then(serde_json::Value::as_str)
+            .filter(|password| !password.is_empty());
+        let backup = match BASE64.decode(encoded) {
             Ok(backup) if backup.len() <= 16 * 1024 * 1024 => backup,
             _ => return reject(&mut stream, "400 Bad Request"),
         };
-        let (peer_id, count) = match history::History::import_backup(identity, &backup) {
+        let (peer_id, count) = match history::History::import_backup(identity, &backup, password) {
             Ok(result) => result,
             Err(_) => return reject(&mut stream, "400 Bad Request"),
         };
