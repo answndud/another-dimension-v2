@@ -34,6 +34,7 @@ let pollTimer = null;
 let lastPhase = '';
 let selectedHistoryPeer = '';
 let selectedHistoryMessages = [];
+let selectedHistoryIndices = new Set();
 
 function show(view) {
   bridgeForm.hidden = view !== 'bridge';
@@ -119,12 +120,23 @@ function renderHistoryMessages() {
     if (query && !item.text.toLocaleLowerCase().includes(query)) continue;
     const card = document.createElement('article');
     card.className = `entry${item.sender === '나' ? ' mine' : ''}`;
+    const selection = document.createElement('label');
+    selection.className = 'message-select';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = selectedHistoryIndices.has(item.index);
+    checkbox.addEventListener('change', () => {
+      if (checkbox.checked) selectedHistoryIndices.add(item.index);
+      else selectedHistoryIndices.delete(item.index);
+      updateSelectionCount();
+    });
+    selection.append(checkbox, document.createTextNode('삭제 선택'));
     const time = document.createElement('time');
     time.dateTime = new Date(item.time * 1000).toISOString();
     time.textContent = `${formatTime(item.time)} [${item.sender}]`;
     const body = document.createElement('div');
     body.textContent = item.text;
-    card.append(time, body);
+    card.append(selection, time, body);
     historyMessages.append(card);
   }
   if (!historyMessages.childElementCount) {
@@ -135,13 +147,21 @@ function renderHistoryMessages() {
   }
 }
 
+function updateSelectionCount() {
+  document.querySelector('#selection-count').textContent = selectedHistoryIndices.size
+    ? `${selectedHistoryIndices.size}개 메시지 선택됨`
+    : '선택한 메시지 없음';
+}
+
 async function openHistory(peerId) {
   const response = await request('/api/history/messages', peerId);
   if (!response.ok) { message.textContent = '대화 기록을 열지 못했습니다.'; return; }
   selectedHistoryPeer = peerId;
   selectedHistoryMessages = await response.json();
+  selectedHistoryIndices.clear();
   document.querySelector('#history-peer').textContent = peerId;
   messageFilter.value = '';
+  updateSelectionCount();
   renderHistoryMessages();
   show('history');
 }
@@ -443,6 +463,75 @@ document.querySelector('#history-export').addEventListener('click', () => {
   link.download = `another-dimension-${selectedHistoryPeer.slice(0, 12)}.txt`;
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+
+async function reloadHistoryDetail() {
+  await openHistory(selectedHistoryPeer);
+  await refreshHistoryList();
+}
+
+async function deleteHistoryRange(start, end, prompt) {
+  if (!selectedHistoryPeer || !window.confirm(prompt)) return;
+  const response = await request('/api/history/delete-range', `${selectedHistoryPeer}\n${start}\n${end}`);
+  if (response.status === 409) {
+    message.textContent = '먼저 해당 대화의 연결을 종료한 뒤 다시 시도하세요.';
+    return;
+  }
+  if (!response.ok) { message.textContent = '기록을 삭제하지 못했습니다.'; return; }
+  await reloadHistoryDetail();
+  message.textContent = '선택한 기간의 기록을 삭제했습니다.';
+}
+
+document.querySelector('#delete-selected').addEventListener('click', async () => {
+  if (!selectedHistoryIndices.size) return;
+  const count = selectedHistoryIndices.size;
+  if (!window.confirm(`선택한 메시지 ${count}개를 이 기기에서 삭제할까요?`)) return;
+  const response = await request('/api/history/delete-messages', JSON.stringify({
+    peerId: selectedHistoryPeer,
+    indices: [...selectedHistoryIndices]
+  }));
+  if (response.status === 409) {
+    message.textContent = '먼저 해당 대화의 연결을 종료한 뒤 다시 시도하세요.';
+    return;
+  }
+  if (!response.ok) { message.textContent = '기록을 삭제하지 못했습니다.'; return; }
+  await reloadHistoryDetail();
+  message.textContent = `${count}개 메시지를 삭제했습니다.`;
+});
+
+document.querySelector('#delete-range').addEventListener('click', async () => {
+  const from = document.querySelector('#delete-from').value;
+  const to = document.querySelector('#delete-to').value;
+  if (!from || !to || from > to) { message.textContent = '올바른 시작일과 종료일을 선택하세요.'; return; }
+  const start = Math.floor(new Date(`${from}T00:00:00`).getTime() / 1000);
+  const end = Math.floor(new Date(`${to}T23:59:59.999`).getTime() / 1000);
+  await deleteHistoryRange(start, end, `${from}부터 ${to}까지의 메시지를 이 기기에서 삭제할까요?`);
+});
+
+document.querySelector('#keep-recent').addEventListener('click', async () => {
+  const days = Number(document.querySelector('#keep-days').value);
+  if (!Number.isInteger(days) || days < 1 || days > 36500) {
+    message.textContent = '보관할 기간을 1일 이상 입력하세요.';
+    return;
+  }
+  const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
+  await deleteHistoryRange(0, cutoff, `최근 ${days}일 이전의 메시지를 이 기기에서 삭제할까요?`);
+});
+
+document.querySelector('#delete-conversation').addEventListener('click', async () => {
+  if (!selectedHistoryPeer || !window.confirm('이 대화의 모든 기록을 이 기기에서 삭제할까요? 상대방 기록과 백업은 삭제되지 않습니다.')) return;
+  const response = await request('/api/history/delete-conversation', selectedHistoryPeer);
+  if (response.status === 409) {
+    message.textContent = '먼저 해당 대화의 연결을 종료한 뒤 다시 시도하세요.';
+    return;
+  }
+  if (!response.ok) { message.textContent = '대화를 삭제하지 못했습니다.'; return; }
+  selectedHistoryPeer = '';
+  selectedHistoryMessages = [];
+  selectedHistoryIndices.clear();
+  show('active');
+  await refreshHistoryList();
+  message.textContent = '대화 기록을 삭제했습니다.';
 });
 
 restoreSession();

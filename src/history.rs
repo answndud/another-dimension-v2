@@ -40,6 +40,7 @@ pub struct Summary {
 
 pub struct History {
     file: File,
+    path: PathBuf,
     key: Zeroizing<[u8; 32]>,
     identity_id: String,
     peer_id: String,
@@ -72,7 +73,7 @@ impl History {
             .create(true)
             .read(true)
             .append(true)
-            .open(path)?;
+            .open(&path)?;
         set_private_file(&file)?;
 
         let mut recovered_header = false;
@@ -93,6 +94,7 @@ impl History {
         Ok((
             Self {
                 file,
+                path,
                 key,
                 identity_id,
                 peer_id,
@@ -104,46 +106,59 @@ impl History {
     }
 
     pub fn append(&mut self, message: &StoredMessage) -> io::Result<()> {
-        let text = message.text.as_bytes();
-        if text.is_empty() || text.len() > MAX_MESSAGE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid message size",
-            ));
-        }
-        let mut plain = Vec::with_capacity(13 + text.len());
-        plain.extend_from_slice(&message.unix_time.to_be_bytes());
-        plain.push(match message.sender {
-            MessageSender::Me => 0,
-            MessageSender::Other => 1,
-        });
-        plain.extend_from_slice(&(text.len() as u32).to_be_bytes());
-        plain.extend_from_slice(text);
-        let nonce_bytes = random_nonce()?;
-        let cipher = ChaCha20Poly1305::new_from_slice(self.key.as_ref())
-            .map_err(|_| io::Error::other("history key unavailable"))?;
-        let encrypted = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: &plain,
-                    aad: &associated_data(&self.identity_id, &self.peer_id, self.next_index),
-                },
-            )
-            .map_err(|_| io::Error::other("history encryption failed"))?;
-        let record_len = NONCE_BYTES + encrypted.len();
-        let record_len = u32::try_from(record_len)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record too large"))?;
-
-        self.file.write_all(&record_len.to_be_bytes())?;
-        self.file.write_all(&nonce_bytes)?;
-        self.file.write_all(&encrypted)?;
+        let record = encode_record(
+            &self.key,
+            &self.identity_id,
+            &self.peer_id,
+            self.next_index,
+            message,
+        )?;
+        self.file.write_all(&record)?;
         self.file.sync_data()?;
         self.next_index = self
             .next_index
             .checked_add(1)
             .ok_or_else(|| io::Error::other("history record limit reached"))?;
         Ok(())
+    }
+
+    pub fn replace(&mut self, messages: &[StoredMessage]) -> io::Result<()> {
+        let suffix = hex_encode(&random_nonce()?);
+        let temporary = self.path.with_extension(format!("{suffix}.tmp"));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)?;
+            set_private_file(&file)?;
+            file.write_all(MAGIC)?;
+            for (index, message) in messages.iter().enumerate() {
+                let record = encode_record(
+                    &self.key,
+                    &self.identity_id,
+                    &self.peer_id,
+                    index as u64,
+                    message,
+                )?;
+                file.write_all(&record)?;
+            }
+            file.sync_all()?;
+            drop(file);
+            rename(&temporary, &self.path)?;
+            let mut replacement = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&self.path)?;
+            set_private_file(&replacement)?;
+            replacement.seek(SeekFrom::End(0))?;
+            self.file = replacement;
+            self.next_index = messages.len() as u64;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(temporary);
+        }
+        result
     }
 
     pub fn list(identity: &Identity) -> io::Result<Vec<Summary>> {
@@ -165,6 +180,94 @@ impl History {
         summaries.sort_by(|left, right| right.last_message.cmp(&left.last_message));
         Ok(summaries)
     }
+
+    pub fn delete_conversation(identity: &Identity, peer_id: &str) -> io::Result<()> {
+        validate_peer_id(peer_id)?;
+        let identity_id = identity.public_id();
+        let peer_id = peer_id.to_ascii_lowercase();
+        let directory = data_directory()?.join(&identity_id);
+        let key = identity.storage_key();
+        let path = directory.join(format!(
+            "{}.adlog",
+            opaque_conversation_name(&derive_index_key(&key), &peer_id)
+        ));
+        let lock = INDEX_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock
+            .lock()
+            .map_err(|_| io::Error::other("history index unavailable"))?;
+        let mut peers = read_index(identity, &identity_id, &directory)?;
+        if !peers.iter().any(|existing| existing == &peer_id) {
+            return Ok(());
+        }
+        let tombstone = directory.join(format!(".deleted-{}.tmp", hex_encode(&random_nonce()?)));
+        if path.exists() {
+            rename(&path, &tombstone)?;
+        }
+        peers.retain(|existing| existing != &peer_id);
+        if let Err(error) = write_index(identity, &identity_id, &directory, &peers) {
+            if tombstone.exists() {
+                let _ = rename(&tombstone, &path);
+            }
+            return Err(error);
+        }
+        if tombstone.exists() {
+            std::fs::remove_file(tombstone)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_peer_id(peer_id: &str) -> io::Result<()> {
+    if peer_id.len() != 64 || !peer_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid peer id",
+        ));
+    }
+    Ok(())
+}
+
+fn encode_record(
+    key: &[u8; 32],
+    identity_id: &str,
+    peer_id: &str,
+    index: u64,
+    message: &StoredMessage,
+) -> io::Result<Vec<u8>> {
+    let text = message.text.as_bytes();
+    if text.is_empty() || text.len() > MAX_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid message size",
+        ));
+    }
+    let mut plain = Zeroizing::new(Vec::with_capacity(13 + text.len()));
+    plain.extend_from_slice(&message.unix_time.to_be_bytes());
+    plain.push(match message.sender {
+        MessageSender::Me => 0,
+        MessageSender::Other => 1,
+    });
+    plain.extend_from_slice(&(text.len() as u32).to_be_bytes());
+    plain.extend_from_slice(text);
+    let nonce_bytes = random_nonce()?;
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| io::Error::other("history key unavailable"))?;
+    let encrypted = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: &plain,
+                aad: &associated_data(identity_id, peer_id, index),
+            },
+        )
+        .map_err(|_| io::Error::other("history encryption failed"))?;
+    let length = u32::try_from(NONCE_BYTES + encrypted.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record too large"))?;
+    let mut record = Vec::with_capacity(4 + length as usize);
+    record.extend_from_slice(&length.to_be_bytes());
+    record.extend_from_slice(&nonce_bytes);
+    record.extend_from_slice(&encrypted);
+    Ok(record)
 }
 
 fn register_conversation(

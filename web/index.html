@@ -31,6 +31,8 @@
     .history-list { display: grid; gap: .5rem; margin-top: .8rem; }
     .history-item { display: grid; width: 100%; gap: .15rem; text-align: left; }
     .history-item small { color: #59636e; font-weight: 400; }
+    .field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: .75rem; margin: .75rem 0; }
+    .message-select { margin-right: .5rem; }
     .entry { padding: .65rem .75rem; border: 1px solid #e0e4e8; border-radius: .5rem; background: #fff; overflow-wrap: anywhere; white-space: pre-wrap; }
     .entry.mine { margin-left: 12%; background: #f1f5f9; }
     .entry time { display: block; margin-bottom: .25rem; color: #69737d; font-size: .78rem; }
@@ -127,6 +129,21 @@
       </div>
       <label for="message-filter">메시지 검색</label>
       <input id="message-filter" type="search" autocomplete="off">
+      <div class="panel">
+        <h3>메시지 삭제</h3>
+        <p id="selection-count" class="meta">선택한 메시지 없음</p>
+        <button id="delete-selected" type="button">선택 삭제</button>
+        <div class="field-grid">
+          <div><label for="delete-from">시작일</label><input id="delete-from" type="date"></div>
+          <div><label for="delete-to">종료일</label><input id="delete-to" type="date"></div>
+        </div>
+        <button id="delete-range" type="button">기간 삭제</button>
+        <div class="field-grid">
+          <div><label for="keep-days">최근 며칠 보관</label><input id="keep-days" type="number" min="1" max="36500" value="3"></div>
+        </div>
+        <button id="keep-recent" type="button">기간 외 삭제</button>
+        <button id="delete-conversation" type="button">대화 전체 삭제</button>
+      </div>
       <div id="history-messages" class="conversation" aria-live="polite"></div>
     </section>
     <p id="message" role="status" aria-live="polite"></p>

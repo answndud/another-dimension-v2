@@ -5,7 +5,7 @@ pub mod relay;
 
 use identity::Identity;
 use relay::{InviteCode, RelayRendezvous, RelaySession, RelayUpdate, DEFAULT_RELAY};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
 const PAGE: &[u8] = include_bytes!("../web/index.html");
 const SCRIPT: &[u8] = include_bytes!("../web/app.js");
 const MAX_HEADER: usize = 8192;
-const MAX_BODY: usize = 8192;
+const MAX_BODY: usize = 1_048_576;
 const CODE_LIFETIME: Duration = Duration::from_secs(300);
 const MAX_ATTEMPTS: u8 = 5;
 
@@ -54,6 +54,7 @@ struct ChatSnapshot {
     relay_ack: Option<String>,
 }
 
+#[derive(Clone)]
 struct ChatEntry {
     unix_time: u64,
     sender: &'static str,
@@ -189,6 +190,7 @@ fn spawn_chat_worker(
                             });
                         }
                         Err(_) => {
+                            drop(history.take());
                             chat_update(&operation, |snapshot| {
                                 snapshot.phase = "disconnected";
                                 snapshot.error = Some("메시지를 보낼 수 없습니다.".to_owned());
@@ -237,6 +239,7 @@ fn spawn_chat_worker(
                                 });
                             }
                             Err(_) => {
+                                drop(history.take());
                                 chat_update(&operation, |snapshot| {
                                     snapshot.phase = "disconnected";
                                     snapshot.error =
@@ -254,6 +257,7 @@ fn spawn_chat_worker(
                 }
                 Ok(Some(RelayUpdate::Ready)) | Ok(None) => {}
                 Err(_) => {
+                    drop(history.take());
                     chat_update(&operation, |snapshot| {
                         snapshot.phase = "disconnected";
                         snapshot.error = Some("relay 연결이 끊겼습니다.".to_owned());
@@ -262,6 +266,7 @@ fn spawn_chat_worker(
                 }
             }
         }
+        drop(history);
         chat_update(&operation, |snapshot| snapshot.phase = "closed");
     });
 }
@@ -277,6 +282,48 @@ fn now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn peer_chat_active(state: &State, peer_id: &str) -> bool {
+    state.chats.values().any(|operation| {
+        operation.snapshot.lock().is_ok_and(|snapshot| {
+            snapshot
+                .peer_id
+                .as_deref()
+                .is_some_and(|current| current.eq_ignore_ascii_case(peer_id))
+                && !matches!(snapshot.phase, "closed" | "failed" | "disconnected")
+        })
+    })
+}
+
+fn update_closed_chat_history(
+    state: &State,
+    peer_id: &str,
+    messages: Option<&[history::StoredMessage]>,
+) {
+    for operation in state.chats.values() {
+        if let Ok(mut snapshot) = operation.snapshot.lock() {
+            if snapshot
+                .peer_id
+                .as_deref()
+                .is_some_and(|current| current.eq_ignore_ascii_case(peer_id))
+                && matches!(snapshot.phase, "closed" | "failed" | "disconnected")
+            {
+                snapshot.messages = messages
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|item| ChatEntry {
+                        unix_time: item.unix_time,
+                        sender: match item.sender {
+                            history::MessageSender::Me => "나",
+                            history::MessageSender::Other => "상대방",
+                        },
+                        text: item.text.clone(),
+                    })
+                    .collect();
+            }
+        }
+    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -415,6 +462,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/chat/messages HTTP/1.1"
             | "POST /api/history/list HTTP/1.1"
             | "POST /api/history/messages HTTP/1.1"
+            | "POST /api/history/delete-messages HTTP/1.1"
+            | "POST /api/history/delete-range HTTP/1.1"
+            | "POST /api/history/delete-conversation HTTP/1.1"
     ) {
         return reject(&mut stream, "404 Not Found");
     }
@@ -687,8 +737,10 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         };
         let payload: Vec<_> = messages
             .into_iter()
-            .map(|item| {
+            .enumerate()
+            .map(|(index, item)| {
                 serde_json::json!({
+                    "index": index,
                     "time": item.unix_time,
                     "sender": match item.sender {
                         history::MessageSender::Me => "나",
@@ -704,6 +756,92 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             "application/json; charset=utf-8",
             serde_json::to_string(&payload)?.as_bytes(),
         );
+    }
+    if first == "POST /api/history/delete-messages HTTP/1.1" {
+        let Some(identity) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Some(peer_id) = payload.get("peerId").and_then(serde_json::Value::as_str) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        if peer_chat_active(&state, peer_id) {
+            return reject(&mut stream, "409 Conflict");
+        }
+        let Some(indices) = payload.get("indices").and_then(serde_json::Value::as_array) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        if indices.is_empty() || indices.len() > 100_000 {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        let mut selected = HashSet::with_capacity(indices.len());
+        for index in indices {
+            let Some(index) = index.as_u64().and_then(|value| usize::try_from(value).ok()) else {
+                return reject(&mut stream, "400 Bad Request");
+            };
+            selected.insert(index);
+        }
+        let (mut history, messages, _) = match history::History::open(identity, peer_id) {
+            Ok(history) => history,
+            Err(_) => return reject(&mut stream, "400 Bad Request"),
+        };
+        let kept: Vec<_> = messages
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, item)| (!selected.contains(&index)).then_some(item))
+            .collect();
+        if let Err(_) = history.replace(&kept) {
+            return reject(&mut stream, "500 Internal Server Error");
+        }
+        update_closed_chat_history(&state, peer_id, Some(&kept));
+        return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
+    }
+    if first == "POST /api/history/delete-range HTTP/1.1" {
+        let Some(identity) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        let mut parts = body.split('\n');
+        let peer_id = parts.next().unwrap_or("");
+        let (Some(start), Some(end)) = (parts.next(), parts.next()) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        if parts.next().is_some() || peer_chat_active(&state, peer_id) {
+            return reject(&mut stream, "409 Conflict");
+        }
+        let (Ok(start), Ok(end)) = (start.parse::<u64>(), end.parse::<u64>()) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        if start > end {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        let (mut history, messages, _) = match history::History::open(identity, peer_id) {
+            Ok(history) => history,
+            Err(_) => return reject(&mut stream, "400 Bad Request"),
+        };
+        let kept: Vec<_> = messages
+            .into_iter()
+            .filter(|item| item.unix_time < start || item.unix_time > end)
+            .collect();
+        if let Err(_) = history.replace(&kept) {
+            return reject(&mut stream, "500 Internal Server Error");
+        }
+        update_closed_chat_history(&state, peer_id, Some(&kept));
+        return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
+    }
+    if first == "POST /api/history/delete-conversation HTTP/1.1" {
+        let Some(identity) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        if peer_chat_active(&state, body) {
+            return reject(&mut stream, "409 Conflict");
+        }
+        if history::History::delete_conversation(identity, body).is_err() {
+            return reject(&mut stream, "500 Internal Server Error");
+        }
+        update_closed_chat_history(&state, body, None);
+        return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
     }
     match first.as_str() {
         "POST /api/identity/create HTTP/1.1" => {
