@@ -19,6 +19,7 @@ dependencies = [
  "ed25519-dalek",
  "hkdf",
  "nostr",
+ "serde_json",
  "sha2",
  "snow",
  "tungstenite",

@@ -19,6 +19,8 @@ use std::fs::File;
 use std::io;
 use std::io::Read;
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tungstenite::client::connect_with_config;
 use tungstenite::protocol::WebSocketConfig;
@@ -27,6 +29,7 @@ use tungstenite::{Message, WebSocket};
 use zeroize::Zeroizing;
 
 const EVENT_KIND: u16 = 20_000;
+pub const DEFAULT_RELAY: &str = "wss://relay.damus.io";
 const SUBSCRIPTION_ID: &str = "ad-v2-live";
 const INVITE_PREFIX: &str = "ADI1-";
 const INVITE_TOPIC_INFO: &[u8] = b"another-dimension-v2/invite-topic/v1";
@@ -35,7 +38,8 @@ const INVITE_DOMAIN: &[u8] = b"another-dimension-v2/invite-code/v1";
 const MAX_BOOTSTRAP_FRAME: usize = 256;
 const MAX_RELAY_MESSAGE: usize = 16 * 1024;
 const MAX_ENVELOPE: usize = 4 + 16 + 8 + 4096;
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
+const READ_TIMEOUT: Duration = Duration::from_millis(250);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum RelayError {
@@ -48,6 +52,7 @@ pub enum RelayError {
     SubscriptionClosed(String),
     RelayRejected { event_id: String, reason: String },
     Disconnected,
+    Cancelled,
 }
 
 impl From<tungstenite::Error> for RelayError {
@@ -135,64 +140,82 @@ impl RelaySession {
         Ok(event_id)
     }
 
-    /// Reads until a relevant relay update arrives.
+    /// Reads one WebSocket message, returning `None` when the polling timeout expires.
+    pub fn poll(&mut self) -> Result<Option<RelayUpdate>, RelayError> {
+        let message = match self.socket.read() {
+            Ok(message) => message,
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match message {
+            Message::Text(text) => match RelayMessage::from_json(text.as_str())? {
+                RelayMessage::Event {
+                    subscription_id,
+                    event,
+                } => {
+                    if subscription_id.as_ref() != &self.subscription {
+                        return Ok(None);
+                    }
+                    let event = event.as_ref();
+                    if event.kind != Kind::Custom(EVENT_KIND)
+                        || event.pubkey != self.peer_author
+                        || event.verify().is_err()
+                        || !has_tag(event, "t", &self.topic)
+                    {
+                        return Ok(None);
+                    }
+                    let envelope = decode_hex(&event.content).ok_or(RelayError::InvalidEvent)?;
+                    let messages = self.transport.receive(&envelope)?;
+                    if !messages.is_empty() {
+                        return Ok(Some(RelayUpdate::Messages(messages)));
+                    }
+                }
+                RelayMessage::Ok {
+                    event_id,
+                    status,
+                    message,
+                } => {
+                    if status {
+                        return Ok(Some(RelayUpdate::Published {
+                            event_id: event_id.to_string(),
+                        }));
+                    }
+                    return Err(RelayError::RelayRejected {
+                        event_id: event_id.to_string(),
+                        reason: message.to_string(),
+                    });
+                }
+                RelayMessage::EndOfStoredEvents(subscription_id)
+                    if subscription_id.as_ref() == &self.subscription =>
+                {
+                    return Ok(Some(RelayUpdate::Ready));
+                }
+                RelayMessage::Closed {
+                    subscription_id,
+                    message,
+                } if subscription_id.as_ref() == &self.subscription => {
+                    return Err(RelayError::SubscriptionClosed(message.to_string()));
+                }
+                _ => {}
+            },
+            Message::Ping(payload) => self.socket.send(Message::Pong(payload))?,
+            Message::Close(_) => return Err(RelayError::Disconnected),
+            Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+        }
+        Ok(None)
+    }
+
     pub fn receive(&mut self) -> Result<RelayUpdate, RelayError> {
         loop {
-            match self.socket.read()? {
-                Message::Text(text) => match RelayMessage::from_json(text.as_str())? {
-                    RelayMessage::Event {
-                        subscription_id,
-                        event,
-                    } => {
-                        if subscription_id.as_ref() != &self.subscription {
-                            continue;
-                        }
-                        let event = event.as_ref();
-                        if event.kind != Kind::Custom(EVENT_KIND)
-                            || event.pubkey != self.peer_author
-                            || event.verify().is_err()
-                            || !has_tag(event, "t", &self.topic)
-                        {
-                            continue;
-                        }
-                        let envelope =
-                            decode_hex(&event.content).ok_or(RelayError::InvalidEvent)?;
-                        let messages = self.transport.receive(&envelope)?;
-                        if !messages.is_empty() {
-                            return Ok(RelayUpdate::Messages(messages));
-                        }
-                    }
-                    RelayMessage::Ok {
-                        event_id,
-                        status,
-                        message,
-                    } => {
-                        if status {
-                            return Ok(RelayUpdate::Published {
-                                event_id: event_id.to_string(),
-                            });
-                        }
-                        return Err(RelayError::RelayRejected {
-                            event_id: event_id.to_string(),
-                            reason: message.to_string(),
-                        });
-                    }
-                    RelayMessage::EndOfStoredEvents(subscription_id)
-                        if subscription_id.as_ref() == &self.subscription =>
-                    {
-                        return Ok(RelayUpdate::Ready);
-                    }
-                    RelayMessage::Closed {
-                        subscription_id,
-                        message,
-                    } if subscription_id.as_ref() == &self.subscription => {
-                        return Err(RelayError::SubscriptionClosed(message.to_string()));
-                    }
-                    _ => {}
-                },
-                Message::Ping(payload) => self.socket.send(Message::Pong(payload))?,
-                Message::Close(_) => return Err(RelayError::Disconnected),
-                Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+            if let Some(update) = self.poll()? {
+                return Ok(update);
             }
         }
     }
@@ -209,7 +232,7 @@ fn open_socket(endpoint: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, R
     match socket.get_mut() {
         MaybeTlsStream::Rustls(stream) => {
             stream.sock.set_read_timeout(Some(READ_TIMEOUT))?;
-            stream.sock.set_write_timeout(Some(READ_TIMEOUT))?;
+            stream.sock.set_write_timeout(Some(WRITE_TIMEOUT))?;
         }
         _ => return Err(RelayError::InvalidEndpoint),
     }
@@ -294,6 +317,7 @@ pub struct RelayRendezvous {
     seen: BTreeSet<String>,
     published: BTreeSet<String>,
     attempt_tag: Option<String>,
+    cancelled: Option<Arc<AtomicBool>>,
 }
 
 impl RelayRendezvous {
@@ -333,7 +357,12 @@ impl RelayRendezvous {
             seen: BTreeSet::new(),
             published: BTreeSet::new(),
             attempt_tag,
+            cancelled: None,
         })
+    }
+
+    pub fn set_cancellation_token(&mut self, token: Arc<AtomicBool>) {
+        self.cancelled = Some(token);
     }
 
     /// Exchanges all three Noise XX handshake messages over the rendezvous.
@@ -415,7 +444,26 @@ impl RelayRendezvous {
     fn receive_frame(&mut self) -> Result<Vec<u8>, RelayError> {
         let expected_role = role_tag(self.role.peer());
         loop {
-            match self.socket.read()? {
+            if self
+                .cancelled
+                .as_ref()
+                .is_some_and(|token| token.load(Ordering::SeqCst))
+            {
+                return Err(RelayError::Cancelled);
+            }
+            let incoming = match self.socket.read() {
+                Ok(message) => message,
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            match incoming {
                 Message::Text(text) => match RelayMessage::from_json(text.as_str())? {
                     RelayMessage::Event {
                         subscription_id,

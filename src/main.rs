@@ -3,17 +3,22 @@ mod identity;
 pub mod relay;
 
 use identity::Identity;
+use relay::{InviteCode, RelayRendezvous, RelaySession, RelayUpdate, DEFAULT_RELAY};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
 const PAGE: &[u8] = include_bytes!("../web/index.html");
 const SCRIPT: &[u8] = include_bytes!("../web/app.js");
 const MAX_HEADER: usize = 8192;
-const MAX_BODY: usize = 256;
+const MAX_BODY: usize = 8192;
 const CODE_LIFETIME: Duration = Duration::from_secs(300);
 const MAX_ATTEMPTS: u8 = 5;
 
@@ -22,7 +27,206 @@ struct State {
     issued: Instant,
     attempts: u8,
     sessions: Vec<String>,
-    identity: Option<Identity>,
+    identity: Option<Arc<Identity>>,
+    chats: HashMap<String, Arc<ChatOperation>>,
+}
+
+enum ChatCommand {
+    Confirm,
+    Send(String),
+    Cancel,
+}
+
+struct ChatOperation {
+    snapshot: Mutex<ChatSnapshot>,
+    sender: Sender<ChatCommand>,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct ChatSnapshot {
+    phase: &'static str,
+    fingerprint: Option<String>,
+    peer_id: Option<String>,
+    error: Option<String>,
+    messages: Vec<ChatEntry>,
+    relay_ack: Option<String>,
+}
+
+struct ChatEntry {
+    unix_time: u64,
+    sender: &'static str,
+    text: String,
+}
+
+fn chat_update(operation: &ChatOperation, update: impl FnOnce(&mut ChatSnapshot)) {
+    if let Ok(mut snapshot) = operation.snapshot.lock() {
+        update(&mut snapshot);
+    }
+}
+
+fn spawn_chat_worker(
+    operation: Arc<ChatOperation>,
+    commands: Receiver<ChatCommand>,
+    role: RoleForChat,
+    code: Zeroizing<String>,
+    identity: Arc<Identity>,
+    cancelled: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        let result = (|| -> Result<RelaySession, String> {
+            let invite = InviteCode::parse(&code).ok_or("초대 코드를 확인하세요.")?;
+            let mut rendezvous = match role {
+                RoleForChat::Create => RelayRendezvous::create(DEFAULT_RELAY, &invite),
+                RoleForChat::Join => RelayRendezvous::join(DEFAULT_RELAY, &invite),
+            }
+            .map_err(|_| "relay에 연결하지 못했습니다.")?;
+            rendezvous.set_cancellation_token(Arc::clone(&cancelled));
+            let channel = rendezvous
+                .complete_handshake()
+                .map_err(|_| "상대와 handshake를 완료하지 못했습니다.")?;
+            if operation.cancelled.load(Ordering::SeqCst) {
+                return Err("취소되었습니다.".to_owned());
+            }
+            let verification = rendezvous
+                .authenticate(channel, &identity, None)
+                .map_err(|_| "상대 신원을 확인할 수 없습니다. 새 초대 코드로 다시 시도하세요.")?;
+            let fingerprint = encode_hex(verification.fingerprint());
+            let peer_id = encode_hex(verification.peer_public_key());
+            chat_update(&operation, |snapshot| {
+                snapshot.phase = "verification";
+                snapshot.fingerprint = Some(fingerprint);
+                snapshot.peer_id = Some(peer_id);
+            });
+            let verification = loop {
+                if operation.cancelled.load(Ordering::SeqCst) {
+                    return Err("취소되었습니다.".to_owned());
+                }
+                match commands.recv_timeout(Duration::from_millis(250)) {
+                    Ok(ChatCommand::Confirm) => break verification,
+                    Ok(ChatCommand::Cancel) => return Err("취소되었습니다.".to_owned()),
+                    Ok(ChatCommand::Send(_)) => {}
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return Err("취소되었습니다.".to_owned()),
+                }
+            };
+            chat_update(&operation, |snapshot| snapshot.phase = "confirming");
+            rendezvous
+                .confirm(verification)
+                .map_err(|_| "상대 확인을 마치지 못했습니다. 다시 연결하세요.".to_owned())
+        })();
+
+        let mut session = match result {
+            Ok(session) => {
+                chat_update(&operation, |snapshot| snapshot.phase = "connected");
+                session
+            }
+            Err(error) => {
+                chat_update(&operation, |snapshot| {
+                    snapshot.phase = if operation.cancelled.load(Ordering::SeqCst) {
+                        "closed"
+                    } else {
+                        snapshot.error = Some(error);
+                        "failed"
+                    };
+                });
+                return;
+            }
+        };
+
+        while !operation.cancelled.load(Ordering::SeqCst) {
+            loop {
+                match commands.try_recv() {
+                    Ok(ChatCommand::Send(text)) => match session.send(text.as_bytes()) {
+                        Ok(event_id) => chat_update(&operation, |snapshot| {
+                            snapshot.messages.push(ChatEntry {
+                                unix_time: now_seconds(),
+                                sender: "나",
+                                text,
+                            });
+                            snapshot.relay_ack = Some(format!("pending:{event_id}"));
+                        }),
+                        Err(_) => {
+                            chat_update(&operation, |snapshot| {
+                                snapshot.phase = "disconnected";
+                                snapshot.error = Some("메시지를 보낼 수 없습니다.".to_owned());
+                            });
+                            return;
+                        }
+                    },
+                    Ok(ChatCommand::Cancel) => {
+                        operation.cancelled.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    Ok(ChatCommand::Confirm) => {}
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
+                }
+            }
+            if operation.cancelled.load(Ordering::SeqCst) {
+                break;
+            }
+            match session.poll() {
+                Ok(Some(RelayUpdate::Messages(messages))) => {
+                    for message in messages {
+                        match String::from_utf8(message) {
+                            Ok(text) => chat_update(&operation, |snapshot| {
+                                snapshot.messages.push(ChatEntry {
+                                    unix_time: now_seconds(),
+                                    sender: "상대방",
+                                    text,
+                                });
+                            }),
+                            Err(_) => {
+                                chat_update(&operation, |snapshot| {
+                                    snapshot.phase = "disconnected";
+                                    snapshot.error =
+                                        Some("상대 메시지 형식이 잘못되었습니다.".to_owned());
+                                });
+                                return;
+                            }
+                        }
+                    }
+                }
+                Ok(Some(RelayUpdate::Published { event_id })) => {
+                    chat_update(&operation, |snapshot| {
+                        snapshot.relay_ack = Some(event_id);
+                    });
+                }
+                Ok(Some(RelayUpdate::Ready)) | Ok(None) => {}
+                Err(_) => {
+                    chat_update(&operation, |snapshot| {
+                        snapshot.phase = "disconnected";
+                        snapshot.error = Some("relay 연결이 끊겼습니다.".to_owned());
+                    });
+                    return;
+                }
+            }
+        }
+        chat_update(&operation, |snapshot| snapshot.phase = "closed");
+    });
+}
+
+#[derive(Clone, Copy)]
+enum RoleForChat {
+    Create,
+    Join,
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        result.push(HEX[(byte >> 4) as usize] as char);
+        result.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    result
 }
 
 fn random_token() -> io::Result<String> {
@@ -141,6 +345,14 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/identity/login HTTP/1.1"
             | "POST /api/identity/status HTTP/1.1"
             | "POST /api/identity/logout HTTP/1.1"
+            | "POST /api/invite/create HTTP/1.1"
+            | "POST /api/chat/create HTTP/1.1"
+            | "POST /api/chat/join HTTP/1.1"
+            | "POST /api/chat/status HTTP/1.1"
+            | "POST /api/chat/confirm HTTP/1.1"
+            | "POST /api/chat/cancel HTTP/1.1"
+            | "POST /api/chat/send HTTP/1.1"
+            | "POST /api/chat/messages HTTP/1.1"
     ) {
         return reject(&mut stream, "404 Not Found");
     }
@@ -208,6 +420,174 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         state.sessions.remove(index);
         return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
     }
+    if first == "POST /api/invite/create HTTP/1.1" {
+        if state.identity.is_none() {
+            return reject(&mut stream, "401 Unauthorized");
+        }
+        let invite = InviteCode::generate()?;
+        return respond(
+            &mut stream,
+            "200 OK",
+            "text/plain; charset=utf-8",
+            invite.code().as_bytes(),
+        );
+    }
+    if matches!(
+        first.as_str(),
+        "POST /api/chat/create HTTP/1.1" | "POST /api/chat/join HTTP/1.1"
+    ) {
+        let Some(identity) = state.identity.as_ref().cloned() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        if InviteCode::parse(body).is_none() {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        let operation_id = random_token()?;
+        let (sender, receiver) = mpsc::channel();
+        let operation = Arc::new(ChatOperation {
+            snapshot: Mutex::new(ChatSnapshot {
+                phase: "connecting",
+                fingerprint: None,
+                peer_id: None,
+                error: None,
+                messages: Vec::new(),
+                relay_ack: None,
+            }),
+            sender,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        let cancelled = Arc::clone(&operation.cancelled);
+        let role = if first == "POST /api/chat/create HTTP/1.1" {
+            RoleForChat::Create
+        } else {
+            RoleForChat::Join
+        };
+        let code = Zeroizing::new(body.to_owned());
+        state
+            .chats
+            .insert(operation_id.clone(), Arc::clone(&operation));
+        drop(state);
+        spawn_chat_worker(operation, receiver, role, code, identity, cancelled);
+        return respond(
+            &mut stream,
+            "200 OK",
+            "text/plain; charset=utf-8",
+            operation_id.as_bytes(),
+        );
+    }
+    if first == "POST /api/chat/status HTTP/1.1" {
+        let Some(operation) = state.chats.get(body) else {
+            return reject(&mut stream, "404 Not Found");
+        };
+        let Ok(snapshot) = operation.snapshot.lock() else {
+            return reject(&mut stream, "503 Service Unavailable");
+        };
+        let payload = serde_json::json!({
+            "phase": snapshot.phase,
+            "fingerprint": snapshot.fingerprint,
+            "peerId": snapshot.peer_id,
+            "error": snapshot.error,
+            "relayAck": snapshot.relay_ack,
+            "messageCount": snapshot.messages.len()
+        })
+        .to_string();
+        return respond(
+            &mut stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            payload.as_bytes(),
+        );
+    }
+    if first == "POST /api/chat/confirm HTTP/1.1" {
+        let Some(operation) = state.chats.get(body) else {
+            return reject(&mut stream, "404 Not Found");
+        };
+        if operation.sender.send(ChatCommand::Confirm).is_err() {
+            return reject(&mut stream, "409 Conflict");
+        }
+        return respond(
+            &mut stream,
+            "202 Accepted",
+            "text/plain; charset=utf-8",
+            b"ok",
+        );
+    }
+    if first == "POST /api/chat/cancel HTTP/1.1" {
+        let Some(operation) = state.chats.get(body) else {
+            return reject(&mut stream, "404 Not Found");
+        };
+        operation.cancelled.store(true, Ordering::SeqCst);
+        let _ = operation.sender.send(ChatCommand::Cancel);
+        return respond(
+            &mut stream,
+            "202 Accepted",
+            "text/plain; charset=utf-8",
+            b"ok",
+        );
+    }
+    if first == "POST /api/chat/send HTTP/1.1" {
+        let Some((operation_id, text)) = body.split_once('\n') else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        if text.trim().is_empty() || text.len() > 4078 {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        let Some(operation) = state.chats.get(operation_id) else {
+            return reject(&mut stream, "404 Not Found");
+        };
+        let Ok(snapshot) = operation.snapshot.lock() else {
+            return reject(&mut stream, "503 Service Unavailable");
+        };
+        if snapshot.phase != "connected" {
+            return reject(&mut stream, "409 Conflict");
+        }
+        drop(snapshot);
+        if operation
+            .sender
+            .send(ChatCommand::Send(text.to_owned()))
+            .is_err()
+        {
+            return reject(&mut stream, "409 Conflict");
+        }
+        return respond(
+            &mut stream,
+            "202 Accepted",
+            "text/plain; charset=utf-8",
+            b"ok",
+        );
+    }
+    if first == "POST /api/chat/messages HTTP/1.1" {
+        let Some((operation_id, cursor)) = body.split_once('\n') else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Ok(cursor) = cursor.parse::<usize>() else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Some(operation) = state.chats.get(operation_id) else {
+            return reject(&mut stream, "404 Not Found");
+        };
+        let Ok(snapshot) = operation.snapshot.lock() else {
+            return reject(&mut stream, "503 Service Unavailable");
+        };
+        let messages: Vec<_> = snapshot
+            .messages
+            .iter()
+            .skip(cursor)
+            .map(|message| {
+                serde_json::json!({
+                    "time": message.unix_time,
+                    "sender": message.sender,
+                    "text": message.text
+                })
+            })
+            .collect();
+        return respond(
+            &mut stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            serde_json::to_string(&messages)?.as_bytes(),
+        );
+    }
     match first.as_str() {
         "POST /api/identity/create HTTP/1.1" => {
             if state.identity.is_some() {
@@ -221,7 +601,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 "text/plain; charset=utf-8",
                 code.as_bytes(),
             )?;
-            state.identity = Some(identity);
+            state.identity = Some(Arc::new(identity));
             return Ok(());
         }
         "POST /api/identity/login HTTP/1.1" => {
@@ -231,7 +611,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             let Some(identity) = Identity::from_code(body) else {
                 return reject(&mut stream, "400 Bad Request");
             };
-            state.identity = Some(identity);
+            state.identity = Some(Arc::new(identity));
         }
         "POST /api/identity/status HTTP/1.1" => {
             let Some(identity) = state.identity.as_ref() else {
@@ -245,6 +625,10 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             );
         }
         "POST /api/identity/logout HTTP/1.1" => {
+            for operation in state.chats.values() {
+                operation.cancelled.store(true, Ordering::SeqCst);
+                let _ = operation.sender.send(ChatCommand::Cancel);
+            }
             state.identity = None;
         }
         _ => {}
@@ -261,6 +645,7 @@ fn main() -> io::Result<()> {
         attempts: 0,
         sessions: Vec::new(),
         identity: None,
+        chats: HashMap::new(),
     }));
     println!("http://{address}/");
     {
