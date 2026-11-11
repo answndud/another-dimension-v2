@@ -6,7 +6,7 @@ pub mod relay;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use identity::Identity;
-use relay::{InviteCode, RelayRendezvous, RelaySession, RelayUpdate, DEFAULT_RELAY};
+use relay::{InviteCode, RelayError, RelayRendezvous, RelaySession, RelayUpdate, DEFAULT_RELAY};
 use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, rename, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
@@ -67,6 +67,7 @@ struct ChatSnapshot {
     storage_error: Option<String>,
     messages: Vec<ChatEntry>,
     relay_ack: Option<String>,
+    pending_sends: usize,
 }
 
 #[derive(Clone)]
@@ -79,6 +80,56 @@ struct ChatEntry {
 fn chat_update(operation: &ChatOperation, update: impl FnOnce(&mut ChatSnapshot)) {
     if let Ok(mut snapshot) = operation.snapshot.lock() {
         update(&mut snapshot);
+    }
+}
+
+fn relay_failure_message(error: &RelayError, phase: &str, using_tor: bool) -> String {
+    match error {
+        RelayError::Cancelled => "취소되었습니다.".to_owned(),
+        RelayError::TimedOut("relay subscription") => {
+            "relay 구독이 제한 시간 안에 준비되지 않았습니다. relay 상태를 확인하고 다시 시도하세요."
+                .to_owned()
+        }
+        RelayError::TimedOut(stage) => {
+            let description = match *stage {
+                "handshake initiation" | "handshake response" | "handshake completion" => {
+                    "초대 상대 응답"
+                }
+                "identity proof" => "상대 신원 확인 응답",
+                "peer confirmation" => "상대 확인 응답",
+                _ => "relay 응답",
+            };
+            format!("{description} 제한 시간이 지났습니다. 새 초대 코드로 다시 시도하세요.")
+        }
+        RelayError::SubscriptionClosed(_) => {
+            "relay가 초대 구독을 닫았습니다. 다른 relay가 필요할 수 있습니다.".to_owned()
+        }
+        RelayError::RelayRejected { .. } => {
+            "relay가 이벤트를 거부했습니다. relay 정책이나 연결을 확인하세요.".to_owned()
+        }
+        RelayError::Io(error) if error.kind() == io::ErrorKind::TimedOut => {
+            if using_tor {
+                "Tor SOCKS 또는 TLS 응답 시간이 초과되었습니다. 직접 연결로 전환하지 않았습니다."
+                    .to_owned()
+            } else {
+                "relay TCP/TLS 연결 시간이 초과되었습니다.".to_owned()
+            }
+        }
+        _ => match phase {
+            "connect" if using_tor => {
+                "Tor SOCKS relay 연결에 실패했습니다. 직접 연결로 전환하지 않았습니다."
+                    .to_owned()
+            }
+            "connect" => "relay TLS/WebSocket 연결에 실패했습니다.".to_owned(),
+            "handshake" => "상대와 암호화 handshake를 완료하지 못했습니다.".to_owned(),
+            "identity" => "상대 신원 증명을 확인하지 못했습니다. 새 초대 코드로 다시 시도하세요.".to_owned(),
+            "confirmation" => "상대 확인 응답을 받지 못했습니다. 다시 연결하세요.".to_owned(),
+            "chat" if using_tor => {
+                "Tor 전용 relay 연결이 끊겼습니다. 직접 연결로 전환하지 않았습니다."
+                    .to_owned()
+            }
+            _ => "relay 연결이 끊겼습니다.".to_owned(),
+        },
     }
 }
 
@@ -100,23 +151,17 @@ fn spawn_chat_worker(
                 RoleForChat::Create => RelayRendezvous::create(DEFAULT_RELAY, &invite, tor_socks),
                 RoleForChat::Join => RelayRendezvous::join(DEFAULT_RELAY, &invite, tor_socks),
             }
-            .map_err(|_| {
-                if tor_socks.is_some() {
-                    "Tor SOCKS 연결에 실패했습니다. 직접 연결로 전환하지 않았습니다."
-                } else {
-                    "relay에 연결하지 못했습니다."
-                }
-            })?;
+            .map_err(|error| relay_failure_message(&error, "connect", tor_socks.is_some()))?;
             rendezvous.set_cancellation_token(Arc::clone(&cancelled));
             let channel = rendezvous
                 .complete_handshake()
-                .map_err(|_| "상대와 handshake를 완료하지 못했습니다.")?;
+                .map_err(|error| relay_failure_message(&error, "handshake", tor_socks.is_some()))?;
             if operation.cancelled.load(Ordering::SeqCst) {
                 return Err("취소되었습니다.".to_owned());
             }
             let verification = rendezvous
                 .authenticate(channel, &identity, None)
-                .map_err(|_| "상대 신원을 확인할 수 없습니다. 새 초대 코드로 다시 시도하세요.")?;
+                .map_err(|error| relay_failure_message(&error, "identity", tor_socks.is_some()))?;
             let fingerprint = encode_hex(verification.fingerprint());
             let peer_id = encode_hex(verification.peer_public_key());
             chat_update(&operation, |snapshot| {
@@ -139,7 +184,7 @@ fn spawn_chat_worker(
             chat_update(&operation, |snapshot| snapshot.phase = "confirming");
             let session = rendezvous
                 .confirm(verification)
-                .map_err(|_| "상대 확인을 마치지 못했습니다. 다시 연결하세요.".to_owned())?;
+                .map_err(|error| relay_failure_message(&error, "confirmation", tor_socks.is_some()))?;
             let (history, entries, storage_error) = match history::History::open(&identity, &peer_id) {
                 Ok((history, stored, recovered_partial)) => {
                     let entries = stored
@@ -183,12 +228,14 @@ fn spawn_chat_worker(
                 return;
             }
         };
+        let mut pending_events = HashSet::<String>::new();
 
         while !operation.cancelled.load(Ordering::SeqCst) {
             loop {
                 match commands.try_recv() {
                     Ok(ChatCommand::Send(text)) => match session.send(text.as_bytes()) {
                         Ok(event_id) => {
+                            pending_events.insert(event_id);
                             let entry = history::StoredMessage {
                                 unix_time: now_seconds(),
                                 sender: history::MessageSender::Me,
@@ -207,17 +254,38 @@ fn spawn_chat_worker(
                                     sender: "나",
                                     text,
                                 });
-                                snapshot.relay_ack = Some(format!("pending:{event_id}"));
+                                snapshot.relay_ack = Some("pending".to_owned());
+                                snapshot.pending_sends = pending_events.len();
                                 if save_error.is_some() {
                                     snapshot.storage_error = Some("대화 기록을 저장하지 못했습니다. 프로그램을 종료하면 이 메시지를 잃을 수 있습니다.".to_owned());
                                 }
                             });
                         }
                         Err(_) => {
+                            let entry = history::StoredMessage {
+                                unix_time: now_seconds(),
+                                sender: history::MessageSender::Me,
+                                text: text.clone(),
+                            };
+                            let save_error = match history.as_mut() {
+                                Some(history) => history.append(&entry).err(),
+                                None => Some(io::Error::other("history unavailable")),
+                            };
                             drop(history.take());
                             chat_update(&operation, |snapshot| {
                                 snapshot.phase = "disconnected";
-                                snapshot.error = Some("메시지를 보낼 수 없습니다.".to_owned());
+                                snapshot.messages.push(ChatEntry {
+                                    unix_time: entry.unix_time,
+                                    sender: "나",
+                                    text,
+                                });
+                                snapshot.relay_ack = Some("unknown".to_owned());
+                                snapshot.pending_sends = 0;
+                                snapshot.error = Some(if save_error.is_some() {
+                                    "메시지 전송 결과를 확인하지 못했고 기록 저장도 실패했습니다. 입력한 내용을 복사해 두세요.".to_owned()
+                                } else {
+                                    "메시지를 로컬 기록에 보존했습니다. relay 전송 결과는 알 수 없으며 다시 보내면 중복될 수 있습니다.".to_owned()
+                                });
                             });
                             return;
                         }
@@ -280,16 +348,39 @@ fn spawn_chat_worker(
                     }
                 }
                 Ok(Some(RelayUpdate::Published { event_id })) => {
-                    chat_update(&operation, |snapshot| {
-                        snapshot.relay_ack = Some(event_id);
-                    });
+                    if pending_events.remove(&event_id) {
+                        chat_update(&operation, |snapshot| {
+                            snapshot.relay_ack = Some("accepted".to_owned());
+                            snapshot.pending_sends = pending_events.len();
+                        });
+                    }
                 }
                 Ok(Some(RelayUpdate::Ready)) | Ok(None) => {}
-                Err(_) => {
+                Err(error) => {
                     drop(history.take());
                     chat_update(&operation, |snapshot| {
                         snapshot.phase = "disconnected";
-                        snapshot.error = Some("relay 연결이 끊겼습니다.".to_owned());
+                        if let RelayError::RelayRejected { event_id, .. } = &error {
+                            pending_events.remove(event_id);
+                            if pending_events.is_empty() {
+                                snapshot.relay_ack = Some("rejected".to_owned());
+                                snapshot.pending_sends = 0;
+                                snapshot.error = Some(
+                                    "relay가 메시지 이벤트를 거부했습니다. 이 이벤트는 relay에 접수되지 않았습니다."
+                                        .to_owned(),
+                                );
+                            } else {
+                                snapshot.relay_ack = Some("unknown".to_owned());
+                                snapshot.pending_sends = 0;
+                                snapshot.error = Some("relay가 한 이벤트를 거부했습니다. 다른 대기 메시지의 전송 결과는 알 수 없으며 로컬 기록에 보존되어 있습니다. 다시 보내면 중복될 수 있습니다.".to_owned());
+                            }
+                        } else if pending_events.is_empty() {
+                            snapshot.error = Some(relay_failure_message(&error, "chat", false));
+                        } else {
+                            snapshot.relay_ack = Some("unknown".to_owned());
+                            snapshot.pending_sends = 0;
+                            snapshot.error = Some("relay 연결이 끊겨 마지막 메시지의 전송 결과를 확인하지 못했습니다. 로컬 기록에 보존되어 있으며 다시 보내면 중복될 수 있습니다.".to_owned());
+                        }
                     });
                     return;
                 }
@@ -854,6 +945,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 storage_error: None,
                 messages: Vec::new(),
                 relay_ack: None,
+                pending_sends: 0,
             }),
             sender,
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -904,6 +996,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             "error": snapshot.error,
             "storageError": snapshot.storage_error,
             "relayAck": snapshot.relay_ack,
+            "pendingSends": snapshot.pending_sends,
             "messageCount": snapshot.messages.len()
         })
         .to_string();

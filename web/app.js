@@ -224,11 +224,22 @@ function updateChatView(snapshot) {
     verification: '상대 공개 키와 지문을 별도 경로로 비교하세요.',
     confirming: '상대 확인 응답을 기다리는 중입니다.',
     connected: '연결되었습니다. relay는 IP 주소와 연결 시각·통신량을 볼 수 있습니다.',
-    disconnected: '연결이 끊겼습니다.',
+    disconnected: snapshot.error || '연결이 끊겼습니다.',
     failed: snapshot.error || '연결에 실패했습니다.',
     closed: '연결이 종료되었습니다.'
   };
   chatStatus.textContent = labels[snapshot.phase] || snapshot.error || '연결 상태를 확인하는 중입니다.';
+  const deliveryStatus = document.querySelector('#delivery-status');
+  const deliveryLabels = {
+    pending: `relay 접수 확인 대기 중${snapshot.pendingSends > 1 ? ` (${snapshot.pendingSends}건)` : ''}. 상대방의 수신이나 저장은 확인되지 않습니다.`,
+    accepted: 'relay가 이벤트를 수락했습니다. 상대방의 수신이나 저장을 뜻하지 않습니다.',
+    rejected: 'relay가 이벤트를 거부했습니다. 상대방에게 전달되지 않았습니다.',
+    unknown: '마지막 메시지의 전달 결과를 확인할 수 없습니다. 로컬 기록을 확인하고 다시 보낼 때는 중복 가능성을 고려하세요.'
+  };
+  deliveryStatus.textContent = snapshot.pendingSends > 0
+    ? `relay 접수 확인 대기 중 (${snapshot.pendingSends}건). 상대방의 수신이나 저장은 확인되지 않습니다.`
+    : deliveryLabels[snapshot.relayAck] || '';
+  deliveryStatus.hidden = !deliveryStatus.textContent;
   storageStatus.hidden = !snapshot.storageError;
   storageStatus.textContent = snapshot.storageError || '';
   verification.hidden = snapshot.phase !== 'verification';

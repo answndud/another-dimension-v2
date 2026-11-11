@@ -14,23 +14,21 @@ use nostr::prelude::{
     RelayMessage, SecretKey, SingleLetterTag, SubscriptionId, Tag,
 };
 use sha2::Sha256;
-use socks::{Socks5Stream, TargetAddr};
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io;
-use std::io::Read;
-use std::net::{SocketAddr, TcpStream};
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tungstenite::client::connect_with_config;
+use std::time::{Duration, Instant};
+use tungstenite::client::IntoClientRequest;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{client_tls_with_config, Message, WebSocket};
 use zeroize::Zeroizing;
 
 const EVENT_KIND: u16 = 20_000;
-pub const DEFAULT_RELAY: &str = "wss://relay.damus.io";
+pub const DEFAULT_RELAY: &str = "wss://relay.primal.net";
 const SUBSCRIPTION_ID: &str = "ad-v2-live";
 const INVITE_PREFIX: &str = "ADI1-";
 const INVITE_TOPIC_INFO: &[u8] = b"another-dimension-v2/invite-topic/v1";
@@ -41,6 +39,9 @@ const MAX_RELAY_MESSAGE: usize = 16 * 1024;
 const MAX_ENVELOPE: usize = 4 + 16 + 8 + 4096;
 const READ_TIMEOUT: Duration = Duration::from_millis(250);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(15);
+const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum RelayError {
@@ -50,6 +51,7 @@ pub enum RelayError {
     InvalidEndpoint,
     Io(io::Error),
     InvalidEvent,
+    TimedOut(&'static str),
     SubscriptionClosed(String),
     RelayRejected { event_id: String, reason: String },
     Disconnected,
@@ -121,6 +123,7 @@ impl RelaySession {
             .author(peer_author);
         let request = ClientMessage::req(subscription.clone(), vec![filter]);
         socket.send(Message::text(request.as_json()))?;
+        wait_for_subscription(&mut socket, &subscription)?;
 
         Ok(Self {
             socket,
@@ -233,44 +236,37 @@ fn open_socket(
     if !endpoint.starts_with("wss://") || endpoint.contains('@') || endpoint.contains('#') {
         return Err(RelayError::InvalidEndpoint);
     }
+    ensure_tls_crypto_provider()?;
     let mut config = WebSocketConfig::default();
     config.max_message_size = Some(MAX_RELAY_MESSAGE);
     config.max_frame_size = Some(MAX_RELAY_MESSAGE);
-    let (mut socket, _) = if let Some(proxy) = tor_socks {
+    let request = endpoint.into_client_request()?;
+    let host = request
+        .uri()
+        .host()
+        .ok_or(RelayError::InvalidEndpoint)?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
+    let port = request.uri().port_u16().unwrap_or(443);
+    let stream = if let Some(proxy) = tor_socks {
         if !proxy.ip().is_loopback() || proxy.port() == 0 {
             return Err(RelayError::InvalidEndpoint);
         }
-        let authority = endpoint
-            .strip_prefix("wss://")
-            .ok_or(RelayError::InvalidEndpoint)?;
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) => (
-                host,
-                port.parse::<u16>()
-                    .map_err(|_| RelayError::InvalidEndpoint)?,
-            ),
-            None => (authority, 443),
-        };
-        if host.is_empty() || host.contains('/') || host.contains('?') || host.contains('#') {
-            return Err(RelayError::InvalidEndpoint);
-        }
-        let target = TargetAddr::Domain(host.to_owned(), port);
-        let stream = Socks5Stream::connect(proxy, target).map_err(|error| {
-            RelayError::Io(io::Error::other(format!(
-                "Tor SOCKS connection failed: {error}"
-            )))
-        })?;
-        client_tls_with_config(endpoint, stream.into_inner(), Some(config), None).map_err(
-            |error| match error {
-                tungstenite::HandshakeError::Failure(error) => RelayError::WebSocket(error),
-                tungstenite::HandshakeError::Interrupted(_) => {
-                    RelayError::Io(io::Error::other("blocking TLS handshake interrupted"))
-                }
-            },
-        )?
+        connect_socks5(proxy, &host, port)?
     } else {
-        connect_with_config(endpoint, Some(config), 0)?
+        connect_tcp(&host, port)?
     };
+    stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
+    stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
+    let (mut socket, _) = client_tls_with_config(request, stream, Some(config), None).map_err(
+        |error| match error {
+            tungstenite::HandshakeError::Failure(error) => RelayError::WebSocket(error),
+            tungstenite::HandshakeError::Interrupted(_) => {
+                RelayError::Io(io::Error::other("blocking TLS handshake interrupted"))
+            }
+        },
+    )?;
     match socket.get_mut() {
         MaybeTlsStream::Rustls(stream) => {
             stream.sock.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -279,6 +275,82 @@ fn open_socket(
         _ => return Err(RelayError::InvalidEndpoint),
     }
     Ok(socket)
+}
+
+fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, RelayError> {
+    let addresses = (host, port).to_socket_addrs()?.collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(RelayError::Io(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "relay hostname did not resolve",
+        )));
+    }
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    let mut last_error = None;
+    for address in addresses {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&address, remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(RelayError::Io(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::TimedOut, "relay connection timed out")
+    })))
+}
+
+fn connect_socks5(proxy: SocketAddr, host: &str, port: u16) -> Result<TcpStream, RelayError> {
+    let mut stream = TcpStream::connect_timeout(&proxy, CONNECT_TIMEOUT)?;
+    stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
+    stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
+    stream.write_all(&[5, 1, 0])?;
+    let mut selection = [0; 2];
+    stream.read_exact(&mut selection)?;
+    if selection != [5, 0] {
+        return Err(RelayError::Io(io::Error::other(
+            "SOCKS5 proxy rejected no-authentication mode",
+        )));
+    }
+    let host = host.as_bytes();
+    let host_len = u8::try_from(host.len()).map_err(|_| RelayError::InvalidEndpoint)?;
+    stream.write_all(&[5, 1, 0, 3, host_len])?;
+    stream.write_all(host)?;
+    stream.write_all(&port.to_be_bytes())?;
+    let mut response = [0; 4];
+    stream.read_exact(&mut response)?;
+    if response[0] != 5 || response[1] != 0 {
+        return Err(RelayError::Io(io::Error::other(
+            "SOCKS5 proxy could not connect to relay",
+        )));
+    }
+    let bound_address_len = match response[3] {
+        1 => 4,
+        3 => {
+            let mut length = [0];
+            stream.read_exact(&mut length)?;
+            length[0] as usize
+        }
+        4 => 16,
+        _ => return Err(RelayError::Io(io::Error::other("invalid SOCKS5 response"))),
+    };
+    let mut bound_address = vec![0; bound_address_len + 2];
+    stream.read_exact(&mut bound_address)?;
+    Ok(stream)
+}
+
+fn ensure_tls_crypto_provider() -> Result<(), RelayError> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        return Err(RelayError::Io(io::Error::other(
+            "TLS crypto provider unavailable",
+        )));
+    }
+    Ok(())
 }
 
 /// High-entropy bearer code used only to discover the first connection. Keep
@@ -403,6 +475,7 @@ impl RelayRendezvous {
         socket.send(Message::text(
             ClientMessage::req(subscription.clone(), vec![filter]).as_json(),
         ))?;
+        wait_for_subscription(&mut socket, &subscription)?;
         Ok(Self {
             socket,
             topic,
@@ -426,13 +499,13 @@ impl RelayRendezvous {
         match self.role {
             Role::Initiator => {
                 self.publish_frame(&handshake.write()?)?;
-                handshake.read(&self.receive_frame()?)?;
+                handshake.read(&self.receive_frame("handshake response")?)?;
                 self.publish_frame(&handshake.write()?)?;
             }
             Role::Responder => {
-                handshake.read(&self.receive_frame()?)?;
+                handshake.read(&self.receive_frame("handshake initiation")?)?;
                 self.publish_frame(&handshake.write()?)?;
-                handshake.read(&self.receive_frame()?)?;
+                handshake.read(&self.receive_frame("handshake completion")?)?;
             }
         }
         Ok(handshake.finish()?)
@@ -451,7 +524,7 @@ impl RelayRendezvous {
         }
         let (pending, proof) = channel.prove_identity(identity)?;
         self.publish_frame(&proof)?;
-        Ok(pending.receive_peer_proof(&self.receive_frame()?, expected_peer)?)
+        Ok(pending.receive_peer_proof(&self.receive_frame("identity proof")?, expected_peer)?)
     }
 
     /// Call only after the user has compared the out-of-band fingerprint.
@@ -465,7 +538,7 @@ impl RelayRendezvous {
         }
         let (pending, frame) = verification.confirm_after_user_check()?;
         self.publish_frame(&frame)?;
-        let peer_frame = self.receive_frame()?;
+        let peer_frame = self.receive_frame("peer confirmation")?;
         let active = pending.receive_peer_confirmation(&peer_frame)?;
         RelaySession::from_socket(self.socket, SessionTransport::new(active))
     }
@@ -496,8 +569,9 @@ impl RelayRendezvous {
         Ok(())
     }
 
-    fn receive_frame(&mut self) -> Result<Vec<u8>, RelayError> {
+    fn receive_frame(&mut self, stage: &'static str) -> Result<Vec<u8>, RelayError> {
         let expected_role = role_tag(self.role.peer());
+        let deadline = Instant::now() + RENDEZVOUS_TIMEOUT;
         loop {
             if self
                 .cancelled
@@ -505,6 +579,9 @@ impl RelayRendezvous {
                 .is_some_and(|token| token.load(Ordering::SeqCst))
             {
                 return Err(RelayError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(RelayError::TimedOut(stage));
             }
             let incoming = match self.socket.read() {
                 Ok(message) => message,
@@ -586,6 +663,67 @@ impl RelayRendezvous {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SubscriptionStatus {
+    Pending,
+    Ready,
+    Closed(String),
+}
+
+fn subscription_status(
+    text: &str,
+    expected: &SubscriptionId,
+) -> Result<SubscriptionStatus, RelayError> {
+    Ok(match RelayMessage::from_json(text)? {
+        RelayMessage::EndOfStoredEvents(subscription) if subscription.as_ref() == expected => {
+            SubscriptionStatus::Ready
+        }
+        RelayMessage::Closed {
+            subscription_id,
+            message,
+        } if subscription_id.as_ref() == expected => {
+            SubscriptionStatus::Closed(message.to_string())
+        }
+        _ => SubscriptionStatus::Pending,
+    })
+}
+
+fn wait_for_subscription(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    subscription: &SubscriptionId,
+) -> Result<(), RelayError> {
+    let deadline = Instant::now() + SUBSCRIPTION_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(RelayError::TimedOut("relay subscription"));
+        }
+        let message = match socket.read() {
+            Ok(message) => message,
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match message {
+            Message::Text(text) => match subscription_status(text.as_str(), subscription)? {
+                SubscriptionStatus::Pending => {}
+                SubscriptionStatus::Ready => return Ok(()),
+                SubscriptionStatus::Closed(reason) => {
+                    return Err(RelayError::SubscriptionClosed(reason));
+                }
+            },
+            Message::Ping(payload) => socket.send(Message::Pong(payload))?,
+            Message::Close(_) => return Err(RelayError::Disconnected),
+            Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+        }
+    }
+}
+
 fn role_tag(role: Role) -> &'static str {
     match role {
         Role::Initiator => "i",
@@ -648,4 +786,154 @@ fn decode_hex(input: &str) -> Option<Vec<u8>> {
         .chunks_exact(2)
         .map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        subscription_status, InviteCode, RelayRendezvous, RelayUpdate, Role, SubscriptionStatus,
+    };
+    use crate::identity::Identity;
+    use nostr::prelude::SubscriptionId;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn tls_crypto_provider_is_initialized_before_network_use() {
+        super::ensure_tls_crypto_provider().unwrap();
+    }
+
+    #[test]
+    fn subscription_ready_and_closed_responses_are_matched_by_id() {
+        let expected = SubscriptionId::new("ad-v2-live");
+        assert_eq!(
+            subscription_status(r#"["EOSE","ad-v2-live"]"#, &expected).unwrap(),
+            SubscriptionStatus::Ready
+        );
+        assert_eq!(
+            subscription_status(r#"["EOSE","other"]"#, &expected).unwrap(),
+            SubscriptionStatus::Pending
+        );
+        assert_eq!(
+            subscription_status(r#"["CLOSED","ad-v2-live","restricted"]"#, &expected).unwrap(),
+            SubscriptionStatus::Closed("restricted".to_owned())
+        );
+    }
+
+    #[test]
+    fn socks_connection_sends_the_relay_hostname_to_the_proxy() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).unwrap();
+
+            let mut request = [0; 5];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request[..4], &[5, 1, 0, 3]);
+            let mut hostname = vec![0; request[4] as usize];
+            stream.read_exact(&mut hostname).unwrap();
+            assert_eq!(hostname, b"relay.example");
+            let mut port = [0; 2];
+            stream.read_exact(&mut port).unwrap();
+            assert_eq!(u16::from_be_bytes(port), 443);
+            stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+        });
+
+        let stream = super::connect_socks5(proxy, "relay.example", 443).unwrap();
+        drop(stream);
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "live public relay end-to-end test"]
+    fn live_relay_two_party_channel_roundtrip() {
+        let invite = InviteCode::generate().unwrap();
+        let invite_code = invite.code().to_string();
+        let barrier = Arc::new(Barrier::new(2));
+        let (initiator_tx, responder_rx) = mpsc::channel();
+        let (responder_tx, initiator_rx) = mpsc::channel();
+        let initiator_barrier = Arc::clone(&barrier);
+        let responder_barrier = Arc::clone(&barrier);
+        let initiator_code = invite_code.clone();
+        let initiator = thread::spawn(move || {
+            live_relay_party(
+                Role::Initiator,
+                initiator_code,
+                initiator_tx,
+                initiator_rx,
+                initiator_barrier,
+            )
+        });
+        let responder = thread::spawn(move || {
+            live_relay_party(
+                Role::Responder,
+                invite_code,
+                responder_tx,
+                responder_rx,
+                responder_barrier,
+            )
+        });
+        initiator.join().unwrap();
+        responder.join().unwrap();
+    }
+
+    fn live_relay_party(
+        role: Role,
+        invite_code: String,
+        fingerprint_tx: Sender<Vec<u8>>,
+        fingerprint_rx: Receiver<Vec<u8>>,
+        barrier: Arc<Barrier>,
+    ) {
+        let invite = InviteCode::parse(&invite_code).unwrap();
+        let endpoint = "wss://relay.primal.net";
+        let mut rendezvous = match role {
+            Role::Initiator => RelayRendezvous::join(endpoint, &invite, None),
+            Role::Responder => RelayRendezvous::create(endpoint, &invite, None),
+        }
+        .unwrap();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        rendezvous.set_cancellation_token(cancelled);
+        let channel = rendezvous.complete_handshake().unwrap();
+        let identity = Identity::create().unwrap().0;
+        let verification = rendezvous.authenticate(channel, &identity, None).unwrap();
+        let fingerprint = verification.fingerprint().to_vec();
+        fingerprint_tx.send(fingerprint.clone()).unwrap();
+        assert_eq!(
+            fingerprint_rx
+                .recv_timeout(Duration::from_secs(35))
+                .unwrap(),
+            fingerprint
+        );
+        let mut session = rendezvous.confirm(verification).unwrap();
+        barrier.wait();
+        let (send, expected) = match role {
+            Role::Initiator => ("initiator message", "responder message"),
+            Role::Responder => ("responder message", "initiator message"),
+        };
+        session.send(send.as_bytes()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(35);
+        let mut received = None;
+        while Instant::now() < deadline {
+            match session.poll().unwrap() {
+                Some(RelayUpdate::Messages(messages)) => {
+                    received = messages
+                        .into_iter()
+                        .find_map(|message| String::from_utf8(message).ok());
+                    if received.is_some() {
+                        break;
+                    }
+                }
+                _ => thread::sleep(Duration::from_millis(100)),
+            }
+        }
+        assert_eq!(received.as_deref(), Some(expected));
+    }
 }
