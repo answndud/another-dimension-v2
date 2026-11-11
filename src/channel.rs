@@ -41,7 +41,7 @@ impl Role {
         }
     }
 
-    fn peer(self) -> Self {
+    pub(crate) fn peer(self) -> Self {
         match self {
             Self::Initiator => Self::Responder,
             Self::Responder => Self::Initiator,
@@ -65,6 +65,7 @@ pub enum HandshakeError {
     SequenceExhausted,
     Closed,
     InvalidRelayKey,
+    RoleMismatch,
 }
 
 impl From<snow::Error> for HandshakeError {
@@ -166,6 +167,10 @@ pub struct PendingChannel {
 }
 
 impl PendingChannel {
+    pub(crate) fn role(&self) -> Role {
+        self.role
+    }
+
     /// Creates a transcript-bound identity proof. Send this frame to the peer,
     /// then pass its response to `receive_peer_proof`.
     pub fn prove_identity(
@@ -270,6 +275,10 @@ pub struct VerificationPending {
 }
 
 impl VerificationPending {
+    pub(crate) fn role(&self) -> Role {
+        self.role
+    }
+
     pub fn peer_public_key(&self) -> &[u8; 32] {
         &self.peer_key
     }
