@@ -1,4 +1,5 @@
 pub mod channel;
+mod contacts;
 pub mod history;
 mod identity;
 pub mod relay;
