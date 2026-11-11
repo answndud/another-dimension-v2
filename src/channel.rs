@@ -1,6 +1,6 @@
-//! Candidate authenticated-channel state machine. No network or relay is wired
-//! to this module. Chat frames are available only after local confirmation and
-//! an encrypted peer confirmation frame.
+//! Authenticated-channel state machine used by the relay adapter.
+//! Chat frames are available only after local confirmation and an encrypted
+//! peer confirmation frame.
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use nostr::prelude::{Keys, PublicKey, SecretKey};

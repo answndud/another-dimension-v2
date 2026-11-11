@@ -1,5 +1,7 @@
 # another-dimension-v2
 
+이 저장소는 사용자의 Mac에서 Rust 프로그램을 실행하고 로컬 브라우저 화면을 여는 독립 프로젝트입니다. 정적 브라우저 채팅인 [another-dimension](https://github.com/answndud/another-dimension)과 저장소와 구현이 다르며, GitHub Pages는 실행에 필요하지 않습니다.
+
 ## 실행
 
 일반 연결은 다음 명령으로 시작합니다.
