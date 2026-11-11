@@ -34,6 +34,8 @@ const INVITE_PREFIX: &str = "ADI1-";
 const INVITE_TOPIC_INFO: &[u8] = b"another-dimension-v2/invite-topic/v1";
 const INVITE_KEY_INFO: &[u8] = b"another-dimension-v2/invite-relay-key/v1";
 const INVITE_DOMAIN: &[u8] = b"another-dimension-v2/invite-code/v1";
+const READY_REQUEST_PREFIX: &[u8] = b"\0AD2-READY-1:";
+const READY_ACK_PREFIX: &[u8] = b"\0AD2-READY-ACK-1:";
 const MAX_BOOTSTRAP_FRAME: usize = 256;
 const MAX_RELAY_MESSAGE: usize = 16 * 1024;
 const MAX_ENVELOPE: usize = 4 + 16 + 8 + 4096;
@@ -42,6 +44,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(15);
 const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
+const READY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub enum RelayError {
@@ -495,6 +498,7 @@ impl RelayRendezvous {
 
     /// Exchanges all three Noise XX handshake messages over the rendezvous.
     pub fn complete_handshake(&mut self) -> Result<PendingChannel, RelayError> {
+        self.wait_for_peer_subscription()?;
         let mut handshake = Handshake::new(self.role)?;
         match self.role {
             Role::Initiator => {
@@ -509,6 +513,60 @@ impl RelayRendezvous {
             }
         }
         Ok(handshake.finish()?)
+    }
+
+    fn wait_for_peer_subscription(&mut self) -> Result<(), RelayError> {
+        let deadline = Instant::now() + RENDEZVOUS_TIMEOUT;
+        let mut last_request = None;
+        let mut pending_nonces = BTreeSet::new();
+        loop {
+            if self
+                .cancelled
+                .as_ref()
+                .is_some_and(|token| token.load(Ordering::SeqCst))
+            {
+                return Err(RelayError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(RelayError::TimedOut("peer subscription"));
+            }
+
+            if self.role == Role::Initiator
+                && last_request
+                    .map(|last: Instant| last.elapsed() >= READY_RETRY_INTERVAL)
+                    .unwrap_or(true)
+            {
+                let nonce = random_hex(12)?;
+                let mut request = READY_REQUEST_PREFIX.to_vec();
+                request.extend_from_slice(nonce.as_bytes());
+                self.publish_frame(&request)?;
+                pending_nonces.insert(nonce);
+                last_request = Some(Instant::now());
+            }
+
+            if let Some(frame) = self.poll_frame()? {
+                match self.role {
+                    Role::Initiator => {
+                        if let Some(nonce) = frame.strip_prefix(READY_ACK_PREFIX) {
+                            if std::str::from_utf8(nonce)
+                                .ok()
+                                .is_some_and(|nonce| pending_nonces.contains(nonce))
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Role::Responder => {
+                        if let Some(nonce) = frame.strip_prefix(READY_REQUEST_PREFIX) {
+                            let mut acknowledgement = READY_ACK_PREFIX.to_vec();
+                            acknowledgement.extend_from_slice(nonce);
+                            self.publish_frame(&acknowledgement)?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Exchanges the transcript-bound identity proof through the encrypted
@@ -570,7 +628,6 @@ impl RelayRendezvous {
     }
 
     fn receive_frame(&mut self, stage: &'static str) -> Result<Vec<u8>, RelayError> {
-        let expected_role = role_tag(self.role.peer());
         let deadline = Instant::now() + RENDEZVOUS_TIMEOUT;
         loop {
             if self
@@ -583,82 +640,106 @@ impl RelayRendezvous {
             if Instant::now() >= deadline {
                 return Err(RelayError::TimedOut(stage));
             }
-            let incoming = match self.socket.read() {
-                Ok(message) => message,
-                Err(tungstenite::Error::Io(error))
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
+            if let Some(frame) = self.poll_frame()? {
+                if frame.starts_with(READY_REQUEST_PREFIX) || frame.starts_with(READY_ACK_PREFIX) {
                     continue;
                 }
-                Err(error) => return Err(error.into()),
-            };
-            match incoming {
-                Message::Text(text) => match RelayMessage::from_json(text.as_str())? {
-                    RelayMessage::Event {
-                        subscription_id,
-                        event,
-                    } => {
-                        if subscription_id.as_ref() != &self.subscription {
-                            continue;
-                        }
-                        let event = event.as_ref();
-                        let event_id = event.id.to_string();
-                        if event.pubkey != self.keys.public_key()
-                            || event.kind != Kind::Custom(EVENT_KIND)
-                            || event.verify().is_err()
-                            || tag_value(event, "t") != Some(self.topic.as_str())
-                            || tag_value(event, "r") != Some(expected_role)
-                        {
-                            continue;
-                        }
-                        let Some(attempt) = tag_value(event, "s") else {
-                            continue;
-                        };
-                        if !is_attempt_tag(attempt) {
-                            continue;
-                        }
-                        match self.attempt_tag.as_deref() {
-                            Some(expected) if expected != attempt => continue,
-                            Some(_) => {}
-                            None => self.attempt_tag = Some(attempt.to_owned()),
-                        }
-                        if !self.seen.insert(event_id) {
-                            continue;
-                        }
-                        if self.seen.len() > 16 {
-                            return Err(RelayError::InvalidEvent);
-                        }
-                        let frame = decode_hex(&event.content).ok_or(RelayError::InvalidEvent)?;
-                        if frame.is_empty() || frame.len() > MAX_BOOTSTRAP_FRAME {
-                            return Err(RelayError::InvalidEvent);
-                        }
-                        return Ok(frame);
+                return Ok(frame);
+            }
+        }
+    }
+
+    fn poll_frame(&mut self) -> Result<Option<Vec<u8>>, RelayError> {
+        let expected_role = role_tag(self.role.peer());
+        if self
+            .cancelled
+            .as_ref()
+            .is_some_and(|token| token.load(Ordering::SeqCst))
+        {
+            return Err(RelayError::Cancelled);
+        }
+        let incoming = match self.socket.read() {
+            Ok(message) => message,
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match incoming {
+            Message::Text(text) => match RelayMessage::from_json(text.as_str())? {
+                RelayMessage::Event {
+                    subscription_id,
+                    event,
+                } => {
+                    if subscription_id.as_ref() != &self.subscription {
+                        return Ok(None);
                     }
-                    RelayMessage::Closed {
-                        subscription_id,
-                        message,
-                    } if subscription_id.as_ref() == &self.subscription => {
-                        return Err(RelayError::SubscriptionClosed(message.to_string()));
+                    let event = event.as_ref();
+                    let event_id = event.id.to_string();
+                    if event.pubkey != self.keys.public_key()
+                        || event.kind != Kind::Custom(EVENT_KIND)
+                        || event.verify().is_err()
+                        || tag_value(event, "t") != Some(self.topic.as_str())
+                        || tag_value(event, "r") != Some(expected_role)
+                    {
+                        return Ok(None);
                     }
-                    RelayMessage::Ok {
-                        event_id,
-                        status,
-                        message,
-                    } if self.published.remove(&event_id.to_string()) && !status => {
-                        return Err(RelayError::RelayRejected {
+                    let Some(attempt) = tag_value(event, "s") else {
+                        return Ok(None);
+                    };
+                    if !is_attempt_tag(attempt) {
+                        return Ok(None);
+                    }
+                    match self.attempt_tag.as_deref() {
+                        Some(expected) if expected != attempt => return Ok(None),
+                        Some(_) => {}
+                        None => self.attempt_tag = Some(attempt.to_owned()),
+                    }
+                    if !self.seen.insert(event_id) {
+                        return Ok(None);
+                    }
+                    if self.seen.len() > 64 {
+                        return Err(RelayError::InvalidEvent);
+                    }
+                    let frame = decode_hex(&event.content).ok_or(RelayError::InvalidEvent)?;
+                    if frame.is_empty() || frame.len() > MAX_BOOTSTRAP_FRAME {
+                        return Err(RelayError::InvalidEvent);
+                    }
+                    Ok(Some(frame))
+                }
+                RelayMessage::Closed {
+                    subscription_id,
+                    message,
+                } if subscription_id.as_ref() == &self.subscription => {
+                    return Err(RelayError::SubscriptionClosed(message.to_string()));
+                }
+                RelayMessage::Ok {
+                    event_id,
+                    status,
+                    message,
+                } if self.published.remove(&event_id.to_string()) => {
+                    if status {
+                        Ok(None)
+                    } else {
+                        Err(RelayError::RelayRejected {
                             event_id: event_id.to_string(),
                             reason: message.to_string(),
-                        });
+                        })
                     }
-                    _ => {}
-                },
-                Message::Ping(payload) => self.socket.send(Message::Pong(payload))?,
-                Message::Close(_) => return Err(RelayError::Disconnected),
-                Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+                }
+                _ => Ok(None),
+            },
+            Message::Ping(payload) => {
+                self.socket.send(Message::Pong(payload))?;
+                Ok(None)
             }
+            Message::Close(_) => return Err(RelayError::Disconnected),
+            Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => Ok(None),
         }
     }
 }
@@ -791,7 +872,8 @@ fn decode_hex(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        subscription_status, InviteCode, RelayRendezvous, RelayUpdate, Role, SubscriptionStatus,
+        subscription_status, InviteCode, RelayError, RelayRendezvous, RelayUpdate, Role,
+        SubscriptionStatus,
     };
     use crate::identity::Identity;
     use nostr::prelude::SubscriptionId;
@@ -855,34 +937,52 @@ mod tests {
     #[test]
     #[ignore = "live public relay end-to-end test"]
     fn live_relay_two_party_channel_roundtrip() {
-        let invite = InviteCode::generate().unwrap();
-        let invite_code = invite.code().to_string();
-        let barrier = Arc::new(Barrier::new(2));
-        let (initiator_tx, responder_rx) = mpsc::channel();
-        let (responder_tx, initiator_rx) = mpsc::channel();
-        let initiator_barrier = Arc::clone(&barrier);
-        let responder_barrier = Arc::clone(&barrier);
-        let initiator_code = invite_code.clone();
-        let initiator = thread::spawn(move || {
-            live_relay_party(
-                Role::Initiator,
-                initiator_code,
-                initiator_tx,
-                initiator_rx,
-                initiator_barrier,
-            )
+        let abandoned_invite = InviteCode::generate().unwrap();
+        let mut abandoned_join =
+            RelayRendezvous::join("wss://relay.primal.net", &abandoned_invite, None).unwrap();
+        let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        abandoned_join.set_cancellation_token(Arc::clone(&cancellation));
+        let cancel_after_start = Arc::clone(&cancellation);
+        let cancel_task = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(800));
+            cancel_after_start.store(true, std::sync::atomic::Ordering::SeqCst);
         });
-        let responder = thread::spawn(move || {
-            live_relay_party(
-                Role::Responder,
-                invite_code,
-                responder_tx,
-                responder_rx,
-                responder_barrier,
-            )
-        });
-        initiator.join().unwrap();
-        responder.join().unwrap();
+        assert!(matches!(
+            abandoned_join.complete_handshake(),
+            Err(RelayError::Cancelled)
+        ));
+        cancel_task.join().unwrap();
+
+        for _ in 0..2 {
+            let invite = InviteCode::generate().unwrap();
+            let invite_code = invite.code().to_string();
+            let barrier = Arc::new(Barrier::new(2));
+            let (initiator_tx, responder_rx) = mpsc::channel();
+            let (responder_tx, initiator_rx) = mpsc::channel();
+            let initiator_barrier = Arc::clone(&barrier);
+            let responder_barrier = Arc::clone(&barrier);
+            let initiator_code = invite_code.clone();
+            let initiator = thread::spawn(move || {
+                live_relay_party(
+                    Role::Initiator,
+                    initiator_code,
+                    initiator_tx,
+                    initiator_rx,
+                    initiator_barrier,
+                )
+            });
+            let responder = thread::spawn(move || {
+                live_relay_party(
+                    Role::Responder,
+                    invite_code,
+                    responder_tx,
+                    responder_rx,
+                    responder_barrier,
+                )
+            });
+            initiator.join().unwrap();
+            responder.join().unwrap();
+        }
     }
 
     fn live_relay_party(

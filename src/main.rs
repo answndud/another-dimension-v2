@@ -97,6 +97,7 @@ fn relay_failure_message(error: &RelayError, phase: &str, using_tor: bool) -> St
                 }
                 "identity proof" => "상대 신원 확인 응답",
                 "peer confirmation" => "상대 확인 응답",
+                "peer subscription" => "상대 relay 구독 준비",
                 _ => "relay 응답",
             };
             format!("{description} 제한 시간이 지났습니다. 새 초대 코드로 다시 시도하세요.")
