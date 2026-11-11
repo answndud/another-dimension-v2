@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "zeroize"] }
+hkdf = "=0.12.4"
+sha2 = "=0.10.9"
+zeroize = { version = "=1.9.0", features = ["alloc"] }

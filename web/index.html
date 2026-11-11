@@ -8,11 +8,52 @@
     body { max-width: 52rem; margin: 3rem auto; padding: 0 1.5rem; font: 16px/1.6 system-ui, sans-serif; color: #1a1a1a; }
     header { border-bottom: 1px solid #ccc; }
     h1 { font-size: 1.35rem; font-weight: 600; }
-    main { padding: 1rem 0; }
+    h2 { font-size: 1.1rem; }
+    main { padding: 1.5rem 0; }
+    form, section { max-width: 40rem; }
+    label { display: block; font-weight: 600; }
+    input, textarea { box-sizing: border-box; width: 100%; padding: .55rem; margin: .5rem 0; font: inherit; }
+    textarea { min-height: 5rem; resize: vertical; overflow-wrap: anywhere; }
+    button { padding: .45rem .9rem; margin: .25rem .3rem .25rem 0; font: inherit; cursor: pointer; }
+    .actions { display: flex; flex-wrap: wrap; gap: .35rem; }
+    .identity-id { overflow-wrap: anywhere; font-family: monospace; }
+    [hidden] { display: none; }
   </style>
+  <script src="/app.js" defer></script>
 </head>
 <body>
   <header><h1>Another Dimension</h1></header>
-  <main><p>연결 기능을 사용할 수 없습니다.</p></main>
+  <main>
+    <form id="connect-form">
+      <label for="bridge-code">로컬 연결 코드</label>
+      <p>터미널에 표시된 코드를 입력하세요.</p>
+      <input id="bridge-code" type="password" autocomplete="off" required>
+      <button type="submit">연결</button>
+    </form>
+    <section id="identity-entry" hidden>
+      <h2>개인 신원</h2>
+      <p>개인 접속 코드로 로그인하거나 새 코드를 생성하세요.</p>
+      <form id="login-form">
+        <label for="identity-code">개인 접속 코드</label>
+        <input id="identity-code" type="password" autocomplete="off" spellcheck="false" required>
+        <button type="submit">로그인</button>
+      </form>
+      <p>형식이 맞는 다른 코드를 입력하면 다른 신원이 열립니다.</p>
+      <div class="actions"><button id="create" type="button">새 코드 생성</button><button class="disconnect" type="button">로컬 연결 해제</button></div>
+    </section>
+    <section id="created" hidden>
+      <h2>개인 접속 코드</h2>
+      <p>코드를 따로 보관하세요. 이 화면을 벗어나면 다시 보여드릴 수 없습니다. 코드를 아는 사람은 이 신원을 사용할 수 있습니다.</p>
+      <label for="generated-code">생성된 코드</label>
+      <textarea id="generated-code" readonly spellcheck="false"></textarea>
+      <div class="actions"><button id="copy-code" type="button">코드 복사</button><button id="save-code" type="button">TXT 저장</button><button id="continue" type="button">계속</button></div>
+    </section>
+    <section id="identity-active" hidden>
+      <h2>로그인됨</h2>
+      <p>신원 ID</p><p id="identity-id" class="identity-id"></p>
+      <div class="actions"><button id="logout" type="button">로그아웃</button><button class="disconnect" type="button">로컬 연결 해제</button></div>
+    </section>
+    <p id="message" role="status" aria-live="polite"></p>
+  </main>
 </body>
 </html>
