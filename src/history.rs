@@ -20,6 +20,7 @@ const NONCE_BYTES: usize = 12;
 const INDEX_MAGIC: &[u8; 8] = b"ADIDX1\0\0";
 const BACKUP_MAGIC: &[u8; 8] = b"ADBACK1\0";
 const BACKUP_PASSWORD_MAGIC: &[u8; 8] = b"ADBACK2\0";
+const BACKUP_COMBINED_MAGIC: &[u8; 8] = b"ADBACK3\0";
 const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
 const BACKUP_SALT_BYTES: usize = 16;
 static INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -237,7 +238,7 @@ impl History {
             0
         };
         let header_len = if password.is_some() {
-            BACKUP_PASSWORD_MAGIC.len()
+            BACKUP_COMBINED_MAGIC.len()
         } else {
             BACKUP_MAGIC.len()
         } + salt_len
@@ -267,10 +268,13 @@ impl History {
         File::open("/dev/urandom")?.read_exact(&mut salt)?;
         let nonce = random_nonce()?;
         let (magic, key) = match password {
-            Some(password) => (
-                BACKUP_PASSWORD_MAGIC,
-                derive_password_backup_key(password, &salt)?,
-            ),
+            Some(password) => {
+                let password_key = derive_password_backup_key(password, &salt)?;
+                (
+                    BACKUP_COMBINED_MAGIC,
+                    derive_combined_backup_key(&identity.storage_key(), &password_key),
+                )
+            }
             None => (BACKUP_MAGIC, derive_backup_key(&identity.storage_key())),
         };
         let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
@@ -314,6 +318,8 @@ impl History {
                 derive_backup_key(&identity.storage_key()),
             )
         } else if magic == BACKUP_PASSWORD_MAGIC {
+            // ADBACK2 was password-only. Keep importing it, but new exports use
+            // ADBACK3 so both the identity secret and password are required.
             let password = password.ok_or_else(|| invalid_data("backup password required"))?;
             validate_backup_password(password)?;
             let salt_start = BACKUP_MAGIC.len();
@@ -328,6 +334,23 @@ impl History {
                 Some(salt),
                 nonce_start,
                 derive_password_backup_key(password, &salt)?,
+            )
+        } else if magic == BACKUP_COMBINED_MAGIC {
+            let password = password.ok_or_else(|| invalid_data("backup password required"))?;
+            validate_backup_password(password)?;
+            let salt_start = BACKUP_MAGIC.len();
+            let nonce_start = salt_start + BACKUP_SALT_BYTES;
+            if backup.len() < nonce_start + NONCE_BYTES + 16 {
+                return Err(invalid_data("invalid backup file"));
+            }
+            let salt: [u8; BACKUP_SALT_BYTES] = backup[salt_start..nonce_start]
+                .try_into()
+                .expect("fixed-size salt slice");
+            let password_key = derive_password_backup_key(password, &salt)?;
+            (
+                Some(salt),
+                nonce_start,
+                derive_combined_backup_key(&identity.storage_key(), &password_key),
             )
         } else {
             return Err(invalid_data("invalid backup file"));
@@ -452,6 +475,20 @@ fn derive_backup_key(key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
         )
         .expect("32 bytes is a valid HKDF output length");
     backup_key
+}
+
+fn derive_combined_backup_key(
+    identity_key: &[u8; 32],
+    password_key: &[u8; 32],
+) -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0; 32]);
+    Hkdf::<Sha256>::new(Some(password_key), identity_key)
+        .expand(
+            b"another-dimension-v2/portable-backup/identity-and-password/v1",
+            key.as_mut(),
+        )
+        .expect("32 bytes is a valid HKDF output length");
+    key
 }
 
 fn validate_backup_password(password: &str) -> io::Result<()> {
@@ -803,6 +840,8 @@ fn data_directory() -> io::Result<PathBuf> {
 mod tests {
     use super::{History, MessageSender, StoredMessage, MAX_BACKUP_BYTES, MAX_MESSAGE_BYTES};
     use crate::identity::Identity;
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -839,6 +878,46 @@ mod tests {
         }
     }
 
+    fn legacy_password_backup(
+        identity: &Identity,
+        peer: &str,
+        messages: &[StoredMessage],
+        password: &str,
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&super::decode_peer_id(peer).unwrap());
+        payload.extend_from_slice(&(messages.len() as u32).to_be_bytes());
+        for message in messages {
+            let text = message.text.as_bytes();
+            payload.extend_from_slice(&message.unix_time.to_be_bytes());
+            payload.push(match message.sender {
+                MessageSender::Me => 0,
+                MessageSender::Other => 1,
+            });
+            payload.extend_from_slice(&(text.len() as u32).to_be_bytes());
+            payload.extend_from_slice(text);
+        }
+        let salt = [0x31; super::BACKUP_SALT_BYTES];
+        let nonce = [0x52; super::NONCE_BYTES];
+        let key = super::derive_password_backup_key(password, &salt).unwrap();
+        let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref()).unwrap();
+        let encrypted = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &payload,
+                    aad: &super::backup_aad(identity, super::BACKUP_PASSWORD_MAGIC, Some(&salt)),
+                },
+            )
+            .unwrap();
+        let mut backup = Vec::new();
+        backup.extend_from_slice(super::BACKUP_PASSWORD_MAGIC);
+        backup.extend_from_slice(&salt);
+        backup.extend_from_slice(&nonce);
+        backup.extend_from_slice(&encrypted);
+        backup
+    }
+
     #[test]
     fn backup_import_preserves_repeats_and_reads_existing_legacy_format() {
         let _data = IsolatedData::new();
@@ -866,12 +945,47 @@ mod tests {
 
         let password_backup =
             History::export_backup(&identity, &peer, Some("correct horse battery")).unwrap();
-        assert_eq!(&password_backup[..8], b"ADBACK2\0");
+        assert_eq!(&password_backup[..8], b"ADBACK3\0");
+        let other_identity = Identity::create().unwrap().0;
+        assert!(History::import_backup(
+            &other_identity,
+            &password_backup,
+            Some("correct horse battery")
+        )
+        .is_err());
+        assert!(
+            History::import_backup(&identity, &password_backup, Some("wrong password")).is_err()
+        );
+        let mut tampered = password_backup.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(
+            History::import_backup(&identity, &tampered, Some("correct horse battery")).is_err()
+        );
         assert_eq!(
             History::import_backup(&identity, &password_backup, Some("correct horse battery"))
                 .unwrap()
                 .1,
             2
+        );
+
+        // ADBACK2 was password-only. It remains importable for existing users.
+        let old_password_backup = legacy_password_backup(
+            &identity,
+            &peer,
+            &[message(1_700_000_001, "legacy")],
+            "correct horse battery",
+        );
+        assert_eq!(&old_password_backup[..8], b"ADBACK2\0");
+        assert_eq!(
+            History::import_backup(
+                &identity,
+                &old_password_backup,
+                Some("correct horse battery")
+            )
+            .unwrap()
+            .1,
+            3
         );
     }
 
