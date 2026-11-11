@@ -1,4 +1,4 @@
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::fs::File;
@@ -63,6 +63,14 @@ impl Identity {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    pub(crate) fn public_key(&self) -> [u8; 32] {
+        self.signing_key.verifying_key().to_bytes()
+    }
+
+    pub(crate) fn sign(&self, message: &[u8]) -> [u8; 64] {
+        self.signing_key.sign(message).to_bytes()
     }
 }
 
