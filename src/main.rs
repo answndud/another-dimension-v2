@@ -1,4 +1,5 @@
 pub mod channel;
+pub mod history;
 mod identity;
 pub mod relay;
 
@@ -48,6 +49,7 @@ struct ChatSnapshot {
     fingerprint: Option<String>,
     peer_id: Option<String>,
     error: Option<String>,
+    storage_error: Option<String>,
     messages: Vec<ChatEntry>,
     relay_ack: Option<String>,
 }
@@ -73,7 +75,7 @@ fn spawn_chat_worker(
     cancelled: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
-        let result = (|| -> Result<RelaySession, String> {
+        let result = (|| -> Result<(RelaySession, Option<history::History>, Vec<ChatEntry>, Option<String>), String> {
             let invite = InviteCode::parse(&code).ok_or("초대 코드를 확인하세요.")?;
             let mut rendezvous = match role {
                 RoleForChat::Create => RelayRendezvous::create(DEFAULT_RELAY, &invite),
@@ -95,7 +97,7 @@ fn spawn_chat_worker(
             chat_update(&operation, |snapshot| {
                 snapshot.phase = "verification";
                 snapshot.fingerprint = Some(fingerprint);
-                snapshot.peer_id = Some(peer_id);
+                snapshot.peer_id = Some(peer_id.clone());
             });
             let verification = loop {
                 if operation.cancelled.load(Ordering::SeqCst) {
@@ -110,15 +112,39 @@ fn spawn_chat_worker(
                 }
             };
             chat_update(&operation, |snapshot| snapshot.phase = "confirming");
-            rendezvous
+            let session = rendezvous
                 .confirm(verification)
-                .map_err(|_| "상대 확인을 마치지 못했습니다. 다시 연결하세요.".to_owned())
+                .map_err(|_| "상대 확인을 마치지 못했습니다. 다시 연결하세요.".to_owned())?;
+            let (history, entries, storage_error) = match history::History::open(&identity, &peer_id) {
+                Ok((history, stored, recovered_partial)) => {
+                    let entries = stored
+                        .into_iter()
+                        .map(|item| ChatEntry {
+                            unix_time: item.unix_time,
+                            sender: match item.sender {
+                                history::MessageSender::Me => "나",
+                                history::MessageSender::Other => "상대방",
+                            },
+                            text: item.text,
+                        })
+                        .collect();
+                    let warning = recovered_partial
+                        .then(|| "대화 기록의 마지막 불완전 항목을 제거했습니다.".to_owned());
+                    (Some(history), entries, warning)
+                }
+                Err(_) => (None, Vec::new(), Some("대화 기록을 열지 못했습니다. 이번 대화는 프로그램을 종료하면 사라질 수 있습니다.".to_owned())),
+            };
+            Ok((session, history, entries, storage_error))
         })();
 
-        let mut session = match result {
-            Ok(session) => {
-                chat_update(&operation, |snapshot| snapshot.phase = "connected");
-                session
+        let (mut session, mut history) = match result {
+            Ok((session, history, messages, storage_error)) => {
+                chat_update(&operation, |snapshot| {
+                    snapshot.messages = messages;
+                    snapshot.storage_error = storage_error;
+                    snapshot.phase = "connected";
+                });
+                (session, history)
             }
             Err(error) => {
                 chat_update(&operation, |snapshot| {
@@ -137,14 +163,31 @@ fn spawn_chat_worker(
             loop {
                 match commands.try_recv() {
                     Ok(ChatCommand::Send(text)) => match session.send(text.as_bytes()) {
-                        Ok(event_id) => chat_update(&operation, |snapshot| {
-                            snapshot.messages.push(ChatEntry {
+                        Ok(event_id) => {
+                            let entry = history::StoredMessage {
                                 unix_time: now_seconds(),
-                                sender: "나",
-                                text,
+                                sender: history::MessageSender::Me,
+                                text: text.clone(),
+                            };
+                            let save_error = match history.as_mut() {
+                                Some(history) => history.append(&entry).err(),
+                                None => Some(io::Error::other("history unavailable")),
+                            };
+                            if save_error.is_some() {
+                                history = None;
+                            }
+                            chat_update(&operation, |snapshot| {
+                                snapshot.messages.push(ChatEntry {
+                                    unix_time: entry.unix_time,
+                                    sender: "나",
+                                    text,
+                                });
+                                snapshot.relay_ack = Some(format!("pending:{event_id}"));
+                                if save_error.is_some() {
+                                    snapshot.storage_error = Some("대화 기록을 저장하지 못했습니다. 프로그램을 종료하면 이 메시지를 잃을 수 있습니다.".to_owned());
+                                }
                             });
-                            snapshot.relay_ack = Some(format!("pending:{event_id}"));
-                        }),
+                        }
                         Err(_) => {
                             chat_update(&operation, |snapshot| {
                                 snapshot.phase = "disconnected";
@@ -169,13 +212,30 @@ fn spawn_chat_worker(
                 Ok(Some(RelayUpdate::Messages(messages))) => {
                     for message in messages {
                         match String::from_utf8(message) {
-                            Ok(text) => chat_update(&operation, |snapshot| {
-                                snapshot.messages.push(ChatEntry {
+                            Ok(text) => {
+                                let entry = history::StoredMessage {
                                     unix_time: now_seconds(),
-                                    sender: "상대방",
+                                    sender: history::MessageSender::Other,
                                     text,
+                                };
+                                let save_error = match history.as_mut() {
+                                    Some(history) => history.append(&entry).err(),
+                                    None => Some(io::Error::other("history unavailable")),
+                                };
+                                if save_error.is_some() {
+                                    history = None;
+                                }
+                                chat_update(&operation, |snapshot| {
+                                    snapshot.messages.push(ChatEntry {
+                                        unix_time: entry.unix_time,
+                                        sender: "상대방",
+                                        text: entry.text,
+                                    });
+                                    if save_error.is_some() {
+                                        snapshot.storage_error = Some("대화 기록을 저장하지 못했습니다. 프로그램을 종료하면 이 메시지를 잃을 수 있습니다.".to_owned());
+                                    }
                                 });
-                            }),
+                            }
                             Err(_) => {
                                 chat_update(&operation, |snapshot| {
                                     snapshot.phase = "disconnected";
@@ -450,6 +510,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 fingerprint: None,
                 peer_id: None,
                 error: None,
+                storage_error: None,
                 messages: Vec::new(),
                 relay_ack: None,
             }),
@@ -487,6 +548,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             "fingerprint": snapshot.fingerprint,
             "peerId": snapshot.peer_id,
             "error": snapshot.error,
+            "storageError": snapshot.storage_error,
             "relayAck": snapshot.relay_ack,
             "messageCount": snapshot.messages.len()
         })

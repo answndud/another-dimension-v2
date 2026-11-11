@@ -13,6 +13,7 @@ const joinForm = document.querySelector('#join-form');
 const joinCode = document.querySelector('#join-code');
 const chatView = document.querySelector('#chat-view');
 const chatStatus = document.querySelector('#chat-status');
+const storageStatus = document.querySelector('#storage-status');
 const verification = document.querySelector('#verification');
 const sendForm = document.querySelector('#send-form');
 const chatText = document.querySelector('#chat-text');
@@ -89,6 +90,8 @@ function updateChatView(snapshot) {
     closed: '연결이 종료되었습니다.'
   };
   chatStatus.textContent = labels[snapshot.phase] || snapshot.error || '연결 상태를 확인하는 중입니다.';
+  storageStatus.hidden = !snapshot.storageError;
+  storageStatus.textContent = snapshot.storageError || '';
   verification.hidden = snapshot.phase !== 'verification';
   sendForm.hidden = snapshot.phase !== 'connected';
   if (snapshot.phase === 'verification' && lastPhase !== 'verification') {

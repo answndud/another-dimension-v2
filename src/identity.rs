@@ -7,6 +7,7 @@ use zeroize::Zeroizing;
 
 const PREFIX: &str = "AD1-";
 const KEY_CONTEXT: &[u8] = b"another-dimension-v2/identity-signing/v1";
+const STORAGE_KEY_CONTEXT: &[u8] = b"another-dimension-v2/local-history/v1";
 
 pub struct Identity {
     // Retained for future independently derived storage keys; never persisted here.
@@ -71,6 +72,14 @@ impl Identity {
 
     pub(crate) fn sign(&self, message: &[u8]) -> [u8; 64] {
         self.signing_key.sign(message).to_bytes()
+    }
+
+    pub(crate) fn storage_key(&self) -> Zeroizing<[u8; 32]> {
+        let mut key = Zeroizing::new([0_u8; 32]);
+        Hkdf::<Sha256>::new(Some(&self.public_key()), self._seed.as_ref())
+            .expand(STORAGE_KEY_CONTEXT, key.as_mut())
+            .expect("32 bytes is a valid HKDF output length");
+        key
     }
 }
 
