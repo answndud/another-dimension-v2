@@ -1,8 +1,8 @@
 //! Minimal NIP-01 rendezvous and WebSocket adapter for Noise sessions.
 //!
 //! It publishes only kind-20000 ephemeral events. The relay still observes the
-//! session tag, timing, size, and connection IP in direct mode. No relay URL or
-//! Tor policy is selected here; callers must enforce those policies.
+//! session tag, timing, size, and connection IP in direct mode. Callers select
+//! an optional loopback SOCKS5 proxy; proxy failures never fall back to direct.
 
 use crate::channel::{
     Handshake, HandshakeError, PendingChannel, Role, SessionTransport, VerificationPending,
@@ -14,18 +14,19 @@ use nostr::prelude::{
     RelayMessage, SecretKey, SingleLetterTag, SubscriptionId, Tag,
 };
 use sha2::Sha256;
+use socks::{Socks5Stream, TargetAddr};
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
 use std::io::Read;
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tungstenite::client::connect_with_config;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{Message, WebSocket};
+use tungstenite::{client_tls_with_config, Message, WebSocket};
 use zeroize::Zeroizing;
 
 const EVENT_KIND: u16 = 20_000;
@@ -98,8 +99,12 @@ pub struct RelaySession {
 impl RelaySession {
     /// Connects only to a TLS WebSocket endpoint and subscribes to this peer's
     /// signed ephemeral events for the current session.
-    pub fn connect(endpoint: &str, transport: SessionTransport) -> Result<Self, RelayError> {
-        Self::from_socket(open_socket(endpoint)?, transport)
+    pub fn connect(
+        endpoint: &str,
+        transport: SessionTransport,
+        tor_socks: Option<SocketAddr>,
+    ) -> Result<Self, RelayError> {
+        Self::from_socket(open_socket(endpoint, tor_socks)?, transport)
     }
 
     fn from_socket(
@@ -221,14 +226,51 @@ impl RelaySession {
     }
 }
 
-fn open_socket(endpoint: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, RelayError> {
+fn open_socket(
+    endpoint: &str,
+    tor_socks: Option<SocketAddr>,
+) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, RelayError> {
     if !endpoint.starts_with("wss://") || endpoint.contains('@') || endpoint.contains('#') {
         return Err(RelayError::InvalidEndpoint);
     }
     let mut config = WebSocketConfig::default();
     config.max_message_size = Some(MAX_RELAY_MESSAGE);
     config.max_frame_size = Some(MAX_RELAY_MESSAGE);
-    let (mut socket, _) = connect_with_config(endpoint, Some(config), 0)?;
+    let (mut socket, _) = if let Some(proxy) = tor_socks {
+        if !proxy.ip().is_loopback() || proxy.port() == 0 {
+            return Err(RelayError::InvalidEndpoint);
+        }
+        let authority = endpoint
+            .strip_prefix("wss://")
+            .ok_or(RelayError::InvalidEndpoint)?;
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) => (
+                host,
+                port.parse::<u16>()
+                    .map_err(|_| RelayError::InvalidEndpoint)?,
+            ),
+            None => (authority, 443),
+        };
+        if host.is_empty() || host.contains('/') || host.contains('?') || host.contains('#') {
+            return Err(RelayError::InvalidEndpoint);
+        }
+        let target = TargetAddr::Domain(host.to_owned(), port);
+        let stream = Socks5Stream::connect(proxy, target).map_err(|error| {
+            RelayError::Io(io::Error::other(format!(
+                "Tor SOCKS connection failed: {error}"
+            )))
+        })?;
+        client_tls_with_config(endpoint, stream.into_inner(), Some(config), None).map_err(
+            |error| match error {
+                tungstenite::HandshakeError::Failure(error) => RelayError::WebSocket(error),
+                tungstenite::HandshakeError::Interrupted(_) => {
+                    RelayError::Io(io::Error::other("blocking TLS handshake interrupted"))
+                }
+            },
+        )?
+    } else {
+        connect_with_config(endpoint, Some(config), 0)?
+    };
     match socket.get_mut() {
         MaybeTlsStream::Rustls(stream) => {
             stream.sock.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -321,16 +363,29 @@ pub struct RelayRendezvous {
 }
 
 impl RelayRendezvous {
-    pub fn create(endpoint: &str, invite: &InviteCode) -> Result<Self, RelayError> {
-        Self::connect(endpoint, invite, Role::Responder)
+    pub fn create(
+        endpoint: &str,
+        invite: &InviteCode,
+        tor_socks: Option<SocketAddr>,
+    ) -> Result<Self, RelayError> {
+        Self::connect(endpoint, invite, Role::Responder, tor_socks)
     }
 
-    pub fn join(endpoint: &str, invite: &InviteCode) -> Result<Self, RelayError> {
-        Self::connect(endpoint, invite, Role::Initiator)
+    pub fn join(
+        endpoint: &str,
+        invite: &InviteCode,
+        tor_socks: Option<SocketAddr>,
+    ) -> Result<Self, RelayError> {
+        Self::connect(endpoint, invite, Role::Initiator, tor_socks)
     }
 
-    fn connect(endpoint: &str, invite: &InviteCode, role: Role) -> Result<Self, RelayError> {
-        let mut socket = open_socket(endpoint)?;
+    fn connect(
+        endpoint: &str,
+        invite: &InviteCode,
+        role: Role,
+        tor_socks: Option<SocketAddr>,
+    ) -> Result<Self, RelayError> {
+        let mut socket = open_socket(endpoint, tor_socks)?;
         let (topic, keys) = invite.relay_material()?;
         let attempt_tag = match role {
             Role::Initiator => Some(random_hex(16)?),

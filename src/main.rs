@@ -10,7 +10,7 @@ use relay::{InviteCode, RelayRendezvous, RelaySession, RelayUpdate, DEFAULT_RELA
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -32,6 +32,7 @@ struct State {
     sessions: Vec<String>,
     identity: Option<Arc<Identity>>,
     chats: HashMap<String, Arc<ChatOperation>>,
+    tor_socks: Option<SocketAddr>,
 }
 
 enum ChatCommand {
@@ -76,15 +77,22 @@ fn spawn_chat_worker(
     code: Zeroizing<String>,
     identity: Arc<Identity>,
     cancelled: Arc<AtomicBool>,
+    tor_socks: Option<SocketAddr>,
 ) {
     thread::spawn(move || {
         let result = (|| -> Result<(RelaySession, Option<history::History>, Vec<ChatEntry>, Option<String>), String> {
             let invite = InviteCode::parse(&code).ok_or("초대 코드를 확인하세요.")?;
             let mut rendezvous = match role {
-                RoleForChat::Create => RelayRendezvous::create(DEFAULT_RELAY, &invite),
-                RoleForChat::Join => RelayRendezvous::join(DEFAULT_RELAY, &invite),
+                RoleForChat::Create => RelayRendezvous::create(DEFAULT_RELAY, &invite, tor_socks),
+                RoleForChat::Join => RelayRendezvous::join(DEFAULT_RELAY, &invite, tor_socks),
             }
-            .map_err(|_| "relay에 연결하지 못했습니다.")?;
+            .map_err(|_| {
+                if tor_socks.is_some() {
+                    "Tor SOCKS 연결에 실패했습니다. 직접 연결로 전환하지 않았습니다."
+                } else {
+                    "relay에 연결하지 못했습니다."
+                }
+            })?;
             rendezvous.set_cancellation_token(Arc::clone(&cancelled));
             let channel = rendezvous
                 .complete_handshake()
@@ -464,6 +472,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/identity/status HTTP/1.1"
             | "POST /api/identity/logout HTTP/1.1"
             | "POST /api/identity/add-code HTTP/1.1"
+            | "POST /api/network/mode HTTP/1.1"
             | "POST /api/invite/create HTTP/1.1"
             | "POST /api/chat/create HTTP/1.1"
             | "POST /api/chat/join HTTP/1.1"
@@ -547,6 +556,21 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         state.sessions.remove(index);
         return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
     }
+    if first == "POST /api/network/mode HTTP/1.1" {
+        if !body.is_empty() {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        let mode = match state.tor_socks {
+            Some(proxy) => format!("Tor/SOCKS 전용 · {proxy}"),
+            None => "일반 연결 · relay에 실제 IP가 보일 수 있습니다".to_owned(),
+        };
+        return respond(
+            &mut stream,
+            "200 OK",
+            "text/plain; charset=utf-8",
+            mode.as_bytes(),
+        );
+    }
     if first == "POST /api/identity/add-code HTTP/1.1" {
         let Some(identity) = state.identity.as_ref() else {
             return reject(&mut stream, "401 Unauthorized");
@@ -600,6 +624,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             cancelled: Arc::new(AtomicBool::new(false)),
         });
         let cancelled = Arc::clone(&operation.cancelled);
+        let tor_socks = state.tor_socks;
         let role = if first == "POST /api/chat/create HTTP/1.1" {
             RoleForChat::Create
         } else {
@@ -610,7 +635,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             .chats
             .insert(operation_id.clone(), Arc::clone(&operation));
         drop(state);
-        spawn_chat_worker(operation, receiver, role, code, identity, cancelled);
+        spawn_chat_worker(
+            operation, receiver, role, code, identity, cancelled, tor_socks,
+        );
         return respond(
             &mut stream,
             "200 OK",
@@ -988,7 +1015,43 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok")
 }
 
+fn parse_tor_socks_arg() -> io::Result<Option<SocketAddr>> {
+    let mut args = std::env::args().skip(1);
+    let Some(option) = args.next() else {
+        return Ok(None);
+    };
+    if option != "--tor-socks" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "사용법: another-dimension-v2 [--tor-socks 127.0.0.1:9050]",
+        ));
+    }
+    let endpoint = args.next().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Tor SOCKS 주소가 필요합니다.")
+    })?;
+    if args.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "사용법: another-dimension-v2 [--tor-socks 127.0.0.1:9050]",
+        ));
+    }
+    let endpoint: SocketAddr = endpoint.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Tor SOCKS 주소는 127.0.0.1:9050 형식이어야 합니다.",
+        )
+    })?;
+    if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Tor SOCKS는 로컬 loopback 주소와 유효한 포트만 허용합니다.",
+        ));
+    }
+    Ok(Some(endpoint))
+}
+
 fn main() -> io::Result<()> {
+    let tor_socks = parse_tor_socks_arg()?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
     let state = Arc::new(Mutex::new(State {
@@ -998,8 +1061,14 @@ fn main() -> io::Result<()> {
         sessions: Vec::new(),
         identity: None,
         chats: HashMap::new(),
+        tor_socks,
     }));
     println!("http://{address}/");
+    if let Some(proxy) = tor_socks {
+        println!("Tor/SOCKS 전용 모드: {proxy}; 프록시 실패 시 직접 연결하지 않습니다.");
+    } else {
+        println!("일반 연결 모드");
+    }
     {
         let mut state = state
             .lock()

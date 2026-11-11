@@ -61,6 +61,10 @@ async function refreshIdentity() {
   if (response.status === 401) { show('entry'); return false; }
   if (!response.ok) throw new Error('status failed');
   identityId.textContent = await response.text();
+  const networkMode = await request('/api/network/mode');
+  document.querySelector('#network-mode').textContent = networkMode.ok
+    ? `${await networkMode.text()} · SOCKS 서비스가 실제 Tor인지는 확인하지 않습니다.`
+    : '연결 모드를 확인할 수 없습니다.';
   show('active');
   await refreshHistoryList();
   return true;
