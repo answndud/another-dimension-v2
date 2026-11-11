@@ -32,6 +32,7 @@ let operationId = null;
 let messageCursor = 0;
 let pollTimer = null;
 let lastPhase = '';
+let sendingMessage = false;
 let selectedHistoryPeer = '';
 let selectedHistoryMessages = [];
 let selectedHistoryIndices = new Set();
@@ -243,7 +244,8 @@ function updateChatView(snapshot) {
   storageStatus.hidden = !snapshot.storageError;
   storageStatus.textContent = snapshot.storageError || '';
   verification.hidden = snapshot.phase !== 'verification';
-  sendForm.hidden = snapshot.phase !== 'connected';
+  sendForm.hidden = snapshot.phase !== 'connected' && !chatText.value;
+  sendForm.querySelector('button').disabled = snapshot.phase !== 'connected' || sendingMessage;
   if (snapshot.phase === 'verification' && lastPhase !== 'verification') {
     document.querySelector('#peer-id').textContent = snapshot.peerId || '';
     document.querySelector('#fingerprint').textContent = snapshot.fingerprint || '';
@@ -252,7 +254,6 @@ function updateChatView(snapshot) {
   if (snapshot.phase === 'confirming') document.querySelector('#confirm-peer').disabled = true;
   if (snapshot.phase === 'connected') document.querySelector('#chat-title').textContent = '대화';
   if (snapshot.phase === 'disconnected' || snapshot.phase === 'failed' || snapshot.phase === 'closed') {
-    sendForm.hidden = true;
     stopPolling();
   }
   lastPhase = snapshot.phase;
@@ -541,14 +542,24 @@ document.querySelector('#confirm-peer').addEventListener('click', async () => {
 
 sendForm.addEventListener('submit', async (event) => {
   event.preventDefault();
-  if (!operationId || !chatText.value.trim()) return;
-  const body = `${operationId}\n${chatText.value}`;
+  if (!operationId || sendingMessage || !chatText.value.trim()) return;
+  const text = chatText.value;
+  const body = `${operationId}\n${text}`;
+  const button = sendForm.querySelector('button');
+  sendingMessage = true;
+  button.disabled = true;
   try {
     const response = await request('/api/chat/send', body);
     if (!response.ok) throw new Error('send failed');
-    chatText.value = '';
+    if (chatText.value === text) chatText.value = '';
     chatText.focus();
-  } catch (_) { chatStatus.textContent = '메시지를 보낼 수 없습니다.'; }
+  } catch (_) {
+    sendForm.hidden = false;
+    chatStatus.textContent = '전송 결과를 확인하지 못했습니다. 입력을 보존했습니다. 다시 보내면 중복될 수 있습니다.';
+  } finally {
+    sendingMessage = false;
+    button.disabled = lastPhase !== 'connected';
+  }
 });
 
 document.querySelector('#close-chat').addEventListener('click', async () => {

@@ -52,7 +52,7 @@ struct AppSettings {
 
 enum ChatCommand {
     Confirm,
-    Send(String),
+    Send(String, Sender<()>),
     Cancel,
 }
 
@@ -83,6 +83,62 @@ struct ChatEntry {
 fn chat_update(operation: &ChatOperation, update: impl FnOnce(&mut ChatSnapshot)) {
     if let Ok(mut snapshot) = operation.snapshot.lock() {
         update(&mut snapshot);
+    }
+}
+
+fn submit_chat_message(sender: &Sender<ChatCommand>, text: String, timeout: Duration) -> bool {
+    let (processed, result) = mpsc::channel();
+    sender.send(ChatCommand::Send(text, processed)).is_ok() && result.recv_timeout(timeout).is_ok()
+}
+
+fn rejected_message(pending_events: &mut HashSet<String>, event_id: &str) -> bool {
+    pending_events.remove(event_id)
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+
+    #[test]
+    fn queued_message_is_not_acknowledged_if_worker_exits() {
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let command = receiver.recv().unwrap();
+            drop(command);
+        });
+        assert!(!submit_chat_message(
+            &sender,
+            "unsent".into(),
+            Duration::from_secs(1)
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn message_is_acknowledged_after_worker_processing() {
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            if let ChatCommand::Send(text, processed) = receiver.recv().unwrap() {
+                assert_eq!(text, "hello");
+                processed.send(()).unwrap();
+            } else {
+                panic!("expected message");
+            }
+        });
+        assert!(submit_chat_message(
+            &sender,
+            "hello".into(),
+            Duration::from_secs(1)
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn heartbeat_rejection_does_not_remove_pending_message() {
+        let mut pending = HashSet::from(["message".to_owned()]);
+        assert!(!rejected_message(&mut pending, "heartbeat"));
+        assert!(pending.contains("message"));
+        assert!(rejected_message(&mut pending, "message"));
     }
 }
 
@@ -195,7 +251,7 @@ fn spawn_chat_worker(
                 match commands.recv_timeout(Duration::from_millis(250)) {
                     Ok(ChatCommand::Confirm) => break verification,
                     Ok(ChatCommand::Cancel) => return Err("취소되었습니다.".to_owned()),
-                    Ok(ChatCommand::Send(_)) => {}
+                    Ok(ChatCommand::Send(_, _)) => {}
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return Err("취소되었습니다.".to_owned()),
                 }
@@ -276,7 +332,7 @@ fn spawn_chat_worker(
             }
             loop {
                 match commands.try_recv() {
-                    Ok(ChatCommand::Send(text)) => match session.send(text.as_bytes()) {
+                    Ok(ChatCommand::Send(text, processed)) => match session.send(text.as_bytes()) {
                         Ok(event_id) => {
                             pending_events.insert(event_id);
                             let entry = history::StoredMessage {
@@ -303,6 +359,7 @@ fn spawn_chat_worker(
                                     snapshot.storage_error = Some("대화 기록을 저장하지 못했습니다. 프로그램을 종료하면 이 메시지를 잃을 수 있습니다.".to_owned());
                                 }
                             });
+                            let _ = processed.send(());
                         }
                         Err(_) => {
                             let entry = history::StoredMessage {
@@ -330,6 +387,7 @@ fn spawn_chat_worker(
                                     "메시지를 로컬 기록에 보존했습니다. relay 전송 결과는 알 수 없으며 다시 보내면 중복될 수 있습니다.".to_owned()
                                 });
                             });
+                            let _ = processed.send(());
                             return;
                         }
                     },
@@ -409,18 +467,23 @@ fn spawn_chat_worker(
                     chat_update(&operation, |snapshot| {
                         snapshot.phase = "disconnected";
                         if let RelayError::RelayRejected { event_id, .. } = &error {
-                            pending_events.remove(event_id);
-                            if pending_events.is_empty() {
+                            let message_rejected = rejected_message(&mut pending_events, event_id);
+                            if message_rejected && pending_events.is_empty() {
                                 snapshot.relay_ack = Some("rejected".to_owned());
                                 snapshot.pending_sends = 0;
                                 snapshot.error = Some(
                                     "relay가 메시지 이벤트를 거부했습니다. 이 이벤트는 relay에 접수되지 않았습니다."
                                         .to_owned(),
                                 );
-                            } else {
+                            } else if !pending_events.is_empty() {
                                 snapshot.relay_ack = Some("unknown".to_owned());
                                 snapshot.pending_sends = 0;
-                                snapshot.error = Some("relay가 한 이벤트를 거부했습니다. 다른 대기 메시지의 전송 결과는 알 수 없으며 로컬 기록에 보존되어 있습니다. 다시 보내면 중복될 수 있습니다.".to_owned());
+                                snapshot.error = Some("relay가 이벤트를 거부했습니다. 대기 중인 메시지의 전송 결과를 확인하지 못했습니다. 로컬 기록을 확인하고 다시 보내면 중복될 수 있습니다.".to_owned());
+                            } else {
+                                snapshot.error = Some(
+                                    "relay가 연결 유지 이벤트를 거부해 연결이 끊겼습니다."
+                                        .to_owned(),
+                                );
                             }
                         } else if pending_events.is_empty() {
                             snapshot.error = Some(relay_failure_message(&error, "chat", false));
@@ -1099,12 +1162,8 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             return reject(&mut stream, "409 Conflict");
         }
         drop(snapshot);
-        if operation
-            .sender
-            .send(ChatCommand::Send(text.to_owned()))
-            .is_err()
-        {
-            return reject(&mut stream, "409 Conflict");
+        if !submit_chat_message(&operation.sender, text.to_owned(), Duration::from_secs(10)) {
+            return reject(&mut stream, "503 Service Unavailable");
         }
         return respond(
             &mut stream,
