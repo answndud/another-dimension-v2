@@ -880,6 +880,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/disconnect HTTP/1.1"
             | "POST /api/identity/create HTTP/1.1"
             | "POST /api/identity/login HTTP/1.1"
+            | "POST /api/identity/replace HTTP/1.1"
             | "POST /api/identity/status HTTP/1.1"
             | "POST /api/identity/logout HTTP/1.1"
             | "POST /api/identity/add-code HTTP/1.1"
@@ -1040,6 +1041,30 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             "text/plain; charset=utf-8",
             code.as_bytes(),
         );
+    }
+    if first == "POST /api/identity/replace HTTP/1.1" {
+        if state.identity.is_none() {
+            return reject(&mut stream, "401 Unauthorized");
+        }
+        if !body.is_empty() || any_chat_active(&state) {
+            return reject(&mut stream, "409 Conflict");
+        }
+        let Some(current) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        let (replacement, code) = Identity::create()?;
+        if current.copy_local_data_to(&replacement).is_err() {
+            return reject(&mut stream, "500 Internal Server Error");
+        }
+        // Keep the old session active if the one-time code cannot be delivered.
+        respond(
+            &mut stream,
+            "200 OK",
+            "text/plain; charset=utf-8",
+            code.as_bytes(),
+        )?;
+        state.identity = Some(Arc::new(replacement));
+        return Ok(());
     }
     if first == "POST /api/invite/create HTTP/1.1" {
         if state.tor_socks != state.settings.tor_socks {

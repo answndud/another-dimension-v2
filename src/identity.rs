@@ -140,6 +140,57 @@ impl Identity {
             .expect("32 bytes is a valid HKDF output length");
         key
     }
+
+    /// Re-encrypt local histories and verified-contact secrets under a freshly
+    /// created identity before it replaces the active identity in memory.
+    /// The old identity directory remains intact as a recovery source.
+    pub(crate) fn copy_local_data_to(&self, replacement: &Identity) -> io::Result<()> {
+        if self.public_key() == replacement.public_key() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "replacement identity must be new",
+            ));
+        }
+        let destination = crate::history::data_directory()?.join(replacement.public_id());
+        if destination.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "replacement identity data already exists",
+            ));
+        }
+
+        let result = (|| {
+            for peer_id in crate::history::History::known_peer_ids(self)? {
+                let (messages, recovered_partial) =
+                    crate::history::History::read_for_identity_copy(self, &peer_id)?;
+                if recovered_partial {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "source history has an incomplete record",
+                    ));
+                }
+                let (mut history, _, _) = crate::history::History::open(replacement, &peer_id)?;
+                history.replace(&messages)?;
+            }
+
+            let source_contacts = crate::contacts::list_known(
+                &crate::history::data_directory()?
+                    .join(self.public_id())
+                    .join("verified-contacts"),
+                self,
+            )?;
+            let contact_directory = destination.join("verified-contacts");
+            for contact in &source_contacts {
+                crate::contacts::save(&contact_directory, replacement, contact)?;
+            }
+            Ok(())
+        })();
+
+        if result.is_err() && destination.exists() {
+            let _ = std::fs::remove_dir_all(&destination);
+        }
+        result
+    }
 }
 
 fn derive_code_key(wrap_key: &[u8; CODE_KEY_BYTES]) -> Zeroizing<[u8; 32]> {

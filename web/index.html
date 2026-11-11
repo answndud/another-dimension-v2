@@ -23,6 +23,8 @@
     button:hover { background: #edf1f5; }
     button.primary { border-color: #263849; color: #fff; background: #263849; }
     button.primary:hover { background: #344b60; }
+    dialog { width: min(38rem, calc(100% - 2rem)); border: 1px solid #b7c0c9; border-radius: .65rem; padding: 1.4rem; color: inherit; background: #fff; box-shadow: 0 12px 36px #20252b33; }
+    dialog::backdrop { background: #20252b88; }
     .actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: 1rem; }
     .identity-id, .fingerprint, .invite-code { overflow-wrap: anywhere; font: .86rem/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .meta { color: #59636e; font-size: .92rem; }
@@ -67,6 +69,7 @@
     <section id="created" hidden>
       <h2>개인 접속 코드</h2>
       <p>코드를 따로 보관하세요. 이 화면을 벗어나면 다시 보여드릴 수 없습니다. 코드를 아는 사람은 이 신원을 사용할 수 있습니다.</p>
+      <p id="created-note" class="meta" role="status"></p>
       <label for="generated-code">생성된 코드</label>
       <textarea id="generated-code" readonly spellcheck="false"></textarea>
       <div class="actions"><button id="copy-code" type="button">코드 복사</button><button id="save-code" type="button">TXT 저장</button><button id="continue" type="button">계속</button></div>
@@ -99,6 +102,19 @@
         <p class="meta">새 코드는 같은 신원과 대화 기록을 사용합니다. 기존 백업도 그대로 열 수 있습니다. 이 기능은 유출된 코드를 무효화하지 않습니다. 서버 없이 기존 코드의 복사본을 폐기할 수 없으므로 이전 코드는 계속 유효하며, 이전 코드를 가진 사람도 이 신원에 로그인할 수 있습니다.</p>
         <button id="add-code" type="button">새 코드 추가 발급</button>
       </div>
+      <div class="panel">
+        <h3>새 신원으로 교체</h3>
+        <p class="meta">현재 기기의 대화 기록과 확인된 상대 정보를 새 신원 키로 복사합니다. 상대와 새 초대·확인값을 다시 비교해야 합니다. 다른 기기와 기존 백업은 바뀌지 않으며, 이전 코드를 무효화하거나 회수할 수 없습니다.</p>
+        <button id="replace-identity" type="button">새 신원 코드 발급</button>
+      </div>
+      <dialog id="replace-identity-dialog" aria-labelledby="replace-identity-title" aria-describedby="replace-identity-warning">
+        <h2 id="replace-identity-title">새 신원으로 교체할까요?</h2>
+        <p id="replace-identity-warning">현재 기기의 기록과 상대 확인 정보를 새 코드로 복사합니다. 새 코드를 저장하고 각 상대와 새 초대·확인값을 다시 비교해야 합니다. 다른 기기와 백업은 바뀌지 않으며, 이전 코드는 계속 유효합니다.</p>
+        <div class="actions">
+          <button id="cancel-identity-replacement" type="button">취소</button>
+          <button id="confirm-identity-replacement" type="button" class="primary">새 신원으로 교체</button>
+        </div>
+      </dialog>
       <section id="added-code-view" hidden>
         <h3>새 개인 접속 코드</h3>
         <p>새 코드를 별도로 저장하세요. 화면을 닫으면 다시 표시할 수 없습니다. 이전 코드도 계속 유효합니다.</p>

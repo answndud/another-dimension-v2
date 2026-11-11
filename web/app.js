@@ -5,6 +5,7 @@ const loginForm = document.querySelector('#login-form');
 const identityCode = document.querySelector('#identity-code');
 const created = document.querySelector('#created');
 const generatedCode = document.querySelector('#generated-code');
+const createdNote = document.querySelector('#created-note');
 const active = document.querySelector('#identity-active');
 const identityId = document.querySelector('#identity-id');
 const inviteView = document.querySelector('#invite-view');
@@ -355,6 +356,7 @@ document.querySelector('#create').addEventListener('click', async () => {
     const response = await request('/api/identity/create');
     if (!response.ok) { message.textContent = '코드를 생성할 수 없습니다.'; return; }
     generatedCode.value = await response.text();
+    createdNote.textContent = '';
     show('created');
   } catch (_) { message.textContent = '코드를 생성할 수 없습니다.'; }
 });
@@ -376,8 +378,35 @@ document.querySelector('#save-code').addEventListener('click', () => {
 
 document.querySelector('#continue').addEventListener('click', async () => {
   generatedCode.value = '';
+  createdNote.textContent = '';
   message.textContent = '';
   try { await refreshIdentity(); } catch (_) { message.textContent = '신원을 확인할 수 없습니다.'; }
+});
+
+const replaceIdentityDialog = document.querySelector('#replace-identity-dialog');
+document.querySelector('#replace-identity').addEventListener('click', () => {
+  replaceIdentityDialog.showModal();
+});
+document.querySelector('#cancel-identity-replacement').addEventListener('click', () => {
+  replaceIdentityDialog.close();
+});
+document.querySelector('#confirm-identity-replacement').addEventListener('click', async () => {
+  replaceIdentityDialog.close();
+  message.textContent = '';
+  try {
+    const response = await request('/api/identity/replace');
+    if (!response.ok) {
+      message.textContent = response.status === 409
+        ? '진행 중인 대화를 종료한 뒤 다시 시도하세요.'
+        : '기록을 새 신원으로 복사하지 못했습니다. 기존 신원은 유지됩니다.';
+      return;
+    }
+    generatedCode.value = await response.text();
+    createdNote.textContent = '신원을 교체했습니다. 새 코드를 저장하고 상대와 새 확인값을 비교하세요. 이전 코드는 무효화되지 않았습니다.';
+    show('created');
+  } catch (_) {
+    message.textContent = '신원을 교체하지 못했습니다. 기존 신원은 유지됩니다.';
+  }
 });
 
 document.querySelector('#add-code').addEventListener('click', async () => {

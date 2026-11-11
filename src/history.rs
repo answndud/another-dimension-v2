@@ -107,8 +107,13 @@ impl History {
             file.sync_data()?;
         }
         file.seek(SeekFrom::Start(0))?;
-        let (messages, next_index, recovered_partial) =
-            read_records(&mut file, Zeroizing::new(*key), &identity_id, &peer_id)?;
+        let (messages, next_index, recovered_partial) = read_records(
+            &mut file,
+            Zeroizing::new(*key),
+            &identity_id,
+            &peer_id,
+            true,
+        )?;
         file.seek(SeekFrom::End(0))?;
         register_conversation(identity, &identity_id, &peer_id, &directory)?;
 
@@ -195,6 +200,32 @@ impl History {
         }
         summaries.sort_by(|left, right| right.last_message.cmp(&left.last_message));
         Ok(summaries)
+    }
+
+    /// Read a source history for identity migration without repairing or
+    /// otherwise changing a possibly incomplete original file.
+    pub(crate) fn read_for_identity_copy(
+        identity: &Identity,
+        peer_id: &str,
+    ) -> io::Result<(Vec<StoredMessage>, bool)> {
+        validate_peer_id(peer_id)?;
+        let identity_id = identity.public_id();
+        let peer_id = peer_id.to_ascii_lowercase();
+        let directory = data_directory()?.join(&identity_id);
+        let key = identity.storage_key();
+        let path = directory.join(format!(
+            "{}.adlog",
+            opaque_conversation_name(&derive_index_key(&key), &peer_id)
+        ));
+        let mut file = File::open(path)?;
+        let (messages, _, recovered_partial) = read_records(
+            &mut file,
+            Zeroizing::new(*key),
+            &identity_id,
+            &peer_id,
+            false,
+        )?;
+        Ok((messages, recovered_partial))
     }
 
     pub fn delete_conversation(identity: &Identity, peer_id: &str) -> io::Result<()> {
@@ -707,6 +738,7 @@ fn read_records(
     key: Zeroizing<[u8; 32]>,
     identity_id: &str,
     peer_id: &str,
+    repair_partial: bool,
 ) -> io::Result<(Vec<StoredMessage>, u64, bool)> {
     let mut magic = [0; MAGIC.len()];
     file.read_exact(&mut magic)?;
@@ -726,7 +758,9 @@ fn read_records(
             break;
         }
         if remaining < 4 {
-            file.set_len(record_start)?;
+            if repair_partial {
+                file.set_len(record_start)?;
+            }
             recovered_partial = true;
             break;
         }
@@ -737,7 +771,9 @@ fn read_records(
             return Err(invalid_data("invalid history record length"));
         }
         if remaining < 4 + length as u64 {
-            file.set_len(record_start)?;
+            if repair_partial {
+                file.set_len(record_start)?;
+            }
             recovered_partial = true;
             break;
         }
@@ -859,7 +895,9 @@ pub(crate) fn data_directory() -> io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{History, MessageSender, StoredMessage, MAX_BACKUP_BYTES, MAX_MESSAGE_BYTES};
+    use super::{
+        decode_peer_id, History, MessageSender, StoredMessage, MAX_BACKUP_BYTES, MAX_MESSAGE_BYTES,
+    };
     use crate::identity::Identity;
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -930,6 +968,98 @@ mod tests {
             &identity
         )
         .is_err());
+    }
+
+    #[test]
+    fn replacing_identity_copies_encrypted_history_and_contacts_without_removing_source() {
+        let data = IsolatedData::new();
+        let (old_identity, _) = Identity::create().unwrap();
+        let peer_id = "33".repeat(32);
+        let (mut old_history, _, _) = History::open(&old_identity, &peer_id).unwrap();
+        let repeated = StoredMessage {
+            unix_time: 123,
+            sender: MessageSender::Other,
+            text: "same message".to_owned(),
+        };
+        old_history.append(&repeated).unwrap();
+        old_history.append(&repeated).unwrap();
+        let old_directory = data.0.join(old_identity.public_id());
+        let history_path = old_history.path.clone();
+        let original_history = std::fs::read(&history_path).unwrap();
+        let contact = crate::contacts::VerifiedContact {
+            peer_key: decode_peer_id(&peer_id).unwrap(),
+            rendezvous_secret: zeroize::Zeroizing::new([8; 32]),
+        };
+        crate::contacts::save(
+            &old_directory.join("verified-contacts"),
+            &old_identity,
+            &contact,
+        )
+        .unwrap();
+        let contact_path = std::fs::read_dir(old_directory.join("verified-contacts"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let original_contact = std::fs::read(&contact_path).unwrap();
+
+        let (replacement, code) = Identity::create().unwrap();
+        old_identity.copy_local_data_to(&replacement).unwrap();
+        assert_ne!(old_identity.public_id(), replacement.public_id());
+        assert_eq!(
+            Identity::from_code(&code).unwrap().public_id(),
+            replacement.public_id()
+        );
+        let (_, old_messages, _) = History::open(&old_identity, &peer_id).unwrap();
+        let (_, new_messages, _) = History::open(&replacement, &peer_id).unwrap();
+        assert_eq!(old_messages, vec![repeated.clone(), repeated.clone()]);
+        assert_eq!(new_messages, old_messages);
+        assert_eq!(
+            *crate::contacts::load(
+                &data
+                    .0
+                    .join(replacement.public_id())
+                    .join("verified-contacts"),
+                &replacement,
+                contact.peer_key
+            )
+            .unwrap()
+            .rendezvous_secret,
+            [8; 32]
+        );
+        assert_eq!(std::fs::read(history_path).unwrap(), original_history);
+        assert_eq!(std::fs::read(contact_path).unwrap(), original_contact);
+    }
+
+    #[test]
+    fn identity_replacement_stops_on_partial_source_without_changing_it() {
+        let data = IsolatedData::new();
+        let (old_identity, _) = Identity::create().unwrap();
+        let peer_id = "44".repeat(32);
+        let (mut history, _, _) = History::open(&old_identity, &peer_id).unwrap();
+        history
+            .append(&StoredMessage {
+                unix_time: 456,
+                sender: MessageSender::Me,
+                text: "keep original".to_owned(),
+            })
+            .unwrap();
+        let source_path = history.path.clone();
+        drop(history);
+        let length = std::fs::metadata(&source_path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source_path)
+            .unwrap()
+            .set_len(length - 1)
+            .unwrap();
+        let incomplete_source = std::fs::read(&source_path).unwrap();
+        let (replacement, _) = Identity::create().unwrap();
+
+        assert!(old_identity.copy_local_data_to(&replacement).is_err());
+        assert_eq!(std::fs::read(source_path).unwrap(), incomplete_source);
+        assert!(!data.0.join(replacement.public_id()).exists());
     }
 
     fn legacy_password_backup(
