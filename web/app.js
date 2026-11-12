@@ -328,12 +328,13 @@ function updateChatView(snapshot) {
   restorePanel.hidden = snapshot.phase !== 'connected'
     || (!snapshot.historyRestoreInProgress && !restoreOffer.length && !snapshot.historyRestoreStatus);
   restoreStatus.textContent = snapshot.historyRestoreInProgress
-    ? '상대 기록을 확인하고 있습니다. 동의 전에는 로컬 기록을 변경하지 않습니다.'
+    ? `상대 기록을 받는 중입니다: ${snapshot.historyRestoreReceived || 0} / ${snapshot.historyRestoreTotal || 0}. 동의 전에는 로컬 기록을 변경하지 않습니다.`
     : snapshot.historyRestoreStatus || '';
   document.querySelector('#history-restore-request').disabled = snapshot.phase !== 'connected'
     || snapshot.historyRestoreInProgress || (snapshot.historyRestoreOfferCount || 0) > 0;
   document.querySelector('#history-restore-accept').disabled = (snapshot.historyRestoreOfferCount || 0) === 0;
-  document.querySelector('#history-restore-decline').disabled = (snapshot.historyRestoreOfferCount || 0) === 0;
+  document.querySelector('#history-restore-decline').disabled = (snapshot.historyRestoreOfferCount || 0) === 0 && !snapshot.historyRestoreInProgress;
+  document.querySelector('#history-restore-decline').textContent = snapshot.historyRestoreInProgress ? '전송 취소' : '복원 거부';
   if (restorePreview.dataset.offerKey !== restoreKey) {
     restorePreview.replaceChildren();
     for (const item of restoreOffer) {
@@ -723,10 +724,16 @@ document.querySelector('#history-restore-request').addEventListener('click', asy
 
 async function resolveHistoryRestore(accept) {
   if (!operationId) return;
+  const cancellingTransfer = !accept
+    && document.querySelector('#history-restore-decline').textContent === '전송 취소';
   try {
     const response = await request('/api/chat/resolve-history-restore', JSON.stringify({ operationId, accept }));
     if (!response.ok) throw new Error((await response.text()) || 'restore failed');
-    message.textContent = accept ? '복원한 기록을 현재 대화에 추가했습니다.' : '복원을 거부했습니다. 로컬 기록은 변경되지 않았습니다.';
+    message.textContent = accept
+      ? '복원한 기록을 현재 대화에 추가했습니다.'
+      : cancellingTransfer
+        ? '기록 전송을 취소했습니다. 로컬 기록은 변경되지 않았습니다.'
+        : '복원을 거부했습니다. 로컬 기록은 변경되지 않았습니다.';
   } catch (error) {
     message.textContent = error instanceof Error && error.message !== 'restore failed'
       ? error.message

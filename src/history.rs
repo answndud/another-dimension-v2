@@ -26,6 +26,7 @@ const BACKUP_COMBINED_MAGIC: &[u8; 8] = b"ADBACK3\0";
 const BACKUP_SIGNED_MAGIC: &[u8; 8] = b"ADBACK4\0";
 const BACKUP_BUNDLE_MAGIC: &[u8; 8] = b"ADPACK1\0";
 const TRANSFER_MAGIC: &[u8; 6] = b"ADREC1";
+const TRANSFER_CHUNK_MAGIC: &[u8; 5] = b"ADCH1";
 const MESSAGE_MAGIC: &[u8; 6] = b"ADMSG1";
 const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
 const BACKUP_SALT_BYTES: usize = 16;
@@ -881,6 +882,38 @@ pub(crate) fn encode_transfer(message: &StoredMessage) -> io::Result<Vec<u8>> {
     encode_wire_message(message, TRANSFER_MAGIC)
 }
 
+pub(crate) fn encode_transfer_chunk(
+    message: &StoredMessage,
+    request_id: &str,
+    chunk_index: usize,
+) -> io::Result<Vec<u8>> {
+    if request_id.len() != 64 || !request_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid_data("invalid history request ID"));
+    }
+    let chunk_index =
+        u32::try_from(chunk_index).map_err(|_| invalid_data("history chunk index is too large"))?;
+    let mut frame = Vec::new();
+    frame.extend_from_slice(TRANSFER_CHUNK_MAGIC);
+    frame.extend_from_slice(request_id.as_bytes());
+    frame.extend_from_slice(&chunk_index.to_be_bytes());
+    frame.extend_from_slice(&encode_transfer(message)?);
+    Ok(frame)
+}
+
+pub(crate) fn transfer_chunk_metadata(frame: &[u8]) -> io::Result<(String, usize, &[u8])> {
+    let header_len = TRANSFER_CHUNK_MAGIC.len() + 64 + 4;
+    if frame.len() < header_len || !frame.starts_with(TRANSFER_CHUNK_MAGIC) {
+        return Err(invalid_data("history record has no request and chunk ID"));
+    }
+    let request_id = std::str::from_utf8(&frame[5..69])
+        .map_err(|_| invalid_data("invalid history request ID"))?;
+    if request_id.len() != 64 || !request_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid_data("invalid history request ID"));
+    }
+    let chunk = u32::from_be_bytes(frame[69..73].try_into().expect("fixed slice")) as usize;
+    Ok((request_id.to_owned(), chunk, &frame[header_len..]))
+}
+
 pub(crate) fn encode_signed_message(message: &StoredMessage) -> io::Result<Vec<u8>> {
     if message.proof.is_none() || message.sender != MessageSender::Me {
         return Err(invalid_data("outgoing message is not signed"));
@@ -1105,7 +1138,7 @@ pub(crate) fn linked_identity_keys(
 }
 
 pub(crate) fn is_transfer_frame(frame: &[u8]) -> bool {
-    frame.starts_with(TRANSFER_MAGIC)
+    frame.starts_with(TRANSFER_MAGIC) || frame.starts_with(TRANSFER_CHUNK_MAGIC)
 }
 
 pub(crate) fn is_signed_message_frame(frame: &[u8]) -> bool {

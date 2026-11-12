@@ -362,7 +362,7 @@ test('actual UI: identity-link failure body reaches the user status unchanged', 
   assert.equal(h.element('#message').textContent, detail);
 });
 
-test('actual UI: restore status and unsigned legacy preview reach the connected screen', () => {
+test('actual UI: restore progress, cancel, and unsigned legacy preview reach the connected screen', async () => {
   const h = createHarness();
   h.evaluate(`updateChatView({
     phase: 'connected', messageEpoch: 0, messages: [], peerId: 'peer',
@@ -374,4 +374,22 @@ test('actual UI: restore status and unsigned legacy preview reach the connected 
   assert.match(h.element('#history-restore-status').textContent, /로컬 기록은 변경되지 않았습니다/);
   assert.match(h.element('#history-restore-preview').children[0].children[0].textContent, /기존 서명 없음/);
   assert.equal(h.element('#history-restore-accept').disabled, false);
+
+  h.evaluate(`updateChatView({
+    phase: 'connected', messageEpoch: 0, messages: [], peerId: 'peer',
+    historyRestoreStatus: '받는 중', historyRestoreOfferCount: 0,
+    historyRestoreOffer: [], historyRestoreInProgress: true,
+    historyRestoreReceived: 4096, historyRestoreTotal: 4097, identityTransition: []
+  })`);
+  assert.match(h.element('#history-restore-status').textContent, /4096 \/ 4097/);
+  assert.equal(h.element('#history-restore-decline').disabled, false);
+  assert.equal(h.element('#history-restore-decline').textContent, '전송 취소');
+  h.evaluate("operationId = 'restore-request-test'");
+  const cancel = h.click('#history-restore-decline');
+  await new Promise((resolve) => setImmediate(resolve));
+  const request = h.requestFor('/api/chat/resolve-history-restore');
+  assert.equal(JSON.parse(request.init.body).accept, false);
+  request.resolve(response('ok'));
+  await cancel;
+  assert.match(h.element('#message').textContent, /전송을 취소했습니다/);
 });
