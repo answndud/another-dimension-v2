@@ -650,6 +650,14 @@ pub(crate) fn record_linked_local_identity(
     previous_id: &str,
 ) -> io::Result<()> {
     validate_peer_id(previous_id)?;
+    if !crate::identity::previous_public_ids(identity)?
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(previous_id))
+    {
+        return Err(invalid_data(
+            "local identity link is outside confirmed lineage",
+        ));
+    }
     let mut linked = read_linked_keys(identity, peer_id)?;
     linked.0.insert(previous_id.to_ascii_lowercase());
     write_linked_keys(identity, peer_id, &linked)
@@ -2644,6 +2652,7 @@ mod tests {
         );
         assert!(!history.append_system_once(&current, entry).unwrap());
         super::record_linked_local_identity(&current, &peer, &old_id).unwrap();
+        assert!(super::record_linked_local_identity(&current, &peer, &"ff".repeat(32)).is_err());
         assert!(
             super::pending_local_identity_links(&current, &peer, &[old_id])
                 .unwrap()

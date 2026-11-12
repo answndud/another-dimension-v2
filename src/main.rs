@@ -415,30 +415,6 @@ fn identity_event(kind: &str, previous_id: &str, current_id: &str) -> history::S
     }
 }
 
-fn identity_event_exists_for_previous(
-    messages: &[history::StoredMessage],
-    kind: &str,
-    previous_id: &str,
-    current_id: &str,
-) -> bool {
-    messages.iter().any(|message| {
-        if message.sender != history::MessageSender::Me {
-            return false;
-        }
-        let Some(marker) = message.text.strip_prefix(history::IDENTITY_EVENT_PREFIX) else {
-            return false;
-        };
-        let mut fields = marker.split(':');
-        fields.next() == Some(kind)
-            && fields
-                .next()
-                .is_some_and(|id| id.eq_ignore_ascii_case(previous_id))
-            && fields
-                .next()
-                .is_some_and(|id| id.eq_ignore_ascii_case(current_id))
-    })
-}
-
 fn rejected_message(pending_events: &mut HashSet<String>, event_id: &str) -> bool {
     pending_events.remove(event_id)
 }
@@ -462,26 +438,6 @@ mod send_tests {
         );
 
         let event = identity_event("peer", &"ab".repeat(32), &current);
-        assert!(identity_event_exists_for_previous(
-            std::slice::from_ref(&event),
-            "peer",
-            &"ab".repeat(32),
-            &current
-        ));
-        assert!(!identity_event_exists_for_previous(
-            std::slice::from_ref(&event),
-            "peer",
-            &"ab".repeat(32),
-            &"ef".repeat(32)
-        ));
-        let mut remote_marker = event.clone();
-        remote_marker.sender = history::MessageSender::Other;
-        assert!(!identity_event_exists_for_previous(
-            std::slice::from_ref(&remote_marker),
-            "peer",
-            &"ab".repeat(32),
-            &current
-        ));
         let displayed = chat_entry(event);
         assert_eq!(displayed.sender, "신원 변경");
         assert!(displayed.text.contains("cdcdcdcdcdcd"));
@@ -773,24 +729,16 @@ fn spawn_chat_worker(
             };
             let (history, entries, storage_error, pending_previous_ids) = match history::History::open(&identity, &peer_id) {
                 Ok((history, stored, recovered_partial)) => {
-                    let pending = previous_identity_ids
-                        .iter()
-                        .filter(|old_id| {
-                            !identity_event_exists_for_previous(
-                                &stored,
-                                "self",
-                                old_id,
-                                &identity.public_id(),
-                            )
-                        })
-                        .cloned()
-                        .collect();
+                    let (pending, link_error) = match history::pending_local_identity_links(&identity, &peer_id, &previous_identity_ids) {
+                        Ok(pending) => (pending, None),
+                        Err(error) => (previous_identity_ids.clone(), Some(format!("이전 신원 연결 정보를 읽지 못했습니다. 재확인이 필요합니다: {error}"))),
+                    };
                     let entries = stored
                         .into_iter()
                         .map(chat_entry)
                         .collect();
-                    let warning = recovered_partial
-                        .then(|| "대화 기록의 마지막 불완전 항목을 제거했습니다.".to_owned());
+                    let warning = link_error.or_else(|| recovered_partial
+                        .then(|| "대화 기록의 마지막 불완전 항목을 제거했습니다.".to_owned()));
                     (Some(history), entries, warning, pending)
                 }
                 Err(_) => (None, Vec::new(), Some("대화 기록을 열지 못했습니다. 이번 대화는 프로그램을 종료하면 사라질 수 있습니다.".to_owned()), previous_identity_ids.clone()),
