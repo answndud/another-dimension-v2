@@ -66,10 +66,20 @@ enum ChatCommand {
 }
 
 struct ChatOperation {
+    owner_identity_id: String,
     snapshot: Mutex<ChatSnapshot>,
     message_reader: Mutex<Option<MessagePageReader>>,
     sender: Sender<ChatCommand>,
     cancelled: Arc<AtomicBool>,
+}
+
+fn owned_chat_operation<'a>(
+    state: &'a State,
+    operation_id: &str,
+) -> Option<&'a Arc<ChatOperation>> {
+    let identity_id = state.identity.as_ref()?.public_id();
+    let operation = state.chats.get(operation_id)?;
+    (operation.owner_identity_id == identity_id).then_some(operation)
 }
 
 struct MessagePageReader {
@@ -675,6 +685,7 @@ mod send_tests {
     #[test]
     fn restore_merge_acceptance_is_async_idempotent_and_reports_final_state() {
         let operation = Arc::new(ChatOperation {
+            owner_identity_id: "test-identity".to_owned(),
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connected",
                 fingerprint: None,
@@ -746,6 +757,7 @@ mod send_tests {
     fn restore_merge_api_returns_202_without_waiting_and_status_reports_completion() {
         let (command_sender, command_receiver) = mpsc::channel();
         let operation = Arc::new(ChatOperation {
+            owner_identity_id: "test-identity".to_owned(),
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connected",
                 fingerprint: None,
@@ -856,6 +868,116 @@ mod send_tests {
         );
         assert!(failure.contains("\"historyRestoreState\":\"failed\""));
         assert!(failure.contains("injected merge failure"));
+    }
+
+    #[test]
+    fn chat_operation_apis_are_scoped_to_the_creating_identity() {
+        let (identity_a, _) = Identity::create().unwrap();
+        let owner_id = identity_a.public_id().to_owned();
+        let (identity_b, _) = Identity::create().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let peer_id = "7a".repeat(32);
+        let operation = Arc::new(ChatOperation {
+            owner_identity_id: owner_id.clone(),
+            snapshot: Mutex::new(ChatSnapshot {
+                phase: "connected",
+                fingerprint: None,
+                peer_id: Some(peer_id.clone()),
+                error: None,
+                storage_error: None,
+                messages: vec![ChatEntry {
+                    unix_time: 1,
+                    sender: "상대방",
+                    text: "private message".to_owned(),
+                }],
+                message_count: 1,
+                relay_ack: None,
+                pending_sends: 0,
+                identity_transition: Some(vec![peer_id.clone()]),
+                history_restore_in_progress: false,
+                history_restore_state: "awaiting-merge-consent",
+                history_restore_estimate_bytes: 0,
+                history_restore_cleanup_error: None,
+                history_restore_offer: vec![RestoreOfferEntry {
+                    unix_time: 1,
+                    sender: "상대방",
+                    text: "private preview".to_owned(),
+                    signed: true,
+                }],
+                history_restore_offer_count: 1,
+                history_restore_legacy_count: 0,
+                history_restore_received: 1,
+                history_restore_total: 1,
+                history_restore_status: Some("private status".to_owned()),
+                message_epoch: 0,
+            }),
+            message_reader: Mutex::new(None),
+            sender,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        let mut chats = HashMap::new();
+        chats.insert("owned-operation".to_owned(), Arc::clone(&operation));
+        let state = Arc::new(Mutex::new(State {
+            code: String::new(),
+            issued: Instant::now(),
+            attempts: 0,
+            sessions: vec!["test-session".to_owned()],
+            identity: Some(Arc::new(identity_b)),
+            chats,
+            tor_socks: None,
+            settings: AppSettings::default(),
+            notifications_enabled: Arc::new(AtomicBool::new(false)),
+            last_notification: Arc::new(Mutex::new(None)),
+        }));
+        let requests = [
+            ("/api/chat/status", "owned-operation".to_owned()),
+            ("/api/chat/messages", "owned-operation\n0".to_owned()),
+            ("/api/chat/confirm", "owned-operation".to_owned()),
+            ("/api/chat/send", "owned-operation\nhello".to_owned()),
+            ("/api/chat/cancel", "owned-operation".to_owned()),
+            (
+                "/api/chat/link-identity",
+                format!("owned-operation\n{peer_id}"),
+            ),
+            (
+                "/api/chat/request-history-restore",
+                "owned-operation".to_owned(),
+            ),
+            (
+                "/api/chat/resolve-history-restore",
+                r#"{"operationId":"owned-operation","accept":true}"#.to_owned(),
+            ),
+        ];
+        for (path, body) in requests {
+            let response = call_test_api(&state, path, &body, "test-session");
+            assert!(
+                response.starts_with("HTTP/1.1 404 Not Found"),
+                "{path}: {response}"
+            );
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        state.lock().unwrap().identity = None;
+        let logged_out = call_test_api(
+            &state,
+            "/api/chat/status",
+            "owned-operation",
+            "test-session",
+        );
+        assert!(logged_out.starts_with("HTTP/1.1 404 Not Found"));
+
+        state.lock().unwrap().identity = Some(Arc::new(identity_a));
+        let owner_status = call_test_api(
+            &state,
+            "/api/chat/status",
+            "owned-operation",
+            "test-session",
+        );
+        assert!(owner_status.starts_with("HTTP/1.1 200 OK"));
+        assert!(owner_status.contains("private preview"));
     }
 
     #[test]
@@ -3186,6 +3308,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let operation_id = random_token()?;
         let (sender, receiver) = mpsc::channel();
         let operation = Arc::new(ChatOperation {
+            owner_identity_id: identity.public_id().to_owned(),
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connecting",
                 fingerprint: None,
@@ -3246,7 +3369,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         );
     }
     if first == "POST /api/chat/status HTTP/1.1" {
-        let Some(operation) = state.chats.get(body) else {
+        let Some(operation) = owned_chat_operation(&state, body) else {
             return reject(&mut stream, "404 Not Found");
         };
         let Ok(snapshot) = operation.snapshot.lock() else {
@@ -3288,7 +3411,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         );
     }
     if first == "POST /api/chat/confirm HTTP/1.1" {
-        let Some(operation) = state.chats.get(body) else {
+        let Some(operation) = owned_chat_operation(&state, body) else {
             return reject(&mut stream, "404 Not Found");
         };
         if operation.sender.send(ChatCommand::Confirm).is_err() {
@@ -3302,7 +3425,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         );
     }
     if first == "POST /api/chat/request-history-restore HTTP/1.1" {
-        let Some(operation) = state.chats.get(body) else {
+        let Some(operation) = owned_chat_operation(&state, body) else {
             return reject(&mut stream, "404 Not Found");
         };
         if !operation.snapshot.lock().is_ok_and(|snapshot| {
@@ -3353,7 +3476,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some(accept) = payload.get("accept").and_then(serde_json::Value::as_bool) else {
             return reject(&mut stream, "400 Bad Request");
         };
-        let Some(operation) = state.chats.get(operation_id) else {
+        let Some(operation) = owned_chat_operation(&state, operation_id) else {
             return reject(&mut stream, "404 Not Found");
         };
         let Ok(mut snapshot) = operation.snapshot.lock() else {
@@ -3388,6 +3511,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some((operation_id, previous_peer_id)) = body.split_once('\n') else {
             return reject(&mut stream, "400 Bad Request");
         };
+        let Some(operation) = owned_chat_operation(&state, operation_id) else {
+            return reject(&mut stream, "404 Not Found");
+        };
         if history::decode_peer_id(previous_peer_id).is_err() {
             return reject(&mut stream, "400 Bad Request");
         }
@@ -3395,9 +3521,6 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         if peer_chat_active(&state, &previous_peer_id) {
             return reject(&mut stream, "409 Conflict");
         }
-        let Some(operation) = state.chats.get(operation_id) else {
-            return reject(&mut stream, "404 Not Found");
-        };
         let Ok(snapshot) = operation.snapshot.lock() else {
             return reject(&mut stream, "503 Service Unavailable");
         };
@@ -3445,7 +3568,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         };
     }
     if first == "POST /api/chat/cancel HTTP/1.1" {
-        let Some(operation) = state.chats.get(body) else {
+        let Some(operation) = owned_chat_operation(&state, body) else {
             return reject(&mut stream, "404 Not Found");
         };
         let merge_accepted = operation.snapshot.lock().is_ok_and(|snapshot| {
@@ -3476,7 +3599,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         {
             return reject(&mut stream, "400 Bad Request");
         }
-        let Some(operation) = state.chats.get(operation_id) else {
+        let Some(operation) = owned_chat_operation(&state, operation_id) else {
             return reject(&mut stream, "404 Not Found");
         };
         let Ok(snapshot) = operation.snapshot.lock() else {
@@ -3503,7 +3626,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Ok(cursor) = cursor.parse::<usize>() else {
             return reject(&mut stream, "400 Bad Request");
         };
-        let Some(operation) = state.chats.get(operation_id) else {
+        let Some(operation) = owned_chat_operation(&state, operation_id) else {
             return reject(&mut stream, "404 Not Found");
         };
         let Ok(snapshot) = operation.snapshot.lock() else {

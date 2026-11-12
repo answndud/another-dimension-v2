@@ -97,16 +97,30 @@ async function refreshIdentity() {
   const response = await request('/api/identity/status');
   if (response.status === 401) { show('entry'); return false; }
   if (!response.ok) throw new Error('status failed');
-  identityId.textContent = await response.text();
+  const currentIdentityId = await response.text();
+  identityId.textContent = currentIdentityId;
   await refreshNetworkSettings();
   show('active');
   await refreshHistoryList();
   const restoreJob = sessionStorage.getItem(restoreJobKey);
   if (restoreJob) {
     sessionStorage.removeItem(restoreJobKey);
-    attachChat(restoreJob).catch(() => {});
+    try {
+      const savedJob = JSON.parse(restoreJob);
+      if (savedJob.identityId === currentIdentityId && typeof savedJob.operationId === 'string') {
+        if (sessionStorage.getItem(operationKey) !== savedJob.operationId) {
+          await attachChat(savedJob.operationId);
+        }
+      }
+    } catch (_) {}
   }
   return true;
+}
+
+function rememberRestoreJob(operationId) {
+  const ownerIdentityId = identityId.textContent.trim();
+  if (!operationId || !ownerIdentityId) return;
+  sessionStorage.setItem(restoreJobKey, JSON.stringify({ operationId, identityId: ownerIdentityId }));
 }
 
 async function refreshNetworkSettings() {
@@ -429,7 +443,7 @@ async function pollChat() {
     const snapshot = await response.json();
     updateChatView(snapshot);
     if (['merge-queued', 'merging'].includes(snapshot.historyRestoreState)) {
-      sessionStorage.setItem(restoreJobKey, operationId);
+      rememberRestoreJob(operationId);
     } else if (snapshot.historyRestoreState === 'completed' || snapshot.historyRestoreState === 'failed') {
       sessionStorage.removeItem(restoreJobKey);
     }
@@ -652,7 +666,7 @@ loginForm.addEventListener('submit', async (event) => {
 document.querySelector('#logout').addEventListener('click', async () => {
   try {
     if (latestChatSnapshot && ['merge-queued', 'merging'].includes(latestChatSnapshot.historyRestoreState) && operationId) {
-      sessionStorage.setItem(restoreJobKey, operationId);
+      rememberRestoreJob(operationId);
     }
     if (!(await request('/api/identity/logout')).ok) throw new Error('logout failed');
     stopPolling();
@@ -788,13 +802,13 @@ async function resolveHistoryRestore(accept) {
   const cancellingTransfer = !accept
     && document.querySelector('#history-restore-decline').textContent === '전송 취소';
   if (accept && restoreState === 'awaiting-merge-consent') {
-    sessionStorage.setItem(restoreJobKey, operationId);
+    rememberRestoreJob(operationId);
   }
   try {
     const response = await request('/api/chat/resolve-history-restore', JSON.stringify({ operationId, accept }));
     if (!response.ok) throw new Error((await response.text()) || 'restore failed');
     if (accept && restoreState === 'awaiting-merge-consent') {
-      sessionStorage.setItem(restoreJobKey, operationId);
+      rememberRestoreJob(operationId);
     }
     message.textContent = accept
       ? acceptingTransfer ? '전송 요청을 접수했습니다. 완료 후 미리 보기에서 최종 병합을 확인하세요.' : '최종 병합 요청을 접수했습니다. 상태 조회에서 완료 또는 실패를 확인하세요.'
@@ -835,7 +849,7 @@ sendForm.addEventListener('submit', async (event) => {
 
 document.querySelector('#close-chat').addEventListener('click', async () => {
   if (latestChatSnapshot && ['merge-queued', 'merging'].includes(latestChatSnapshot.historyRestoreState) && operationId) {
-    sessionStorage.setItem(restoreJobKey, operationId);
+    rememberRestoreJob(operationId);
   }
   if (operationId) await request('/api/chat/cancel', operationId).catch(() => {});
   stopPolling();

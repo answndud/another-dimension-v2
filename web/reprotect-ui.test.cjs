@@ -39,6 +39,7 @@ function createHarness() {
         dataset: {}, style: {}, listeners: {}, children: [],
         addEventListener(type, callback) { this.listeners[type] = callback; },
         querySelector(selector) { return element(`${selector} inside ${selector}`); },
+        querySelectorAll() { return []; },
         replaceChildren(...children) { this.children = children; },
         append(...children) { this.children.push(...children); },
         appendChild(child) { this.children.push(child); return child; },
@@ -478,6 +479,52 @@ test('actual UI: stale history selection reports the reload requirement', async 
   request.resolve(response('history changed; reload before applying selection', 409));
   await deletion;
   assert.equal(h.element('#message').textContent, 'history changed; reload before applying selection');
+});
+
+test('actual UI: restore jobs reopen only for the identity that created them', async (t) => {
+  const restoreJob = JSON.stringify({ operationId: 'private-operation', identityId: 'identity-A' });
+  const settings = JSON.stringify({
+    savedMode: 'general', socks: null, activeMode: 'general', activeSocks: null,
+    restartRequired: false, notifications: false,
+  });
+  await t.test('different identity does not request the old operation', async () => {
+    const h = createHarness();
+    h.evaluate(`sessionStorage.setItem('local-history-restore-job', ${JSON.stringify(restoreJob)})`);
+    const refresh = h.evaluate('refreshIdentity()');
+    await new Promise((resolve) => setImmediate(resolve));
+    h.requestFor('/api/identity/status').resolve(response('identity-B'));
+    await new Promise((resolve) => setImmediate(resolve));
+    h.requestFor('/api/settings/get').resolve(response(settings));
+    await new Promise((resolve) => setImmediate(resolve));
+    h.requestFor('/api/history/list').resolve(response('[]'));
+    await refresh;
+    assert.equal(h.requests.some((item) => item.path === '/api/chat/status'), false);
+    assert.equal(h.evaluate("sessionStorage.getItem('local-history-restore-job')"), null);
+  });
+
+  await t.test('same identity resumes polling the saved operation', async () => {
+    const h = createHarness();
+    h.evaluate(`sessionStorage.setItem('local-history-restore-job', ${JSON.stringify(restoreJob)})`);
+    const refresh = h.evaluate('refreshIdentity()');
+    await new Promise((resolve) => setImmediate(resolve));
+    h.requestFor('/api/identity/status').resolve(response('identity-A'));
+    await new Promise((resolve) => setImmediate(resolve));
+    h.requestFor('/api/settings/get').resolve(response(settings));
+    await new Promise((resolve) => setImmediate(resolve));
+    h.requestFor('/api/history/list').resolve(response('[]'));
+    await new Promise((resolve) => setImmediate(resolve));
+    const status = h.requestFor('/api/chat/status');
+    assert.equal(status.init.body, 'private-operation');
+    status.resolve(response(JSON.stringify({
+      phase: 'closed', messageEpoch: 0, messages: [], messageCount: 0,
+      historyRestoreState: 'completed', historyRestoreInProgress: false,
+      historyRestoreStatus: 'merge done', historyRestoreOfferCount: 0,
+      historyRestoreLegacyCount: 0, historyRestoreReceived: 0,
+      historyRestoreTotal: 0, historyRestoreOffer: [], identityTransition: [],
+    })));
+    await refresh;
+    assert.equal(h.evaluate('operationId'), 'private-operation');
+  });
 });
 
 test('actual UI: staging cleanup failure remains visible after disconnect', () => {
