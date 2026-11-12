@@ -87,14 +87,20 @@ impl Drop for PendingMergeQueueNotice {
     fn drop(&mut self) {
         if self.has_pending.load(Ordering::SeqCst) {
             chat_update(&self.operation, |snapshot| {
-                snapshot.storage_error = Some(
-                    "연결 종료로 병합 중 임시 대기하던 수신 메시지를 기록에 반영하지 못했습니다. 상대 기록 복원을 다시 요청해 확인하세요."
-                        .to_owned(),
-                );
-                snapshot.error = snapshot.storage_error.clone();
+                let detail = "연결 종료로 병합 중 임시 대기하던 수신 메시지를 기록에 반영하지 못했습니다. 상대 기록 복원을 다시 요청해 확인하세요.";
+                snapshot.storage_error =
+                    Some(append_error_detail(snapshot.storage_error.take(), detail));
+                snapshot.error = Some(append_error_detail(snapshot.error.take(), detail));
             });
         }
     }
+}
+
+fn append_error_detail(previous: Option<String>, detail: &str) -> String {
+    previous.map_or_else(
+        || detail.to_owned(),
+        |previous| format!("{previous} {detail}"),
+    )
 }
 
 fn owned_chat_operation<'a>(
@@ -605,6 +611,33 @@ fn parse_chat_control(message: &[u8]) -> Result<Option<serde_json::Value>, ()> {
     serde_json::from_slice(payload).map(Some).map_err(|_| ())
 }
 
+fn is_unframed_live_chat_message(message: &[u8]) -> bool {
+    std::str::from_utf8(message).is_ok()
+        && !history::is_signed_message_frame(message)
+        && !history::is_transfer_frame(message)
+        && matches!(parse_chat_control(message), Ok(None))
+}
+
+fn reject_unframed_live_chat_message(operation: &ChatOperation, message: &[u8]) -> bool {
+    if !is_unframed_live_chat_message(message) {
+        return false;
+    }
+    mark_chat_disconnected(
+        operation,
+        "서명되지 않은 일반 메시지를 받아 연결을 종료했습니다. 기록에는 저장하지 않았습니다.",
+        false,
+    );
+    true
+}
+
+fn restore_transfer_allowed(operation: &ChatOperation) -> bool {
+    operation
+        .snapshot
+        .lock()
+        .map(|snapshot| snapshot.history_restore_state == "receiving")
+        .unwrap_or(false)
+}
+
 fn chat_entry(item: history::StoredMessage) -> ChatEntry {
     let is_identity_event = item.text.starts_with(history::IDENTITY_EVENT_PREFIX);
     let display_text = item
@@ -764,6 +797,125 @@ mod send_tests {
         let mut response = String::new();
         client.read_to_string(&mut response).unwrap();
         response
+    }
+
+    #[test]
+    fn live_chat_rejects_unframed_text_without_waiting_for_history_lock() {
+        let (alice, _) = Identity::create().unwrap();
+        let (bob, _) = Identity::create().unwrap();
+        let peer_id = alice.public_id().to_owned();
+        let bob_id = bob.public_id();
+        let operation = Arc::new(ChatOperation {
+            owner_identity_id: bob.public_id().to_owned(),
+            history_state_lock: Mutex::new(()),
+            snapshot: Mutex::new(ChatSnapshot {
+                phase: "connected",
+                fingerprint: None,
+                peer_id: Some(peer_id.clone()),
+                error: None,
+                storage_error: None,
+                messages: Vec::new(),
+                message_count: 0,
+                relay_ack: None,
+                pending_sends: 0,
+                identity_transition: None,
+                history_restore_in_progress: true,
+                history_restore_state: "merging",
+                history_restore_estimate_bytes: 0,
+                history_restore_cleanup_error: None,
+                history_restore_offer: Vec::new(),
+                history_restore_offer_count: 0,
+                history_restore_legacy_count: 0,
+                history_restore_received: 0,
+                history_restore_total: 0,
+                history_restore_status: Some("merging".to_owned()),
+                message_epoch: 0,
+            }),
+            message_reader: Mutex::new(None),
+            sender: mpsc::channel().0,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+
+        let plain_text = b"unsigned live text";
+        assert!(is_unframed_live_chat_message(plain_text));
+        let signed =
+            history::sign_message(&alice, &bob_id, 7, "signed message".to_owned()).unwrap();
+        let signed_frame = history::encode_signed_message(&signed).unwrap();
+        assert!(!is_unframed_live_chat_message(&signed_frame));
+        assert_eq!(
+            history::decode_signed_message(&bob, &peer_id, &alice.public_key(), &signed_frame)
+                .unwrap()
+                .text,
+            "signed message"
+        );
+
+        let control_frame = chat_control(serde_json::json!({"type":"history-sync-cancel"}));
+        assert!(!is_unframed_live_chat_message(&control_frame));
+        assert!(parse_chat_control(&control_frame).unwrap().is_some());
+
+        let old_record = history::StoredMessage {
+            unix_time: 8,
+            sender: history::MessageSender::Me,
+            text: "unsigned legacy restore".to_owned(),
+            proof: None,
+        };
+        let transfer_frame = history::encode_transfer(&old_record).unwrap();
+        assert!(!is_unframed_live_chat_message(&transfer_frame));
+        assert!(
+            history::decode_transfer(&bob, &peer_id, &alice.public_key(), &transfer_frame)
+                .unwrap()
+                .proof
+                .is_none()
+        );
+        operation.snapshot.lock().unwrap().history_restore_state = "awaiting-transfer-consent";
+        assert!(!restore_transfer_allowed(&operation));
+        operation.snapshot.lock().unwrap().history_restore_state = "receiving";
+        assert!(restore_transfer_allowed(&operation));
+        operation.snapshot.lock().unwrap().history_restore_state = "merging";
+
+        let (lock_held_send, lock_held_receive) = mpsc::channel();
+        let (release_send, release_receive) = mpsc::channel();
+        let locked_operation = Arc::clone(&operation);
+        let holder = thread::spawn(move || {
+            let _guard = locked_operation.history_state_lock.lock().unwrap();
+            lock_held_send.send(()).unwrap();
+            release_receive.recv().unwrap();
+        });
+        lock_held_receive
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let (result_send, result_receive) = mpsc::channel();
+        let rejecting_operation = Arc::clone(&operation);
+        let reject = thread::spawn(move || {
+            result_send
+                .send(reject_unframed_live_chat_message(
+                    &rejecting_operation,
+                    plain_text,
+                ))
+                .unwrap();
+        });
+        assert!(result_receive.recv_timeout(Duration::from_secs(1)).unwrap());
+        release_send.send(()).unwrap();
+        holder.join().unwrap();
+        reject.join().unwrap();
+
+        let snapshot = operation.snapshot.lock().unwrap();
+        assert_eq!(snapshot.phase, "disconnected");
+        assert_eq!(snapshot.message_count, 0);
+        assert!(snapshot.messages.is_empty());
+        assert!(snapshot.error.as_deref().unwrap().contains("서명되지 않은"));
+        drop(snapshot);
+        drop(PendingMergeQueueNotice {
+            operation: Arc::clone(&operation),
+            has_pending: Arc::new(AtomicBool::new(true)),
+        });
+        let snapshot = operation.snapshot.lock().unwrap();
+        assert!(snapshot.error.as_deref().unwrap().contains("서명되지 않은"));
+        assert!(snapshot
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("임시 대기하던 수신 메시지"));
     }
 
     #[test]
@@ -2345,6 +2497,11 @@ fn spawn_chat_worker(
                             continue;
                         }
                         last_peer_activity = Instant::now();
+                        if reject_unframed_live_chat_message(&operation, &message) {
+                            drop(history.take());
+                            discard_restore_staging(&mut pending_restore, &operation);
+                            return;
+                        }
                         if history::is_signed_message_frame(&message) {
                             let entry = match history::decode_signed_message(
                                 &identity, &peer_id, &peer_key, &message,
@@ -2357,6 +2514,11 @@ fn spawn_chat_worker(
                                     return;
                                 }
                             };
+                            if notifications_enabled.load(Ordering::SeqCst)
+                                && should_send_notification(&last_notification)
+                            {
+                                notify_incoming_message();
+                            }
                             if queue_incoming_message(&operation, merge_pending_messages.len()) {
                                 if queue_message_during_restore_merge(
                                     &mut merge_pending_messages,
@@ -2434,11 +2596,7 @@ fn spawn_chat_worker(
                                 // Delayed frames from cancelled or completed requests cannot alter a newer offer.
                                 continue;
                             }
-                            if !operation
-                                .snapshot
-                                .lock()
-                                .is_ok_and(|snapshot| snapshot.history_restore_state == "receiving")
-                            {
+                            if !restore_transfer_allowed(&operation) {
                                 continue;
                             }
                             let decoded = history::decode_transfer_with_linked_keys(
@@ -3157,54 +3315,14 @@ fn spawn_chat_worker(
                             }
                             continue;
                         }
-                        match String::from_utf8(message) {
-                            Ok(text) => {
-                                let entry = history::StoredMessage {
-                                    unix_time: now_seconds(),
-                                    sender: history::MessageSender::Other,
-                                    text,
-                                    proof: None,
-                                };
-                                let _history_state_guard = operation
-                                    .history_state_lock
-                                    .lock()
-                                    .unwrap_or_else(|error| error.into_inner());
-                                let save_error = match history.as_mut() {
-                                    Some(history) => history.append(&entry).err(),
-                                    None => Some(io::Error::other("history unavailable")),
-                                };
-                                if save_error.is_some() {
-                                    history = None;
-                                }
-                                if notifications_enabled.load(Ordering::SeqCst)
-                                    && should_send_notification(&last_notification)
-                                {
-                                    notify_incoming_message();
-                                }
-                                chat_update(&operation, |snapshot| {
-                                    snapshot.message_count =
-                                        snapshot.message_count.saturating_add(1);
-                                    snapshot.messages.push(ChatEntry {
-                                        unix_time: entry.unix_time,
-                                        sender: "상대방",
-                                        text: entry.text,
-                                    });
-                                    if save_error.is_some() {
-                                        snapshot.storage_error = Some("대화 기록을 저장하지 못했습니다. 프로그램을 종료하면 이 메시지를 잃을 수 있습니다.".to_owned());
-                                    }
-                                });
-                            }
-                            Err(_) => {
-                                drop(history.take());
-                                chat_update(&operation, |snapshot| {
-                                    snapshot.phase = "disconnected";
-                                    snapshot.error =
-                                        Some("상대 메시지 형식이 잘못되었습니다.".to_owned());
-                                });
-                                discard_restore_staging(&mut pending_restore, &operation);
-                                return;
-                            }
-                        }
+                        drop(history.take());
+                        mark_chat_disconnected(
+                            &operation,
+                            "처리할 수 없는 채팅 프레임을 받아 연결을 종료했습니다.",
+                            false,
+                        );
+                        discard_restore_staging(&mut pending_restore, &operation);
+                        return;
                     }
                 }
                 Ok(Some(RelayUpdate::Published { event_id })) => {
