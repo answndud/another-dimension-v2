@@ -61,7 +61,7 @@ enum ChatCommand {
     Send(String, Sender<()>),
     AcceptIdentityTransition(String, Sender<Result<(), String>>),
     RequestHistoryRestore(Sender<Result<(), String>>),
-    ResolveHistoryRestore(bool, Sender<Result<(), String>>),
+    ResolveHistoryRestore(bool),
     Cancel,
 }
 
@@ -101,6 +101,42 @@ struct ChatSnapshot {
     history_restore_total: usize,
     history_restore_status: Option<String>,
     message_epoch: u64,
+}
+
+fn reserve_history_restore_resolution(
+    snapshot: &mut ChatSnapshot,
+    accept: bool,
+) -> Result<&'static str, &'static str> {
+    if snapshot.phase != "connected" {
+        return Err("restore operation is not available");
+    }
+    let state = if accept {
+        if snapshot.history_restore_in_progress {
+            return Err("restore approval is already in progress");
+        }
+        match snapshot.history_restore_state {
+            "awaiting-transfer-consent" => "transfer-queued",
+            "awaiting-merge-consent" => "merge-queued",
+            _ => return Err("restore approval was already handled"),
+        }
+    } else if matches!(
+        snapshot.history_restore_state,
+        "idle" | "failed" | "merging" | "merge-queued" | "cancel-queued" | "completed"
+    ) {
+        return Err("restore operation cannot be declined in this state");
+    } else {
+        "cancel-queued"
+    };
+    snapshot.history_restore_state = state;
+    snapshot.history_restore_in_progress = true;
+    snapshot.history_restore_status = Some(match state {
+        "merge-queued" => {
+            "최종 병합 요청을 접수했습니다. 완료 여부는 연결 상태에서 확인합니다.".to_owned()
+        }
+        "transfer-queued" => "전송 동의 요청을 접수했습니다.".to_owned(),
+        _ => "복원 취소 요청을 접수했습니다.".to_owned(),
+    });
+    Ok(state)
 }
 
 #[derive(Clone)]
@@ -607,6 +643,76 @@ mod send_tests {
     }
 
     #[test]
+    fn restore_merge_acceptance_is_async_idempotent_and_reports_final_state() {
+        let operation = Arc::new(ChatOperation {
+            snapshot: Mutex::new(ChatSnapshot {
+                phase: "connected",
+                fingerprint: None,
+                peer_id: None,
+                error: None,
+                storage_error: None,
+                messages: Vec::new(),
+                message_count: 0,
+                relay_ack: None,
+                pending_sends: 0,
+                identity_transition: None,
+                history_restore_in_progress: false,
+                history_restore_state: "awaiting-merge-consent",
+                history_restore_estimate_bytes: 0,
+                history_restore_cleanup_error: None,
+                history_restore_offer: Vec::new(),
+                history_restore_offer_count: 0,
+                history_restore_legacy_count: 0,
+                history_restore_received: 0,
+                history_restore_total: 0,
+                history_restore_status: None,
+                message_epoch: 0,
+            }),
+            message_reader: Mutex::new(None),
+            sender: mpsc::channel().0,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let worker_operation = Arc::clone(&operation);
+        let worker_gate = Arc::clone(&gate);
+        let worker = thread::spawn(move || {
+            let (lock, changed) = &*worker_gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = changed.wait(released).unwrap();
+            }
+            chat_update(&worker_operation, |snapshot| {
+                snapshot.history_restore_state = "completed";
+                snapshot.history_restore_in_progress = false;
+                snapshot.history_restore_status = Some("test merge complete".to_owned());
+            });
+        });
+
+        {
+            let mut snapshot = operation.snapshot.lock().unwrap();
+            assert_eq!(
+                reserve_history_restore_resolution(&mut snapshot, true),
+                Ok("merge-queued")
+            );
+            assert_eq!(snapshot.history_restore_state, "merge-queued");
+            assert!(snapshot.history_restore_in_progress);
+            assert!(reserve_history_restore_resolution(&mut snapshot, true).is_err());
+        }
+        {
+            let (lock, changed) = &*gate;
+            *lock.lock().unwrap() = true;
+            changed.notify_one();
+        }
+        worker.join().unwrap();
+        let snapshot = operation.snapshot.lock().unwrap();
+        assert_eq!(snapshot.history_restore_state, "completed");
+        assert_eq!(
+            snapshot.history_restore_status.as_deref(),
+            Some("test merge complete")
+        );
+    }
+
+    #[test]
     fn history_sync_chunks_over_legacy_record_and_byte_limits_with_ack_backpressure() {
         let request_id = "ab".repeat(32);
         let messages: Vec<_> = (0..4_097)
@@ -971,9 +1077,7 @@ fn spawn_chat_worker(
                     Ok(ChatCommand::RequestHistoryRestore(result)) => {
                         let _ = result.send(Err("상대 기록 복원은 연결 확인 후 사용할 수 있습니다.".to_owned()));
                     }
-                    Ok(ChatCommand::ResolveHistoryRestore(_, result)) => {
-                        let _ = result.send(Err("복원 제안을 처리할 수 없습니다.".to_owned()));
-                    }
+                    Ok(ChatCommand::ResolveHistoryRestore(_)) => {}
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return Err("취소되었습니다.".to_owned()),
                 }
@@ -1288,14 +1392,14 @@ fn spawn_chat_worker(
                             }
                         }
                     }
-                    Ok(ChatCommand::ResolveHistoryRestore(accept, result)) => {
+                    Ok(ChatCommand::ResolveHistoryRestore(accept)) => {
                         let in_progress = restore_request_id.is_some();
                         let restore_state = operation
                             .snapshot
                             .lock()
                             .map(|snapshot| snapshot.history_restore_state)
                             .unwrap_or("failed");
-                        if accept && restore_state == "awaiting-transfer-consent" {
+                        if accept && restore_state == "transfer-queued" {
                             let request_id = restore_request_id.clone();
                             let sent =
                                 request_id.is_some_and(|request_id| {
@@ -1309,29 +1413,78 @@ fn spawn_chat_worker(
                                     snapshot.history_restore_state = "receiving";
                                     snapshot.history_restore_status = Some("전송 동의를 받았습니다. 서명과 발신자를 검증하며 암호화 임시 저장소에 받습니다.".to_owned());
                                 });
-                                let _ = result.send(Ok(()));
+                                chat_update(&operation, |snapshot| {
+                                    snapshot.history_restore_status =
+                                        Some("기록 전송을 시작했습니다.".to_owned());
+                                });
                             } else {
-                                let _ =
-                                    result.send(Err("기록 전송을 시작하지 못했습니다.".to_owned()));
+                                chat_update(&operation, |snapshot| {
+                                    snapshot.history_restore_state = "failed";
+                                    snapshot.history_restore_in_progress = false;
+                                    snapshot.history_restore_status =
+                                        Some("기록 전송을 시작하지 못했습니다.".to_owned());
+                                });
                             }
                             continue;
                         }
-                        let mut resolved = if accept {
-                            match (history.as_mut(), pending_restore.as_mut()) {
-                                (Some(current), Some(staging)) if staging.count() > 0 => current
-                                    .merge_restore_staging(&identity, staging)
-                                    .map(|summary| {
-                                        chat_update(&operation, |snapshot| {
-                                            snapshot.message_count = summary.total_count.min(usize::MAX as u64) as usize;
-                                            snapshot.message_epoch = snapshot.message_epoch.wrapping_add(1);
-                                            snapshot.history_restore_status = Some(format!(
-                                                "{}개 메시지를 복원했습니다. 서명 없는 기존 메시지는 완전한 중복 판정이 불가능합니다.",
-                                                summary.imported_count
-                                            ));
-                                        });
-                                    }),
-                                _ => Err(io::Error::other("no pending history offer")),
-                            }
+                        if accept && restore_state == "merge-queued" {
+                            let Some(mut staging) = pending_restore.take() else {
+                                chat_update(&operation, |snapshot| {
+                                    snapshot.history_restore_state = "failed";
+                                    snapshot.history_restore_in_progress = false;
+                                    snapshot.history_restore_status =
+                                        Some("복원 임시 저장소를 찾지 못했습니다.".to_owned());
+                                });
+                                continue;
+                            };
+                            let merge_identity = Arc::clone(&identity);
+                            let merge_operation = Arc::clone(&operation);
+                            let merge_peer_id = peer_id.clone();
+                            chat_update(&operation, |snapshot| {
+                                snapshot.history_restore_state = "merging";
+                                snapshot.history_restore_in_progress = true;
+                                snapshot.history_restore_status = Some("최종 병합 중입니다. 대화 기록 저장은 잠금 때문에 잠시 대기할 수 있습니다. 연결 종료 후에도 병합과 결과 상태는 유지됩니다.".to_owned());
+                            });
+                            thread::spawn(move || {
+                                let result = (|| -> io::Result<history::RestoreMergeSummary> {
+                                    let (mut current, _, _) = history::History::open_for_chat(
+                                        &merge_identity,
+                                        &merge_peer_id,
+                                    )?;
+                                    current.merge_restore_staging(&merge_identity, &mut staging)
+                                })();
+                                let cleanup = staging.cleanup();
+                                let result = match (result, cleanup) {
+                                    (Ok(summary), Ok(())) => Ok(summary),
+                                    (Err(error), Ok(())) => Err(error.to_string()),
+                                    (Ok(_), Err(error)) => Err(format!("기록 병합은 완료됐지만 임시 저장소 정리에 실패했습니다: {error}")),
+                                    (Err(error), Err(cleanup)) => Err(format!("기록 병합 실패 ({error}); 임시 저장소 정리도 실패 ({cleanup})")),
+                                };
+                                chat_update(&merge_operation, |snapshot| {
+                                    snapshot.history_restore_in_progress = false;
+                                    snapshot.history_restore_offer.clear();
+                                    snapshot.history_restore_offer_count = 0;
+                                    snapshot.history_restore_legacy_count = 0;
+                                    snapshot.history_restore_received = 0;
+                                    snapshot.history_restore_total = 0;
+                                    match result {
+                                        Ok(summary) => {
+                                            snapshot.history_restore_state = "completed";
+                                            snapshot.message_count =
+                                                summary.total_count.min(usize::MAX as u64) as usize;
+                                            snapshot.message_epoch =
+                                                snapshot.message_epoch.wrapping_add(1);
+                                            snapshot.history_restore_status = Some(format!("{}개 메시지를 병합했습니다. 서명 없는 구형 메시지는 완전한 중복 판정이 불가능합니다.", summary.imported_count));
+                                        }
+                                        Err(error) => {
+                                            snapshot.history_restore_state = "failed";
+                                            snapshot.history_restore_status =
+                                                Some(format!("기록 병합 실패: {error}"));
+                                        }
+                                    }
+                                });
+                            });
+                            continue;
                         } else {
                             if let Some(request_id) = restore_request_id.take() {
                                 let _ = session.send(&chat_control(serde_json::json!({
@@ -1342,47 +1495,34 @@ fn spawn_chat_worker(
                             }
                             restore_receiver = HistorySyncReceiver::default();
                             restore_started_at = None;
-                            chat_update(&operation, |snapshot| {
-                                snapshot.history_restore_status = Some(
-                                    if in_progress {
-                                        "기록 전송을 취소했습니다. 로컬 기록은 변경하지 않았습니다."
-                                    } else {
-                                        "복원을 거부했습니다. 로컬 기록은 변경하지 않았습니다."
-                                    }
-                                    .to_owned(),
-                                )
-                            });
-                            Ok(())
-                        };
-                        let cleanup = pending_restore
-                            .take()
-                            .map(history::RestoreStaging::cleanup)
-                            .transpose();
-                        if let Err(cleanup_error) = cleanup {
-                            resolved = match resolved {
-                                Ok(()) => Err(io::Error::other(format!(
-                                    "restore operation finished but encrypted staging cleanup failed: {cleanup_error}"
-                                ))),
-                                Err(operation_error) => Err(io::Error::other(format!(
-                                    "restore failed ({operation_error}); encrypted staging cleanup failed ({cleanup_error})"
-                                ))),
-                            };
-                        }
-                        chat_update(&operation, |snapshot| {
-                            snapshot.history_restore_state =
-                                if resolved.is_ok() { "idle" } else { "failed" };
-                            if let Err(error) = &resolved {
-                                snapshot.history_restore_status = Some(format!(
-                                    "기록 병합 또는 임시 저장소 정리에 실패했습니다: {error}"
-                                ));
+                            let mut result = Ok(());
+                            if let Some(staging) = pending_restore.take() {
+                                result = staging.cleanup();
                             }
-                            snapshot.history_restore_offer.clear();
-                            snapshot.history_restore_offer_count = 0;
-                            snapshot.history_restore_legacy_count = 0;
-                            snapshot.history_restore_received = 0;
-                            snapshot.history_restore_total = 0;
-                        });
-                        let _ = result.send(resolved.map_err(|error| error.to_string()));
+                            chat_update(&operation, |snapshot| {
+                                snapshot.history_restore_in_progress = false;
+                                snapshot.history_restore_state =
+                                    if result.is_ok() { "idle" } else { "failed" };
+                                snapshot.history_restore_status = Some(match result {
+                                    Ok(()) if in_progress => {
+                                        "기록 전송을 취소했습니다. 로컬 기록은 변경하지 않았습니다."
+                                            .to_owned()
+                                    }
+                                    Ok(()) => {
+                                        "복원을 거부했습니다. 로컬 기록은 변경하지 않았습니다."
+                                            .to_owned()
+                                    }
+                                    Err(error) => {
+                                        format!("복원 임시 저장소 정리에 실패했습니다: {error}")
+                                    }
+                                });
+                                snapshot.history_restore_offer.clear();
+                                snapshot.history_restore_offer_count = 0;
+                                snapshot.history_restore_legacy_count = 0;
+                                snapshot.history_restore_received = 0;
+                                snapshot.history_restore_total = 0;
+                            });
+                        }
                     }
                     Ok(ChatCommand::Confirm) => {}
                     Err(TryRecvError::Empty) => break,
@@ -3023,7 +3163,10 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             snapshot.phase == "connected"
                 && !snapshot.history_restore_in_progress
                 && snapshot.history_restore_offer.is_empty()
-                && matches!(snapshot.history_restore_state, "idle" | "failed")
+                && matches!(
+                    snapshot.history_restore_state,
+                    "idle" | "failed" | "completed"
+                )
         }) {
             return reject(&mut stream, "409 Conflict");
         }
@@ -3067,37 +3210,33 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some(operation) = state.chats.get(operation_id) else {
             return reject(&mut stream, "404 Not Found");
         };
-        if !operation.snapshot.lock().is_ok_and(|snapshot| {
-            snapshot.phase == "connected"
-                && if accept {
-                    matches!(
-                        snapshot.history_restore_state,
-                        "awaiting-transfer-consent" | "awaiting-merge-consent"
-                    ) && !snapshot.history_restore_in_progress
-                } else {
-                    !matches!(snapshot.history_restore_state, "idle" | "failed")
-                }
-        }) {
-            return reject(&mut stream, "409 Conflict");
+        let Ok(mut snapshot) = operation.snapshot.lock() else {
+            return reject(&mut stream, "503 Service Unavailable");
+        };
+        match reserve_history_restore_resolution(&mut snapshot, accept) {
+            Ok(_) => {}
+            Err(_) => return reject(&mut stream, "409 Conflict"),
         }
-        let (sender, receiver) = mpsc::channel();
+        drop(snapshot);
         if operation
             .sender
-            .send(ChatCommand::ResolveHistoryRestore(accept, sender))
+            .send(ChatCommand::ResolveHistoryRestore(accept))
             .is_err()
         {
+            if let Ok(mut snapshot) = operation.snapshot.lock() {
+                snapshot.history_restore_state = "failed";
+                snapshot.history_restore_in_progress = false;
+                snapshot.history_restore_status =
+                    Some("복원 요청을 작업자에게 전달하지 못했습니다.".to_owned());
+            }
             return reject(&mut stream, "409 Conflict");
         }
-        return match receiver.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(())) => respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok"),
-            Ok(Err(error)) => respond(
-                &mut stream,
-                "500 Internal Server Error",
-                "text/plain; charset=utf-8",
-                error.as_bytes(),
-            ),
-            Err(_) => reject(&mut stream, "409 Conflict"),
-        };
+        return respond(
+            &mut stream,
+            "202 Accepted",
+            "text/plain; charset=utf-8",
+            b"accepted; poll /api/chat/status for the result",
+        );
     }
     if first == "POST /api/chat/link-identity HTTP/1.1" {
         let Some((operation_id, previous_peer_id)) = body.split_once('\n') else {
@@ -3163,7 +3302,12 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some(operation) = state.chats.get(body) else {
             return reject(&mut stream, "404 Not Found");
         };
-        operation.cancelled.store(true, Ordering::SeqCst);
+        let merge_accepted = operation.snapshot.lock().is_ok_and(|snapshot| {
+            matches!(snapshot.history_restore_state, "merge-queued" | "merging")
+        });
+        if !merge_accepted {
+            operation.cancelled.store(true, Ordering::SeqCst);
+        }
         let _ = operation.sender.send(ChatCommand::Cancel);
         return respond(
             &mut stream,
@@ -3747,7 +3891,12 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         }
         "POST /api/identity/logout HTTP/1.1" => {
             for operation in state.chats.values() {
-                operation.cancelled.store(true, Ordering::SeqCst);
+                let merge_accepted = operation.snapshot.lock().is_ok_and(|snapshot| {
+                    matches!(snapshot.history_restore_state, "merge-queued" | "merging")
+                });
+                if !merge_accepted {
+                    operation.cancelled.store(true, Ordering::SeqCst);
+                }
                 let _ = operation.sender.send(ChatCommand::Cancel);
             }
             state.identity = None;

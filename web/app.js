@@ -27,6 +27,7 @@ const conversation = document.querySelector('#conversation');
 const message = document.querySelector('#message');
 const sessionKey = 'local-bridge-session';
 const operationKey = 'local-chat-operation';
+const restoreJobKey = 'local-history-restore-job';
 let token = sessionStorage.getItem(sessionKey);
 let currentInvite = '';
 let operationId = null;
@@ -96,6 +97,11 @@ async function refreshIdentity() {
   await refreshNetworkSettings();
   show('active');
   await refreshHistoryList();
+  const restoreJob = sessionStorage.getItem(restoreJobKey);
+  if (restoreJob) {
+    sessionStorage.removeItem(restoreJobKey);
+    attachChat(restoreJob).catch(() => {});
+  }
   return true;
 }
 
@@ -328,11 +334,14 @@ function updateChatView(snapshot) {
   const restoreStatus = document.querySelector('#history-restore-status');
   const restorePreview = document.querySelector('#history-restore-preview');
   const restoreKey = `${snapshot.historyRestoreStatus || ''}:${snapshot.historyRestoreOfferCount || 0}:${snapshot.historyRestoreLegacyCount || 0}:${restoreOffer.map(item => `${item.time}:${item.sender}:${item.text}`).join('|')}`;
-  restorePanel.hidden = (snapshot.phase !== 'connected' && !snapshot.historyRestoreCleanupError)
+  const merging = ['merge-queued', 'merging'].includes(restoreState);
+  restorePanel.hidden = (snapshot.phase !== 'connected' && !snapshot.historyRestoreCleanupError && !merging)
     || (!snapshot.historyRestoreInProgress && !restoreOffer.length && !snapshot.historyRestoreStatus);
-  restoreStatus.textContent = snapshot.historyRestoreInProgress
-    ? `상대 기록을 받는 중입니다: ${snapshot.historyRestoreReceived || 0} / ${snapshot.historyRestoreTotal || 0}. 동의 전에는 로컬 기록을 변경하지 않습니다.`
-    : snapshot.historyRestoreStatus || '';
+  restoreStatus.textContent = merging
+    ? (snapshot.historyRestoreStatus || '최종 병합 중입니다. 대화 기록 저장은 잠금 때문에 잠시 대기할 수 있습니다. 연결 종료 후에도 계속됩니다.')
+    : snapshot.historyRestoreInProgress
+      ? `상대 기록을 받는 중입니다: ${snapshot.historyRestoreReceived || 0} / ${snapshot.historyRestoreTotal || 0}. 동의 전에는 로컬 기록을 변경하지 않습니다.`
+      : snapshot.historyRestoreStatus || '';
   if (snapshot.historyRestoreCleanupError) {
     restoreStatus.textContent += ` 임시 기록 정리 실패: ${snapshot.historyRestoreCleanupError}`;
   }
@@ -344,7 +353,7 @@ function updateChatView(snapshot) {
     || (snapshot.historyRestoreOfferCount || 0) === 0;
   document.querySelector('#history-restore-accept').textContent = restoreState === 'awaiting-merge-consent'
     ? '제안된 기록 병합' : '전송 동의';
-  document.querySelector('#history-restore-decline').disabled = ['idle', 'failed'].includes(restoreState);
+  document.querySelector('#history-restore-decline').disabled = ['idle', 'failed', 'completed', 'merging', 'merge-queued'].includes(restoreState);
   document.querySelector('#history-restore-decline').textContent = snapshot.historyRestoreInProgress
     ? (restoreState === 'estimating' ? '예상 확인 취소' : '전송 취소')
     : (restoreState === 'awaiting-transfer-consent' ? '전송 거부' : '복원 거부');
@@ -378,7 +387,7 @@ function updateChatView(snapshot) {
   }
   if (snapshot.phase === 'confirming') document.querySelector('#confirm-peer').disabled = true;
   if (snapshot.phase === 'connected') document.querySelector('#chat-title').textContent = '대화';
-  if (snapshot.phase === 'disconnected' || snapshot.phase === 'failed' || snapshot.phase === 'closed') {
+  if ((snapshot.phase === 'disconnected' || snapshot.phase === 'failed' || snapshot.phase === 'closed') && !merging) {
     stopPolling();
   }
   lastPhase = snapshot.phase;
@@ -391,6 +400,11 @@ async function pollChat() {
     if (!response.ok) throw new Error('status unavailable');
     const snapshot = await response.json();
     updateChatView(snapshot);
+    if (['merge-queued', 'merging'].includes(snapshot.historyRestoreState)) {
+      sessionStorage.setItem(restoreJobKey, operationId);
+    } else if (snapshot.historyRestoreState === 'completed' || snapshot.historyRestoreState === 'failed') {
+      sessionStorage.removeItem(restoreJobKey);
+    }
     if (snapshot.messageCount > messageCursor) {
       const messages = await request('/api/chat/messages', `${operationId}\n${messageCursor}`);
       if (!messages.ok) throw new Error('messages unavailable');
@@ -399,7 +413,8 @@ async function pollChat() {
   } catch (_) {
     chatStatus.textContent = '로컬 프로그램에서 연결 상태를 읽지 못했습니다.';
   }
-  if (operationId && !['failed', 'disconnected', 'closed'].includes(lastPhase)) {
+  if (operationId && (!['failed', 'disconnected', 'closed'].includes(lastPhase)
+    || ['merge-queued', 'merging'].includes(latestChatSnapshot?.historyRestoreState))) {
     pollTimer = setTimeout(pollChat, 350);
   }
 }
@@ -608,6 +623,9 @@ loginForm.addEventListener('submit', async (event) => {
 
 document.querySelector('#logout').addEventListener('click', async () => {
   try {
+    if (latestChatSnapshot && ['merge-queued', 'merging'].includes(latestChatSnapshot.historyRestoreState) && operationId) {
+      sessionStorage.setItem(restoreJobKey, operationId);
+    }
     if (!(await request('/api/identity/logout')).ok) throw new Error('logout failed');
     stopPolling();
     operationId = null;
@@ -741,11 +759,17 @@ async function resolveHistoryRestore(accept) {
   const acceptingTransfer = accept && restoreState === 'awaiting-transfer-consent';
   const cancellingTransfer = !accept
     && document.querySelector('#history-restore-decline').textContent === '전송 취소';
+  if (accept && restoreState === 'awaiting-merge-consent') {
+    sessionStorage.setItem(restoreJobKey, operationId);
+  }
   try {
     const response = await request('/api/chat/resolve-history-restore', JSON.stringify({ operationId, accept }));
     if (!response.ok) throw new Error((await response.text()) || 'restore failed');
+    if (accept && restoreState === 'awaiting-merge-consent') {
+      sessionStorage.setItem(restoreJobKey, operationId);
+    }
     message.textContent = accept
-      ? acceptingTransfer ? '전송을 시작했습니다. 완료 후 미리 보기에서 최종 병합을 확인하세요.' : '복원한 기록을 현재 대화에 추가했습니다.'
+      ? acceptingTransfer ? '전송 요청을 접수했습니다. 완료 후 미리 보기에서 최종 병합을 확인하세요.' : '최종 병합 요청을 접수했습니다. 상태 조회에서 완료 또는 실패를 확인하세요.'
       : cancellingTransfer
         ? '기록 전송을 취소했습니다. 로컬 기록은 변경되지 않았습니다.'
         : '복원을 거부했습니다. 로컬 기록은 변경되지 않았습니다.';
@@ -782,6 +806,9 @@ sendForm.addEventListener('submit', async (event) => {
 });
 
 document.querySelector('#close-chat').addEventListener('click', async () => {
+  if (latestChatSnapshot && ['merge-queued', 'merging'].includes(latestChatSnapshot.historyRestoreState) && operationId) {
+    sessionStorage.setItem(restoreJobKey, operationId);
+  }
   if (operationId) await request('/api/chat/cancel', operationId).catch(() => {});
   stopPolling();
   operationId = null;
