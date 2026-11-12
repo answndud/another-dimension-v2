@@ -2369,9 +2369,19 @@ fn relay_failure_message(error: &RelayError, phase: &str, using_tor: bool) -> St
         RelayError::Channel(channel::HandshakeError::IdentityMismatch) => {
             "저장된 상대와 연결된 신원이 다릅니다. 연결을 중단했습니다. 별도 경로로 상대를 다시 확인하세요.".to_owned()
         }
+        RelayError::NoRelayAvailable => {
+            if using_tor {
+                "Tor SOCKS를 통한 relay 연결을 사용할 수 없습니다. 직접 연결로 전환하지 않았습니다. 설정을 확인하고 다시 시도하세요.".to_owned()
+            } else {
+                "설정된 relay에 연결할 수 없습니다. 주소와 네트워크 상태를 확인하고 다시 시도하세요.".to_owned()
+            }
+        }
         RelayError::TimedOut("relay subscription") => {
-            "relay 구독이 제한 시간 안에 준비되지 않았습니다. relay 상태를 확인하고 다시 시도하세요."
+            "공통으로 접근 가능한 relay에서 응답을 받지 못했습니다. relay 설정을 확인하고 다시 시도하세요."
                 .to_owned()
+        }
+        RelayError::TimedOut("peer subscription") => {
+            "공통 relay에서 상대를 제한 시간 안에 찾지 못했습니다. relay 설정을 확인하고 다시 시도하세요.".to_owned()
         }
         RelayError::TimedOut(stage) => {
             let description = match *stage {
@@ -2427,7 +2437,7 @@ fn spawn_chat_worker(
     identity: Arc<Identity>,
     cancelled: Arc<AtomicBool>,
     tor_socks: Option<SocketAddr>,
-    relay_url: String,
+    relay_urls: Vec<String>,
     notifications_enabled: Arc<AtomicBool>,
     last_notification: Arc<Mutex<Option<Instant>>>,
 ) {
@@ -2446,8 +2456,8 @@ fn spawn_chat_worker(
         let result = (|| -> Result<(RelaySession, Option<history::History>, Vec<ChatEntry>, usize, Option<String>, [u8; 32], String), String> {
             let invite = InviteCode::parse(&code).ok_or("초대 코드를 확인하세요.")?;
             let mut rendezvous = match role {
-                RoleForChat::Create => RelayRendezvous::create(&relay_url, &invite, tor_socks),
-                RoleForChat::Join => RelayRendezvous::join(&relay_url, &invite, tor_socks),
+                RoleForChat::Create => RelayRendezvous::create(&relay_urls, &invite, tor_socks),
+                RoleForChat::Join => RelayRendezvous::join(&relay_urls, &invite, tor_socks),
             }
             .map_err(|error| relay_failure_message(&error, "connect", tor_socks.is_some()))?;
             rendezvous.set_cancellation_token(Arc::clone(&cancelled));
@@ -3850,6 +3860,17 @@ fn spawn_chat_worker(
                         });
                     }
                 }
+                Ok(Some(RelayUpdate::PublishUnknown { event_id })) => {
+                    if pending_events.remove(&event_id) {
+                        chat_update(&operation, |snapshot| {
+                            snapshot.relay_ack = Some("unknown".to_owned());
+                            snapshot.pending_sends = pending_events.len();
+                            snapshot.error = Some(
+                                "relay 연결이 끊겨 메시지 접수 여부를 확인하지 못했습니다. 로컬 기록에 보존되어 있으며 다시 보내면 중복될 수 있습니다.".to_owned(),
+                            );
+                        });
+                    }
+                }
                 Ok(Some(RelayUpdate::Ready)) | Ok(None) => {}
                 Err(error) => {
                     drop(history.take());
@@ -4771,7 +4792,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         });
         let cancelled = Arc::clone(&operation.cancelled);
         let tor_socks = state.tor_socks;
-        let relay_url = first_active_relay(&state.active_relays).to_owned();
+        let relay_urls = state.active_relays.clone();
         let notifications_enabled = Arc::clone(&state.notifications_enabled);
         let last_notification = Arc::clone(&state.last_notification);
         let role = reconnect_role.unwrap_or(if first == "POST /api/chat/create HTTP/1.1" {
@@ -4793,7 +4814,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             identity,
             cancelled,
             tor_socks,
-            relay_url,
+            relay_urls,
             notifications_enabled,
             last_notification,
         );
