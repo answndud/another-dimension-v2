@@ -1588,6 +1588,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/history/delete-range HTTP/1.1"
             | "POST /api/history/delete-conversation HTTP/1.1"
             | "POST /api/history/export-backup HTTP/1.1"
+            | "POST /api/history/export-backup-bundle HTTP/1.1"
             | "POST /api/history/import-backup HTTP/1.1"
             | "POST /api/history/reprotect-backup HTTP/1.1"
             | "POST /api/history/verify-backup HTTP/1.1"
@@ -2315,10 +2316,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             Ok(history) => history,
             Err(_) => return reject(&mut stream, "400 Bad Request"),
         };
-        let kept: Vec<_> = messages
-            .into_iter()
-            .filter(|item| item.unix_time < start || item.unix_time > end)
-            .collect();
+        let kept = history::outside_time_range(&messages, start, end);
         if let Err(_) = history.replace(&kept) {
             return reject(&mut stream, "500 Internal Server Error");
         }
@@ -2374,6 +2372,41 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             BASE64.encode(backup).as_bytes(),
         );
     }
+    if first == "POST /api/history/export-backup-bundle HTTP/1.1" {
+        let Some(identity) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Some(peers) = payload.get("peerIds").and_then(serde_json::Value::as_array) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Some(peer_ids) = peers
+            .iter()
+            .map(serde_json::Value::as_str)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        if peer_ids.iter().any(|peer| peer_chat_active(&state, peer)) {
+            return reject(&mut stream, "409 Conflict");
+        }
+        let peer_ids: Vec<String> = peer_ids.into_iter().map(str::to_owned).collect();
+        let backup = match history::History::export_backup_bundle(identity, &peer_ids) {
+            Ok(backup) => backup,
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                return reject(&mut stream, "400 Bad Request")
+            }
+            Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+        };
+        return respond(
+            &mut stream,
+            "200 OK",
+            "text/plain; charset=utf-8",
+            BASE64.encode(backup).as_bytes(),
+        );
+    }
     if first == "POST /api/history/import-backup HTTP/1.1" {
         let Some(identity) = state.identity.as_ref() else {
             return reject(&mut stream, "401 Unauthorized");
@@ -2395,6 +2428,24 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             Ok(backup) if backup.len() <= 16 * 1024 * 1024 => backup,
             _ => return reject(&mut stream, "400 Bad Request"),
         };
+        if backup.starts_with(b"ADPACK1\0") {
+            let restored = match history::History::import_backup_bundle(identity, &backup) {
+                Ok(result) => result,
+                Err(_) => return reject(&mut stream, "400 Bad Request"),
+            };
+            for (peer_id, _) in &restored {
+                if let Ok((_, messages, _)) = history::History::open(identity, peer_id) {
+                    update_closed_chat_history(&state, peer_id, Some(&messages));
+                }
+            }
+            let payload = serde_json::json!({ "conversations": restored.iter().map(|(peer_id, count)| serde_json::json!({ "peerId": peer_id, "messageCount": count })).collect::<Vec<_>>() }).to_string();
+            return respond(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                payload.as_bytes(),
+            );
+        }
         let (peer_id, count) = match history::History::import_backup(identity, &backup, password) {
             Ok(result) => result,
             Err(_) => return reject(&mut stream, "400 Bad Request"),

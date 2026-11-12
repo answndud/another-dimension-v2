@@ -136,6 +136,13 @@ async function refreshHistoryList() {
   historySummaries = items;
   verifiedPeers = new Set(items.filter(item => item.verified).map(item => item.peerId));
   for (const item of items) {
+    const row = document.createElement('div');
+    row.className = 'history-bundle-row';
+    const checkLabel = document.createElement('label');
+    const check = document.createElement('input');
+    check.type = 'checkbox';
+    check.dataset.bundlePeerId = item.peerId;
+    checkLabel.append(check, document.createTextNode(' 백업 선택'));
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'history-item';
@@ -149,7 +156,8 @@ async function refreshHistoryList() {
     button.addEventListener('click', () => openHistory(item.peerId).catch(() => {
       message.textContent = '대화 기록을 열지 못했습니다.';
     }));
-    historyList.append(button);
+    row.append(checkLabel, button);
+    historyList.append(row);
   }
   filterHistoryList();
   if (!items.length) {
@@ -169,6 +177,8 @@ function filterHistoryList() {
   const query = historyFilter.value.trim().toLowerCase();
   for (const item of historyList.querySelectorAll('button[data-peer-id]')) {
     item.hidden = !item.dataset.peerId.toLowerCase().includes(query);
+    const row = item.closest('.history-bundle-row');
+    if (row) row.hidden = item.hidden;
   }
 }
 
@@ -840,6 +850,27 @@ document.querySelector('#history-backup-export').addEventListener('click', async
   }
 });
 
+document.querySelector('#history-bundle-export').addEventListener('click', async () => {
+  const peerIds = [...historyList.querySelectorAll('input[data-bundle-peer-id]:checked')]
+    .map(input => input.dataset.bundlePeerId);
+  if (!peerIds.length) { message.textContent = '백업할 대화를 선택하세요.'; return; }
+  if (!window.confirm(`선택한 ${peerIds.length}개 대화를 암호화 백업으로 저장할까요?`)) return;
+  try {
+    const response = await request('/api/history/export-backup-bundle', JSON.stringify({ peerIds }));
+    if (response.status === 409) { message.textContent = '연결 중인 대화는 종료한 뒤 백업하세요.'; return; }
+    if (!response.ok) throw new Error('bundle export failed');
+    const binary = atob(await response.text());
+    const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'another-dimension-conversations.adbak';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    message.textContent = `${peerIds.length}개 대화의 암호화 백업을 저장했습니다.`;
+  } catch (_) { message.textContent = '대화 백업을 만들지 못했습니다.'; }
+});
+
 document.querySelector('#history-backup-import').addEventListener('click', async () => {
   const file = document.querySelector('#history-backup-file').files[0];
   const passwordField = document.querySelector('#history-backup-import-password');
@@ -873,8 +904,12 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     const result = await response.json();
     document.querySelector('#history-backup-file').value = '';
     await refreshHistoryList();
-    await openHistory(result.peerId);
-    message.textContent = '백업을 확인해 기존 기록과 병합했습니다.';
+    if (Array.isArray(result.conversations)) {
+      message.textContent = `${result.conversations.length}개 대화 백업을 기존 기록과 병합했습니다.`;
+    } else {
+      await openHistory(result.peerId);
+      message.textContent = '백업을 확인해 기존 기록과 병합했습니다.';
+    }
   } catch (_) {
     message.textContent = '백업 파일을 읽지 못했습니다.';
   } finally {

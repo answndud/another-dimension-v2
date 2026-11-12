@@ -24,6 +24,7 @@ const BACKUP_MAGIC: &[u8; 8] = b"ADBACK1\0";
 const BACKUP_PASSWORD_MAGIC: &[u8; 8] = b"ADBACK2\0";
 const BACKUP_COMBINED_MAGIC: &[u8; 8] = b"ADBACK3\0";
 const BACKUP_SIGNED_MAGIC: &[u8; 8] = b"ADBACK4\0";
+const BACKUP_BUNDLE_MAGIC: &[u8; 8] = b"ADPACK1\0";
 const TRANSFER_MAGIC: &[u8; 6] = b"ADREC1";
 const MESSAGE_MAGIC: &[u8; 6] = b"ADMSG1";
 const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
@@ -331,6 +332,99 @@ impl History {
     ) -> io::Result<Vec<u8>> {
         let (_, messages, _) = Self::open(identity, peer_id)?;
         encode_backup(identity, peer_id, &messages, password)
+    }
+
+    /// Bundle separately authenticated conversation backups. Each child stays
+    /// encrypted with the existing backup format, preserving import compatibility.
+    pub fn export_backup_bundle(identity: &Identity, peer_ids: &[String]) -> io::Result<Vec<u8>> {
+        if peer_ids.is_empty() || peer_ids.len() > 128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid conversation selection",
+            ));
+        }
+        let mut bundle = Vec::new();
+        bundle.extend_from_slice(BACKUP_BUNDLE_MAGIC);
+        bundle.extend_from_slice(&(peer_ids.len() as u32).to_be_bytes());
+        let mut unique = HashSet::new();
+        for peer_id in peer_ids {
+            validate_peer_id(peer_id)?;
+            if !unique.insert(peer_id.to_ascii_lowercase()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate conversation",
+                ));
+            }
+            let backup = Self::export_backup(identity, peer_id, None)?;
+            let backup_len = u32::try_from(backup.len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "backup is too large"))?;
+            if bundle.len().saturating_add(4 + backup.len()) > MAX_BACKUP_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "backup bundle is too large",
+                ));
+            }
+            bundle.extend_from_slice(&backup_len.to_be_bytes());
+            bundle.extend_from_slice(&backup);
+        }
+        Ok(bundle)
+    }
+
+    pub fn import_backup_bundle(
+        identity: &Identity,
+        bundle: &[u8],
+    ) -> io::Result<Vec<(String, usize)>> {
+        if bundle.len() > MAX_BACKUP_BYTES
+            || !bundle.starts_with(BACKUP_BUNDLE_MAGIC)
+            || bundle.len() < 12
+        {
+            return Err(invalid_data("invalid backup bundle"));
+        }
+        let count = u32::from_be_bytes(bundle[8..12].try_into().expect("fixed slice")) as usize;
+        if count == 0 || count > 128 {
+            return Err(invalid_data("invalid backup bundle count"));
+        }
+        let mut cursor = 12;
+        let mut entries = Vec::with_capacity(count);
+        let mut unique = HashSet::new();
+        for _ in 0..count {
+            if bundle.len().saturating_sub(cursor) < 4 {
+                return Err(invalid_data("truncated backup bundle"));
+            }
+            let len =
+                u32::from_be_bytes(bundle[cursor..cursor + 4].try_into().expect("fixed slice"))
+                    as usize;
+            cursor += 4;
+            if len > MAX_BACKUP_BYTES || bundle.len().saturating_sub(cursor) < len {
+                return Err(invalid_data("truncated backup bundle"));
+            }
+            let (peer_id, messages) = decode_backup(identity, &bundle[cursor..cursor + len], None)?;
+            if !unique.insert(peer_id.clone()) {
+                return Err(invalid_data("duplicate conversation in backup bundle"));
+            }
+            entries.push((peer_id, messages));
+            cursor += len;
+        }
+        if cursor != bundle.len() {
+            return Err(invalid_data("unexpected backup bundle data"));
+        }
+        // Validate every encrypted child before the first local history is changed.
+        let mut imported = Vec::with_capacity(entries.len());
+        cursor = 12;
+        for (peer_id, _) in entries {
+            let len =
+                u32::from_be_bytes(bundle[cursor..cursor + 4].try_into().expect("fixed slice"))
+                    as usize;
+            cursor += 4;
+            let (_, messages) = decode_backup(identity, &bundle[cursor..cursor + len], None)?;
+            cursor += len;
+            let (mut history, existing, _) = Self::open(identity, &peer_id)?;
+            let merged = merge_snapshot(existing, messages)?;
+            let count = merged.len();
+            history.replace(&merged)?;
+            imported.push((peer_id, count));
+        }
+        Ok(imported)
     }
 
     /// Re-encrypt an existing portable backup for a new identity without
@@ -986,6 +1080,18 @@ pub(crate) fn missing_restored(
     Ok(missing)
 }
 
+pub(crate) fn outside_time_range(
+    messages: &[StoredMessage],
+    start: u64,
+    end: u64,
+) -> Vec<StoredMessage> {
+    messages
+        .iter()
+        .filter(|item| item.unix_time < start || item.unix_time > end)
+        .cloned()
+        .collect()
+}
+
 fn message_signing_payload(unix_time: u64, text: &str, proof: &MessageProof) -> Vec<u8> {
     let mut payload = Vec::with_capacity(43 + 16 + 32 + 32 + text.len());
     payload.extend_from_slice(b"another-dimension-v2/chat-message/v1");
@@ -1547,6 +1653,58 @@ mod tests {
         let (_, messages, _) = History::open(&identity, &peer).unwrap();
         assert_eq!(messages, vec![legacy]);
         assert!(messages[0].proof.is_none());
+    }
+
+    #[test]
+    fn encrypted_bundle_exports_and_restores_multiple_conversations() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let first = "61".repeat(32);
+        let second = "62".repeat(32);
+        for (peer, text) in [
+            (&first, "first conversation"),
+            (&second, "second conversation"),
+        ] {
+            let (mut history, _, _) = History::open(&identity, peer).unwrap();
+            history.append(&message(1, text)).unwrap();
+        }
+        let bundle =
+            History::export_backup_bundle(&identity, &[first.clone(), second.clone()]).unwrap();
+        History::delete_conversation(&identity, &first).unwrap();
+        History::delete_conversation(&identity, &second).unwrap();
+        let restored = History::import_backup_bundle(&identity, &bundle).unwrap();
+        assert_eq!(restored, vec![(first.clone(), 1), (second.clone(), 1)]);
+        assert_eq!(
+            History::open(&identity, &first).unwrap().1[0].text,
+            "first conversation"
+        );
+        assert_eq!(
+            History::open(&identity, &second).unwrap().1[0].text,
+            "second conversation"
+        );
+
+        let mut corrupted = bundle.clone();
+        *corrupted.last_mut().unwrap() ^= 1;
+        assert!(History::import_backup_bundle(&identity, &corrupted).is_err());
+    }
+
+    #[test]
+    fn date_range_and_recent_retention_keep_their_boundary_messages() {
+        let messages = vec![
+            message(9, "before"),
+            message(10, "start"),
+            message(20, "end"),
+            message(21, "after"),
+        ];
+        assert_eq!(
+            super::outside_time_range(&messages, 10, 20),
+            vec![messages[0].clone(), messages[3].clone()]
+        );
+        // Recent retention removes the inclusive range 0..=cutoff.
+        assert_eq!(
+            super::outside_time_range(&messages, 0, 20),
+            vec![messages[3].clone()]
+        );
     }
 
     #[test]
