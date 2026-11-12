@@ -487,23 +487,40 @@ test('actual UI: history detail loads bounded pages and searches only the curren
 test('actual UI: stale history selection reports the reload requirement', async () => {
   const h = createHarness();
   h.window.confirm = () => true;
-  h.evaluate("selectedHistoryPeer = 'peer'; historyPageVersion = 'old-version'; selectedHistoryIndices.add(4)");
+  h.evaluate("identityId.textContent = 'identity-A'; selectedHistoryPeer = 'peer'; historyPageVersion = 'old-version'; selectedHistoryIndices.add(4)");
   const deletion = h.click('#delete-selected');
   await new Promise((resolve) => setImmediate(resolve));
   const request = h.requestFor('/api/history/delete-messages');
-  assert.equal(JSON.parse(request.init.body).version, 'old-version');
-  request.resolve(response('history changed; reload before applying selection', 409));
+  const payload = JSON.parse(request.init.body);
+  assert.equal(payload.version, 'old-version');
+  request.resolve(response(JSON.stringify({ operationId: payload.operationId }), 202));
   await deletion;
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/history/delete-status').resolve(response(JSON.stringify({
+    state: 'failed', error: 'history changed; reload before applying selection',
+  })));
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(h.element('#message').textContent, 'history changed; reload before applying selection');
 });
 
 test('actual UI: successful deletion reloads the detail page and clears stale selection', async () => {
   const h = createHarness();
   h.window.confirm = () => true;
-  h.evaluate("selectedHistoryPeer = 'peer'; historyPageVersion = 'v1'; selectedHistoryIndices.add(4)");
+  h.evaluate("identityId.textContent = 'identity-A'; selectedHistoryPeer = 'peer'; historyPageVersion = 'v1'; selectedHistoryIndices.add(4)");
   const deletion = h.click('#delete-selected');
   await new Promise((resolve) => setImmediate(resolve));
-  h.requestFor('/api/history/delete-messages').resolve(response('ok'));
+  const deleteRequest = h.requestFor('/api/history/delete-messages');
+  const requestBody = JSON.parse(deleteRequest.init.body);
+  assert.equal(requestBody.peerId, 'peer');
+  assert.equal(typeof requestBody.operationId, 'string');
+  deleteRequest.resolve(response(JSON.stringify({ operationId: requestBody.operationId }), 202));
+  await deletion;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.element('#delete-selected').disabled, true);
+  assert.equal(h.element('#message').textContent, '기록 삭제를 진행 중입니다. 완료 상태를 확인하고 있습니다.');
+  h.requestFor('/api/history/delete-status').resolve(response(JSON.stringify({
+    state: 'completed', peerId: 'peer', messageCount: 1, error: null,
+  })));
   await new Promise((resolve) => setImmediate(resolve));
   h.requestFor('/api/history/messages').resolve(response(JSON.stringify({
     version: 'v2', hasMore: false, nextCursor: null,
@@ -511,10 +528,39 @@ test('actual UI: successful deletion reloads the detail page and clears stale se
   })));
   await new Promise((resolve) => setImmediate(resolve));
   h.requestFor('/api/history/list').resolve(response('[]'));
-  await deletion;
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(h.evaluate('selectedHistoryIndices.size'), 0);
   assert.equal(h.evaluate('selectedHistoryMessages.length'), 1);
-  assert.equal(h.element('#message').textContent, '1개 메시지를 삭제했습니다.');
+  assert.equal(h.element('#message').textContent, '기록 삭제를 완료했습니다.');
+  assert.equal(h.element('#delete-selected').disabled, false);
+});
+
+test('actual UI: deletion result stays owner-scoped and can be checked again after identity switch', async () => {
+  const h = createHarness();
+  h.window.confirm = () => true;
+  h.evaluate("identityId.textContent = 'identity-A'; selectedHistoryPeer = 'peer'; historyPageVersion = 'v1'; selectedHistoryIndices.add(1)");
+  const deletion = h.click('#delete-selected');
+  await new Promise((resolve) => setImmediate(resolve));
+  const request = h.requestFor('/api/history/delete-messages');
+  const payload = JSON.parse(request.init.body);
+  request.resolve(response(JSON.stringify({ operationId: payload.operationId }), 202));
+  await deletion;
+  await new Promise((resolve) => setImmediate(resolve));
+  const firstStatus = h.requestFor('/api/history/delete-status');
+  h.evaluate("identityId.textContent = 'identity-B'");
+  firstStatus.resolve(response(JSON.stringify({ state: 'failed', error: 'private A result' })));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(h.evaluate(`sessionStorage.getItem('local-history-delete-jobs')`), /identity-A/);
+  h.evaluate("resumeHistoryDeletions('identity-B')");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.requests.filter((item) => item.path === '/api/history/delete-status').length, 1);
+  h.evaluate("identityId.textContent = 'identity-A'; resumeHistoryDeletions('identity-A')");
+  await new Promise((resolve) => setImmediate(resolve));
+  const resumed = h.requests.filter((item) => item.path === '/api/history/delete-status').at(-1);
+  resumed.resolve(response(JSON.stringify({ state: 'failed', error: 'retryable A error' })));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.element('#message').textContent, 'retryable A error');
+  assert.equal(h.evaluate("sessionStorage.getItem('local-history-delete-jobs')"), null);
 });
 
 test('actual UI: restore jobs reopen only for the identity that created them', async (t) => {

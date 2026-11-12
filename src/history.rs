@@ -4117,6 +4117,11 @@ pub(crate) fn set_test_data_directory(path: Option<PathBuf>) {
 }
 
 #[cfg(test)]
+pub(crate) fn test_data_directory() -> Option<PathBuf> {
+    TEST_DATA_DIRECTORY.with(|directory| directory.borrow().clone())
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         decode_peer_id, History, MessageSender, RestoreStaging, StoredMessage, MAX_BACKUP_BYTES,

@@ -41,6 +41,10 @@ const MAX_MERGE_PENDING_BYTES: usize = 1024 * 1024;
 const RESTORE_MERGE_SEND_REJECTION: &str =
     "기록 병합 중이라 메시지를 전송하지 않았습니다. 병합 완료 후 다시 보내세요.";
 
+#[cfg(test)]
+static TEST_HISTORY_DELETE_GATE: Mutex<Option<Arc<(Mutex<bool>, std::sync::Condvar)>>> =
+    Mutex::new(None);
+
 struct State {
     code: String,
     issued: Instant,
@@ -48,6 +52,8 @@ struct State {
     sessions: Vec<String>,
     identity: Option<Arc<Identity>>,
     chats: HashMap<String, Arc<ChatOperation>>,
+    history_deletions: HashMap<String, Arc<HistoryDeletionOperation>>,
+    active_history_deletions: HashSet<String>,
     tor_socks: Option<SocketAddr>,
     settings: AppSettings,
     notifications_enabled: Arc<AtomicBool>,
@@ -76,6 +82,31 @@ struct ChatOperation {
     message_reader: Mutex<Option<MessagePageReader>>,
     sender: Sender<ChatCommand>,
     cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HistoryDeletionAction {
+    Selected {
+        version: String,
+        indices: HashSet<usize>,
+    },
+    TimeRange {
+        start: u64,
+        end: u64,
+    },
+}
+
+struct HistoryDeletionOperation {
+    owner_identity_id: String,
+    peer_id: String,
+    request_body: String,
+    snapshot: Mutex<HistoryDeletionSnapshot>,
+}
+
+struct HistoryDeletionSnapshot {
+    state: &'static str,
+    message_count: Option<u64>,
+    error: Option<String>,
 }
 
 struct PendingMergeQueueNotice {
@@ -799,6 +830,54 @@ mod send_tests {
         response
     }
 
+    fn closed_test_operation(
+        owner: &str,
+        peer: &str,
+        count: usize,
+        epoch: u64,
+    ) -> Arc<ChatOperation> {
+        let (sender, _) = mpsc::channel();
+        Arc::new(ChatOperation {
+            owner_identity_id: owner.to_owned(),
+            history_state_lock: Mutex::new(()),
+            snapshot: Mutex::new(ChatSnapshot {
+                phase: "closed",
+                fingerprint: None,
+                peer_id: Some(peer.to_owned()),
+                error: None,
+                storage_error: None,
+                messages: vec![ChatEntry {
+                    unix_time: 1,
+                    sender: "나",
+                    text: "cached".to_owned(),
+                }],
+                message_count: count,
+                relay_ack: None,
+                pending_sends: 0,
+                identity_transition: None,
+                history_restore_in_progress: false,
+                history_restore_state: "idle",
+                history_restore_estimate_bytes: 0,
+                history_restore_cleanup_error: None,
+                history_restore_offer: Vec::new(),
+                history_restore_offer_count: 0,
+                history_restore_legacy_count: 0,
+                history_restore_received: 0,
+                history_restore_total: 0,
+                history_restore_status: None,
+                message_epoch: epoch,
+            }),
+            message_reader: Mutex::new(Some(MessagePageReader {
+                peer_id: peer.to_owned(),
+                epoch,
+                next_index: 0,
+                reader: history::HistoryReader::empty_for_test(File::open("/dev/null").unwrap()),
+            })),
+            sender,
+            cancelled: Arc::new(AtomicBool::new(true)),
+        })
+    }
+
     #[test]
     fn live_chat_rejects_unframed_text_without_waiting_for_history_lock() {
         let (alice, _) = Identity::create().unwrap();
@@ -1054,6 +1133,8 @@ mod send_tests {
             sessions: vec!["test-session".to_owned()],
             identity: Some(Arc::new(test_identity)),
             chats,
+            history_deletions: HashMap::new(),
+            active_history_deletions: HashSet::new(),
             tor_socks: None,
             settings: AppSettings::default(),
             notifications_enabled: Arc::new(AtomicBool::new(false)),
@@ -1185,6 +1266,8 @@ mod send_tests {
             sessions: vec!["test-session".to_owned()],
             identity: Some(Arc::new(identity_b)),
             chats,
+            history_deletions: HashMap::new(),
+            active_history_deletions: HashSet::new(),
             tor_socks: None,
             settings: AppSettings::default(),
             notifications_enabled: Arc::new(AtomicBool::new(false)),
@@ -1468,6 +1551,8 @@ mod send_tests {
             sessions: vec!["test-session".to_owned()],
             identity: Some(Arc::new(restored_identity)),
             chats: HashMap::from([("count-operation".to_owned(), Arc::clone(&operation))]),
+            history_deletions: HashMap::new(),
+            active_history_deletions: HashSet::new(),
             tor_socks: None,
             settings: AppSettings::default(),
             notifications_enabled: Arc::new(AtomicBool::new(false)),
@@ -1842,6 +1927,221 @@ mod send_tests {
         assert!(pending.contains("message"));
         assert!(rejected_message(&mut pending, "message"));
     }
+
+    #[test]
+    fn closed_history_updates_are_scoped_to_the_local_identity() {
+        let identity_a = "identity-a";
+        let identity_b = "identity-b";
+        let peer_id = "ab".repeat(32);
+        let operation_a = closed_test_operation(identity_a, &peer_id, 10, 3);
+        let operation_b = closed_test_operation(identity_b, &peer_id, 20, 7);
+        let state = State {
+            code: String::new(),
+            issued: Instant::now(),
+            attempts: 0,
+            sessions: Vec::new(),
+            identity: None,
+            chats: HashMap::from([
+                ("a".to_owned(), Arc::clone(&operation_a)),
+                ("b".to_owned(), Arc::clone(&operation_b)),
+            ]),
+            history_deletions: HashMap::new(),
+            active_history_deletions: HashSet::new(),
+            tor_socks: None,
+            settings: AppSettings::default(),
+            notifications_enabled: Arc::new(AtomicBool::new(false)),
+            last_notification: Arc::new(Mutex::new(None)),
+        };
+        update_closed_chat_history(&state, identity_a, &peer_id, 4);
+        let a = operation_a.snapshot.lock().unwrap();
+        assert_eq!(a.message_count, 4);
+        assert_eq!(a.message_epoch, 4);
+        assert!(a.messages.is_empty());
+        drop(a);
+        assert!(operation_a.message_reader.lock().unwrap().is_none());
+        let b = operation_b.snapshot.lock().unwrap();
+        assert_eq!(b.message_count, 20);
+        assert_eq!(b.message_epoch, 7);
+        assert_eq!(b.messages.len(), 1);
+        drop(b);
+        assert!(operation_b.message_reader.lock().unwrap().is_some());
+
+        update_closed_chat_history(&state, identity_b, &peer_id, 8);
+        assert_eq!(operation_a.snapshot.lock().unwrap().message_count, 4);
+        assert_eq!(operation_b.snapshot.lock().unwrap().message_count, 8);
+    }
+
+    #[test]
+    fn history_delete_runs_without_global_state_lock_and_remains_queryable_after_identity_switch() {
+        let _data = TestDataDirectory::new();
+        let (identity_a, code_a) = Identity::create().unwrap();
+        let (identity_b, code_b) = Identity::create().unwrap();
+        let peer_id = identity_b.public_id();
+        let (mut history, _, _) = history::History::open(&identity_a, &peer_id).unwrap();
+        history
+            .append(&history::StoredMessage {
+                unix_time: 1,
+                sender: history::MessageSender::Me,
+                text: "delete me".to_owned(),
+                proof: None,
+            })
+            .unwrap();
+        let version = history::History::read_page(&identity_a, &peer_id, None, 10)
+            .unwrap()
+            .version;
+        let operation_a = closed_test_operation(identity_a.public_id().as_str(), &peer_id, 1, 9);
+        let operation_b = closed_test_operation(identity_b.public_id().as_str(), &peer_id, 7, 12);
+        let state = Arc::new(Mutex::new(State {
+            code: String::new(),
+            issued: Instant::now(),
+            attempts: 0,
+            sessions: vec!["test-session".to_owned()],
+            identity: Some(Arc::new(Identity::from_code(&code_a).unwrap())),
+            chats: HashMap::from([
+                ("closed-a".to_owned(), Arc::clone(&operation_a)),
+                ("closed-b".to_owned(), Arc::clone(&operation_b)),
+            ]),
+            history_deletions: HashMap::new(),
+            active_history_deletions: HashSet::new(),
+            tor_socks: None,
+            settings: AppSettings::default(),
+            notifications_enabled: Arc::new(AtomicBool::new(false)),
+            last_notification: Arc::new(Mutex::new(None)),
+        }));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        *TEST_HISTORY_DELETE_GATE.lock().unwrap() = Some(Arc::clone(&gate));
+        let request_body = serde_json::json!({
+            "operationId": "test-delete-job-1",
+            "peerId": peer_id,
+            "version": version,
+            "indices": [0],
+        })
+        .to_string();
+        let accepted = call_test_api(
+            &state,
+            "/api/history/delete-messages",
+            &request_body,
+            "test-session",
+        );
+        assert!(accepted.starts_with("HTTP/1.1 202 Accepted"), "{accepted}");
+        assert!(history_delete_active(
+            &state.lock().unwrap(),
+            &identity_a.public_id(),
+            &peer_id,
+        ));
+
+        let state_for_probe = Arc::clone(&state);
+        let (probe_send, probe_receive) = mpsc::channel();
+        thread::spawn(move || {
+            let response = call_test_api(&state_for_probe, "/api/settings/get", "", "test-session");
+            let _ = probe_send.send(response);
+        });
+        assert!(probe_receive
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK"));
+
+        let reconnect = call_test_api(&state, "/api/chat/reconnect", &peer_id, "test-session");
+        assert!(reconnect.starts_with("HTTP/1.1 409 Conflict"));
+
+        state.lock().unwrap().identity = Some(Arc::new(Identity::from_code(&code_b).unwrap()));
+        let forbidden = call_test_api(
+            &state,
+            "/api/history/delete-status",
+            "test-delete-job-1",
+            "test-session",
+        );
+        assert!(forbidden.starts_with("HTTP/1.1 404 Not Found"));
+        {
+            let (released, changed) = &*gate;
+            *released.lock().unwrap() = true;
+            changed.notify_all();
+        }
+        *TEST_HISTORY_DELETE_GATE.lock().unwrap() = None;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let current = state.lock().unwrap();
+            let complete = current
+                .history_deletions
+                .get("test-delete-job-1")
+                .unwrap()
+                .snapshot
+                .lock()
+                .unwrap()
+                .state
+                == "completed";
+            if complete {
+                break;
+            }
+            drop(current);
+            assert!(
+                Instant::now() < deadline,
+                "deletion worker did not complete"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(operation_a.snapshot.lock().unwrap().message_count, 0);
+        assert_eq!(operation_a.snapshot.lock().unwrap().message_epoch, 10);
+        assert!(operation_a.message_reader.lock().unwrap().is_none());
+        assert_eq!(operation_b.snapshot.lock().unwrap().message_count, 7);
+        assert_eq!(operation_b.snapshot.lock().unwrap().message_epoch, 12);
+        assert!(operation_b.message_reader.lock().unwrap().is_some());
+        state.lock().unwrap().identity = Some(Arc::new(Identity::from_code(&code_a).unwrap()));
+        let completed = call_test_api(
+            &state,
+            "/api/history/delete-status",
+            "test-delete-job-1",
+            "test-session",
+        );
+        assert!(completed.starts_with("HTTP/1.1 200 OK"));
+        assert!(completed.contains("\"state\":\"completed\""));
+
+        let (mut current, _, _) = history::History::open(&identity_a, &peer_id).unwrap();
+        current
+            .append(&history::StoredMessage {
+                unix_time: 2,
+                sender: history::MessageSender::Me,
+                text: "newer record".to_owned(),
+                proof: None,
+            })
+            .unwrap();
+        let stale_request = serde_json::json!({
+            "operationId": "test-delete-job-stale",
+            "peerId": peer_id,
+            "version": version,
+            "indices": [0],
+        })
+        .to_string();
+        let stale_accepted = call_test_api(
+            &state,
+            "/api/history/delete-messages",
+            &stale_request,
+            "test-session",
+        );
+        assert!(stale_accepted.starts_with("HTTP/1.1 202 Accepted"));
+        let stale_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let current_state = state.lock().unwrap();
+            let status = current_state
+                .history_deletions
+                .get("test-delete-job-stale")
+                .unwrap()
+                .snapshot
+                .lock()
+                .unwrap();
+            if status.state == "failed" {
+                assert!(status.error.as_deref().unwrap().contains("history changed"));
+                break;
+            }
+            drop(status);
+            drop(current_state);
+            assert!(Instant::now() < stale_deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let still_present = history::History::read_page(&identity_a, &peer_id, None, 10).unwrap();
+        assert_eq!(still_present.entries.len(), 1);
+        assert_eq!(still_present.entries[0].message.text, "newer record");
+    }
 }
 
 fn mark_chat_disconnected(operation: &ChatOperation, reason: &str, delivery_unknown: bool) {
@@ -1915,6 +2215,7 @@ fn relay_failure_message(error: &RelayError, phase: &str, using_tor: bool) -> St
 
 fn spawn_chat_worker(
     operation: Arc<ChatOperation>,
+    state_handle: Arc<Mutex<State>>,
     commands: Receiver<ChatCommand>,
     role: RoleForChat,
     code: Zeroizing<String>,
@@ -1957,12 +2258,23 @@ fn spawn_chat_worker(
             let fingerprint = encode_hex(verification.fingerprint());
             let peer_key = *verification.peer_public_key();
             let peer_id = encode_hex(verification.peer_public_key());
-            chat_update(&operation, |snapshot| {
+            {
+                let state = state_handle
+                    .lock()
+                    .map_err(|_| "local state unavailable".to_owned())?;
+                if history_delete_active(&state, &identity.public_id(), &peer_id) {
+                    return Err("해당 대화 기록을 삭제 중입니다. 삭제가 끝난 뒤 다시 연결하세요.".to_owned());
+                }
+                let mut snapshot = operation
+                    .snapshot
+                    .lock()
+                    .map_err(|_| "chat state unavailable".to_owned())?;
                 snapshot.peer_id = Some(peer_id.clone());
-                if expected_peer.is_some() { return; }
-                snapshot.phase = "verification";
-                snapshot.fingerprint = Some(fingerprint);
-            });
+                if expected_peer.is_none() {
+                    snapshot.phase = "verification";
+                    snapshot.fingerprint = Some(fingerprint);
+                }
+            }
             let verification = if expected_peer.is_some() { verification } else { loop {
                 if operation.cancelled.load(Ordering::SeqCst) {
                     return Err("취소되었습니다.".to_owned());
@@ -3437,8 +3749,21 @@ fn respond_settings(stream: &mut TcpStream, state: &State) -> io::Result<()> {
     )
 }
 
-fn update_closed_chat_history(state: &State, peer_id: &str, message_count: u64) {
+fn conversation_history_key(identity_id: &str, peer_id: &str) -> String {
+    format!("{identity_id}:{}", peer_id.to_ascii_lowercase())
+}
+
+fn history_delete_active(state: &State, identity_id: &str, peer_id: &str) -> bool {
+    state
+        .active_history_deletions
+        .contains(&conversation_history_key(identity_id, peer_id))
+}
+
+fn update_closed_chat_history(state: &State, identity_id: &str, peer_id: &str, message_count: u64) {
     for operation in state.chats.values() {
+        if operation.owner_identity_id != identity_id {
+            continue;
+        }
         if let Ok(mut snapshot) = operation.snapshot.lock() {
             if snapshot
                 .peer_id
@@ -3449,9 +3774,136 @@ fn update_closed_chat_history(state: &State, peer_id: &str, message_count: u64) 
                 snapshot.messages.clear();
                 snapshot.message_count = message_count.min(usize::MAX as u64) as usize;
                 snapshot.message_epoch = snapshot.message_epoch.wrapping_add(1);
+                if let Ok(mut reader) = operation.message_reader.lock() {
+                    *reader = None;
+                }
             }
         }
     }
+}
+
+fn queue_history_deletion(
+    state: &mut State,
+    state_handle: Arc<Mutex<State>>,
+    operation_id: String,
+    request_body: String,
+    identity: Arc<Identity>,
+    peer_id: String,
+    action: HistoryDeletionAction,
+) -> Result<(), &'static str> {
+    let identity_id = identity.public_id().to_owned();
+    if let Some(existing) = state.history_deletions.get(&operation_id) {
+        return if existing.owner_identity_id == identity_id
+            && existing.peer_id.eq_ignore_ascii_case(&peer_id)
+            && existing.request_body == request_body
+        {
+            Ok(())
+        } else {
+            Err("deletion operation ID already exists")
+        };
+    }
+    let reservation_key = conversation_history_key(&identity_id, &peer_id);
+    if state.active_history_deletions.contains(&reservation_key) {
+        return Err("history deletion already in progress for this conversation");
+    }
+    if state.history_deletions.len() >= 256 {
+        let completed: Vec<_> = state
+            .history_deletions
+            .iter()
+            .filter_map(|(id, operation)| {
+                operation
+                    .snapshot
+                    .lock()
+                    .ok()
+                    .filter(|snapshot| matches!(snapshot.state, "completed" | "failed"))
+                    .map(|_| id.clone())
+            })
+            .take(state.history_deletions.len().saturating_sub(255))
+            .collect();
+        for id in completed {
+            state.history_deletions.remove(&id);
+        }
+        if state.history_deletions.len() >= 256 {
+            return Err("too many pending history deletion results");
+        }
+    }
+    let operation = Arc::new(HistoryDeletionOperation {
+        owner_identity_id: identity_id.clone(),
+        peer_id: peer_id.clone(),
+        request_body,
+        snapshot: Mutex::new(HistoryDeletionSnapshot {
+            state: "queued",
+            message_count: None,
+            error: None,
+        }),
+    });
+    state
+        .active_history_deletions
+        .insert(reservation_key.clone());
+    state
+        .history_deletions
+        .insert(operation_id, Arc::clone(&operation));
+    #[cfg(test)]
+    let test_data_directory = history::test_data_directory();
+    // Lock order: reserve under State, release State before history I/O, then
+    // reacquire State only after the conversation file lock has been released.
+    thread::spawn(move || {
+        #[cfg(test)]
+        if let Some(path) = test_data_directory {
+            history::set_test_data_directory(Some(path));
+        }
+        if let Ok(mut snapshot) = operation.snapshot.lock() {
+            snapshot.state = "running";
+        }
+        #[cfg(test)]
+        if let Ok(gate) = TEST_HISTORY_DELETE_GATE.lock() {
+            if let Some(gate) = gate.as_ref() {
+                let (released, changed) = &**gate;
+                let mut released = released.lock().expect("test deletion gate lock");
+                while !*released {
+                    released = changed.wait(released).expect("test deletion gate wait");
+                }
+            }
+        }
+        let result = match action {
+            HistoryDeletionAction::Selected { version, indices } => {
+                history::History::delete_indices_if_version(&identity, &peer_id, &version, &indices)
+            }
+            HistoryDeletionAction::TimeRange { start, end } => {
+                history::History::delete_time_range(&identity, &peer_id, start, end)
+            }
+        };
+        if let Ok(mut state) = state_handle.lock() {
+            match &result {
+                Ok(summary) => update_closed_chat_history(
+                    &state,
+                    &identity_id,
+                    &peer_id,
+                    summary.remaining_count,
+                ),
+                Err(_) => {}
+            }
+            state.active_history_deletions.remove(&reservation_key);
+            if let Ok(mut snapshot) = operation.snapshot.lock() {
+                match result {
+                    Ok(summary) => {
+                        snapshot.state = "completed";
+                        snapshot.message_count = Some(summary.remaining_count);
+                    }
+                    Err(error) => {
+                        snapshot.state = "failed";
+                        snapshot.error = Some(error.to_string());
+                    }
+                }
+            }
+        } else if let Ok(mut snapshot) = operation.snapshot.lock() {
+            snapshot.state = "failed";
+            snapshot.error = Some("history deletion result state unavailable".to_owned());
+        }
+        #[cfg(test)]
+        history::set_test_data_directory(None);
+    });
+    Ok(())
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -3754,6 +4206,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/history/messages HTTP/1.1"
             | "POST /api/history/delete-messages HTTP/1.1"
             | "POST /api/history/delete-range HTTP/1.1"
+            | "POST /api/history/delete-status HTTP/1.1"
             | "POST /api/history/delete-conversation HTTP/1.1"
             | "POST /api/history/export-backup HTTP/1.1"
             | "POST /api/history/export-backup-bundle HTTP/1.1"
@@ -3791,6 +4244,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         Ok(value) => value,
         Err(_) => return reject(&mut stream, "400 Bad Request"),
     };
+    let state_handle = Arc::clone(state);
     let mut state = state
         .lock()
         .map_err(|_| io::Error::other("state unavailable"))?;
@@ -3903,7 +4357,8 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         if state.identity.is_none() {
             return reject(&mut stream, "401 Unauthorized");
         }
-        if !body.is_empty() || any_chat_active(&state) {
+        if !body.is_empty() || any_chat_active(&state) || !state.active_history_deletions.is_empty()
+        {
             return reject(&mut stream, "409 Conflict");
         }
         let Some(current) = state.identity.as_ref() else {
@@ -3955,7 +4410,10 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             let Ok(peer) = history::decode_peer_id(body) else {
                 return reject(&mut stream, "400 Bad Request");
             };
-            if peer == identity.public_key() || peer_chat_active(&state, body) {
+            if peer == identity.public_key()
+                || peer_chat_active(&state, body)
+                || history_delete_active(&state, &identity.public_id(), body)
+            {
                 return reject(&mut stream, "409 Conflict");
             }
             let directory = history::data_directory()?
@@ -4029,6 +4487,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         drop(state);
         spawn_chat_worker(
             operation,
+            state_handle,
             receiver,
             role,
             code,
@@ -4408,7 +4867,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some(identity) = state.identity.as_ref() else {
             return reject(&mut stream, "401 Unauthorized");
         };
-        if any_chat_active(&state) {
+        if any_chat_active(&state) || !state.active_history_deletions.is_empty() {
             return reject(&mut stream, "409 Conflict");
         }
         if body.len() > 256 {
@@ -4545,8 +5004,35 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             serde_json::to_string(&payload)?.as_bytes(),
         );
     }
+    if first == "POST /api/history/delete-status HTTP/1.1" {
+        let Some(identity_id) = state.identity.as_ref().map(|identity| identity.public_id()) else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        let Some(operation) = state.history_deletions.get(body) else {
+            return reject(&mut stream, "404 Not Found");
+        };
+        if operation.owner_identity_id != identity_id {
+            return reject(&mut stream, "404 Not Found");
+        }
+        let Ok(snapshot) = operation.snapshot.lock() else {
+            return reject(&mut stream, "503 Service Unavailable");
+        };
+        let payload = serde_json::json!({
+            "state": snapshot.state,
+            "peerId": operation.peer_id,
+            "messageCount": snapshot.message_count,
+            "error": snapshot.error,
+        })
+        .to_string();
+        return respond(
+            &mut stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            payload.as_bytes(),
+        );
+    }
     if first == "POST /api/history/delete-messages HTTP/1.1" {
-        let Some(identity) = state.identity.as_ref() else {
+        let Some(identity) = state.identity.as_ref().cloned() else {
             return reject(&mut stream, "401 Unauthorized");
         };
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
@@ -4555,6 +5041,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some(peer_id) = payload.get("peerId").and_then(serde_json::Value::as_str) else {
             return reject(&mut stream, "400 Bad Request");
         };
+        if history::decode_peer_id(peer_id).is_err() {
+            return reject(&mut stream, "400 Bad Request");
+        }
         if peer_chat_active(&state, peer_id) {
             return respond(
                 &mut stream,
@@ -4579,77 +5068,110 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some(version) = payload.get("version").and_then(serde_json::Value::as_str) else {
             return reject(&mut stream, "400 Bad Request");
         };
-        let summary = match history::History::delete_indices_if_version(
-            identity, peer_id, version, &selected,
-        ) {
-            Ok(summary) => summary,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                return respond(
-                    &mut stream,
-                    "409 Conflict",
-                    "text/plain; charset=utf-8",
-                    b"history changed; reload before applying selection",
-                )
-            }
-            Err(error) => {
-                let status = if error.kind() == io::ErrorKind::InvalidInput {
-                    "400 Bad Request"
-                } else {
-                    "500 Internal Server Error"
-                };
-                return respond(
-                    &mut stream,
-                    status,
-                    "text/plain; charset=utf-8",
-                    error.to_string().as_bytes(),
-                );
-            }
+        let Some(operation_id) = payload
+            .get("operationId")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return reject(&mut stream, "400 Bad Request");
         };
-        update_closed_chat_history(&state, peer_id, summary.remaining_count);
-        return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
+        if operation_id.is_empty() || operation_id.len() > 128 {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        let request_body = body.to_owned();
+        let queued = queue_history_deletion(
+            &mut state,
+            Arc::clone(&state_handle),
+            operation_id.to_owned(),
+            request_body,
+            identity,
+            peer_id.to_owned(),
+            HistoryDeletionAction::Selected {
+                version: version.to_owned(),
+                indices: selected,
+            },
+        );
+        if let Err(error) = queued {
+            return respond(
+                &mut stream,
+                "409 Conflict",
+                "text/plain; charset=utf-8",
+                error.as_bytes(),
+            );
+        }
+        drop(state);
+        return respond(
+            &mut stream,
+            "202 Accepted",
+            "application/json; charset=utf-8",
+            serde_json::json!({"operationId": operation_id})
+                .to_string()
+                .as_bytes(),
+        );
     }
     if first == "POST /api/history/delete-range HTTP/1.1" {
-        let Some(identity) = state.identity.as_ref() else {
+        let Some(identity) = state.identity.as_ref().cloned() else {
             return reject(&mut stream, "401 Unauthorized");
         };
-        let mut parts = body.split('\n');
-        let peer_id = parts.next().unwrap_or("");
-        let (Some(start), Some(end)) = (parts.next(), parts.next()) else {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
             return reject(&mut stream, "400 Bad Request");
         };
-        if parts.next().is_some() || peer_chat_active(&state, peer_id) {
+        let (Some(peer_id), Some(operation_id), Some(start), Some(end)) = (
+            payload.get("peerId").and_then(serde_json::Value::as_str),
+            payload
+                .get("operationId")
+                .and_then(serde_json::Value::as_str),
+            payload.get("start").and_then(serde_json::Value::as_u64),
+            payload.get("end").and_then(serde_json::Value::as_u64),
+        ) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        if history::decode_peer_id(peer_id).is_err() {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        if operation_id.is_empty() || operation_id.len() > 128 {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        if peer_chat_active(&state, peer_id) {
             return reject(&mut stream, "409 Conflict");
         }
-        let (Ok(start), Ok(end)) = (start.parse::<u64>(), end.parse::<u64>()) else {
-            return reject(&mut stream, "400 Bad Request");
-        };
         if start > end {
             return reject(&mut stream, "400 Bad Request");
         }
-        let summary = match history::History::delete_time_range(identity, peer_id, start, end) {
-            Ok(summary) => summary,
-            Err(error) => {
-                let status = if error.kind() == io::ErrorKind::InvalidInput {
-                    "400 Bad Request"
-                } else {
-                    "500 Internal Server Error"
-                };
-                return respond(
-                    &mut stream,
-                    status,
-                    "text/plain; charset=utf-8",
-                    error.to_string().as_bytes(),
-                );
-            }
-        };
-        update_closed_chat_history(&state, peer_id, summary.remaining_count);
-        return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
+        let request_body = body.to_owned();
+        let queued = queue_history_deletion(
+            &mut state,
+            Arc::clone(&state_handle),
+            operation_id.to_owned(),
+            request_body,
+            identity,
+            peer_id.to_owned(),
+            HistoryDeletionAction::TimeRange { start, end },
+        );
+        if let Err(error) = queued {
+            return respond(
+                &mut stream,
+                "409 Conflict",
+                "text/plain; charset=utf-8",
+                error.as_bytes(),
+            );
+        }
+        drop(state);
+        return respond(
+            &mut stream,
+            "202 Accepted",
+            "application/json; charset=utf-8",
+            serde_json::json!({"operationId": operation_id})
+                .to_string()
+                .as_bytes(),
+        );
     }
     if first == "POST /api/history/delete-conversation HTTP/1.1" {
         let Some(identity) = state.identity.as_ref() else {
             return reject(&mut stream, "401 Unauthorized");
         };
-        if peer_chat_active(&state, body) {
+        if peer_chat_active(&state, body)
+            || history_delete_active(&state, &identity.public_id(), body)
+        {
             return reject(&mut stream, "409 Conflict");
         }
         if let Err(error) = history::History::delete_conversation(identity, body) {
@@ -4660,7 +5182,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 error.to_string().as_bytes(),
             );
         }
-        update_closed_chat_history(&state, body, 0);
+        update_closed_chat_history(&state, &identity.public_id(), body, 0);
         return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
     }
     if first == "POST /api/history/export-backup HTTP/1.1" {
@@ -4677,7 +5199,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             .get("password")
             .and_then(serde_json::Value::as_str)
             .filter(|password| !password.is_empty());
-        if peer_chat_active(&state, peer_id) {
+        if peer_chat_active(&state, peer_id)
+            || history_delete_active(&state, &identity.public_id(), peer_id)
+        {
             return reject(&mut stream, "409 Conflict");
         }
         let backup = match history::History::export_backup(identity, peer_id, password) {
@@ -4711,7 +5235,10 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         else {
             return reject(&mut stream, "400 Bad Request");
         };
-        if peer_ids.iter().any(|peer| peer_chat_active(&state, peer)) {
+        if peer_ids.iter().any(|peer| {
+            peer_chat_active(&state, peer)
+                || history_delete_active(&state, &identity.public_id(), peer)
+        }) {
             return reject(&mut stream, "409 Conflict");
         }
         let peer_ids: Vec<String> = peer_ids.into_iter().map(str::to_owned).collect();
@@ -4733,7 +5260,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some(identity) = state.identity.as_ref() else {
             return reject(&mut stream, "401 Unauthorized");
         };
-        if any_chat_active(&state) {
+        if any_chat_active(&state) || !state.active_history_deletions.is_empty() {
             return reject(&mut stream, "409 Conflict");
         }
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
@@ -4764,7 +5291,12 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 }
             };
             for (peer_id, message_count, _) in &restored {
-                update_closed_chat_history(&state, peer_id, *message_count as u64);
+                update_closed_chat_history(
+                    &state,
+                    &identity.public_id(),
+                    peer_id,
+                    *message_count as u64,
+                );
             }
             let payload = serde_json::json!({ "conversations": restored.iter().map(|(peer_id, count, linked)| serde_json::json!({ "peerId": peer_id, "messageCount": count, "linkedIdentityRestored": linked })).collect::<Vec<_>>() }).to_string();
             return respond(
@@ -4786,7 +5318,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                     )
                 }
             };
-        update_closed_chat_history(&state, &peer_id, count as u64);
+        update_closed_chat_history(&state, &identity.public_id(), &peer_id, count as u64);
         let payload = serde_json::json!({ "peerId": peer_id, "messageCount": count, "linkedIdentityRestored": linked }).to_string();
         return respond(
             &mut stream,
@@ -4964,6 +5496,8 @@ fn main() -> io::Result<()> {
         sessions: Vec::new(),
         identity: None,
         chats: HashMap::new(),
+        history_deletions: HashMap::new(),
+        active_history_deletions: HashSet::new(),
         tor_socks,
         settings,
         notifications_enabled,

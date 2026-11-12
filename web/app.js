@@ -28,6 +28,7 @@ const message = document.querySelector('#message');
 const sessionKey = 'local-bridge-session';
 const operationKey = 'local-chat-operation';
 const restoreJobKey = 'local-history-restore-job';
+const historyDeleteJobKey = 'local-history-delete-jobs';
 let token = sessionStorage.getItem(sessionKey);
 let currentInvite = '';
 let operationId = null;
@@ -44,6 +45,7 @@ let selectedHistoryIndices = new Set();
 let historyCursorStack = [null];
 let historyNextCursor = null;
 let historyPageVersion = null;
+const historyDeletionPollers = new Set();
 const historyPageSize = 50;
 let verifiedPeers = new Set();
 let reprotectSourceHandle = null;
@@ -111,11 +113,13 @@ async function refreshIdentity() {
     conversation.replaceChildren();
     chatStatus.textContent = '';
     document.querySelector('#history-restore-panel').hidden = true;
+    setHistoryDeletionBusy(false);
   }
   identityId.textContent = currentIdentityId;
   await refreshNetworkSettings();
   show('active');
   await refreshHistoryList();
+  resumeHistoryDeletions(currentIdentityId);
   const savedJob = getRestoreJob(currentIdentityId);
   if (savedJob && typeof savedJob.operationId === 'string') {
     if (sessionStorage.getItem(operationKey) !== savedJob.operationId) {
@@ -158,6 +162,103 @@ function forgetRestoreJob(ownerIdentityId, expectedOperationId = null) {
   delete jobs[ownerIdentityId];
   if (Object.keys(jobs).length) sessionStorage.setItem(restoreJobKey, JSON.stringify({ jobs }));
   else sessionStorage.removeItem(restoreJobKey);
+}
+
+function readHistoryDeletionJobs() {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(historyDeleteJobKey) || '{}');
+    return value && value.jobs && typeof value.jobs === 'object' ? value.jobs : {};
+  } catch (_) { return {}; }
+}
+
+function rememberHistoryDeletion(job) {
+  const jobs = readHistoryDeletionJobs();
+  const ownerJobs = Array.isArray(jobs[job.identityId]) ? jobs[job.identityId] : [];
+  if (!ownerJobs.some((item) => item.operationId === job.operationId)) ownerJobs.push(job);
+  jobs[job.identityId] = ownerJobs;
+  sessionStorage.setItem(historyDeleteJobKey, JSON.stringify({ jobs }));
+}
+
+function forgetHistoryDeletion(ownerIdentityId, operationId) {
+  const jobs = readHistoryDeletionJobs();
+  const remaining = (Array.isArray(jobs[ownerIdentityId]) ? jobs[ownerIdentityId] : [])
+    .filter((job) => job.operationId !== operationId);
+  if (remaining.length) jobs[ownerIdentityId] = remaining;
+  else delete jobs[ownerIdentityId];
+  if (Object.keys(jobs).length) sessionStorage.setItem(historyDeleteJobKey, JSON.stringify({ jobs }));
+  else sessionStorage.removeItem(historyDeleteJobKey);
+}
+
+function setHistoryDeletionBusy(busy) {
+  for (const selector of ['#delete-selected', '#delete-range', '#keep-recent', '#delete-conversation']) {
+    document.querySelector(selector).disabled = busy;
+  }
+}
+
+function newHistoryDeletionId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function resumeHistoryDeletions(ownerIdentityId) {
+  const jobs = readHistoryDeletionJobs();
+  for (const job of Array.isArray(jobs[ownerIdentityId]) ? jobs[ownerIdentityId] : []) {
+    pollHistoryDeletion(job);
+  }
+}
+
+async function pollHistoryDeletion(job) {
+  const pollerKey = `${job.identityId}:${job.operationId}`;
+  if (historyDeletionPollers.has(pollerKey)) return;
+  historyDeletionPollers.add(pollerKey);
+  if (identityId.textContent.trim() === job.identityId) {
+    setHistoryDeletionBusy(true);
+    message.textContent = '기록 삭제를 진행 중입니다. 완료 상태를 확인하고 있습니다.';
+  }
+  try {
+    while (identityId.textContent.trim() === job.identityId) {
+      let response;
+      try {
+        response = await request('/api/history/delete-status', job.operationId);
+      } catch (_) {
+        if (identityId.textContent.trim() !== job.identityId) return;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        continue;
+      }
+      if (identityId.textContent.trim() !== job.identityId) return;
+      if (response.status === 404) {
+        forgetHistoryDeletion(job.identityId, job.operationId);
+        message.textContent = '삭제 작업 결과를 찾을 수 없습니다. 프로그램이 재시작됐거나 작업이 만료됐을 수 있습니다.';
+        break;
+      }
+      if (!response.ok) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        continue;
+      }
+      const snapshot = await response.json();
+      if (identityId.textContent.trim() !== job.identityId) return;
+      if (snapshot.state === 'queued' || snapshot.state === 'running') {
+        message.textContent = '기록 삭제를 진행 중입니다. 다른 대화 작업은 계속 사용할 수 있습니다.';
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        continue;
+      }
+      forgetHistoryDeletion(job.identityId, job.operationId);
+      if (snapshot.state === 'completed') {
+        if (selectedHistoryPeer.toLowerCase() === job.peerId.toLowerCase()) await reloadHistoryDetail();
+        if (identityId.textContent.trim() === job.identityId) {
+          message.textContent = '기록 삭제를 완료했습니다.';
+        }
+      } else {
+        message.textContent = snapshot.error || '기록을 삭제하지 못했습니다. 기록은 보존되었습니다.';
+      }
+      break;
+    }
+  } finally {
+    historyDeletionPollers.delete(pollerKey);
+    if (identityId.textContent.trim() === job.identityId) {
+      const remaining = readHistoryDeletionJobs()[job.identityId] || [];
+      setHistoryDeletionBusy(remaining.length > 0);
+    }
+  }
 }
 
 async function refreshNetworkSettings() {
@@ -300,11 +401,14 @@ async function openHistory(peerId) {
 }
 
 async function loadHistoryPage(cursor) {
+  const requestedIdentityId = identityId.textContent.trim();
+  const requestedPeerId = selectedHistoryPeer;
   const response = await request('/api/history/messages', JSON.stringify({
-    peerId: selectedHistoryPeer,
+    peerId: requestedPeerId,
     cursor,
     limit: historyPageSize,
   }));
+  if (identityId.textContent.trim() !== requestedIdentityId || selectedHistoryPeer !== requestedPeerId) return false;
   if (response.status === 409) {
     message.textContent = '기록이 바뀌어 선택을 적용할 수 없습니다. 다시 불러와 선택을 갱신하세요.';
     document.querySelector('#history-page-reload').disabled = false;
@@ -312,6 +416,7 @@ async function loadHistoryPage(cursor) {
   }
   if (!response.ok) { message.textContent = '대화 기록을 열지 못했습니다.'; return false; }
   const page = await response.json();
+  if (identityId.textContent.trim() !== requestedIdentityId || selectedHistoryPeer !== requestedPeerId) return false;
   selectedHistoryMessages = page.messages;
   historyPageVersion = page.version;
   historyNextCursor = page.nextCursor;
@@ -737,6 +842,7 @@ document.querySelector('#logout').addEventListener('click', async () => {
     sessionStorage.removeItem(operationKey);
     latestChatSnapshot = null;
     identityId.textContent = '';
+    setHistoryDeletionBusy(false);
     selectedHistoryPeer = '';
     selectedHistoryMessages = [];
     historySummaries = [];
@@ -1300,40 +1406,47 @@ async function reloadHistoryDetail() {
   return true;
 }
 
+async function submitHistoryDeletion(path, payload, peerId) {
+  const ownerIdentityId = identityId.textContent.trim();
+  if (!ownerIdentityId) return;
+  const job = { operationId: newHistoryDeletionId(), identityId: ownerIdentityId, peerId };
+  rememberHistoryDeletion(job);
+  setHistoryDeletionBusy(true);
+  message.textContent = '기록 삭제를 시작하고 있습니다.';
+  try {
+    const response = await request(path, JSON.stringify({ ...payload, operationId: job.operationId }));
+    if (identityId.textContent.trim() !== ownerIdentityId) return;
+    if (response.status !== 202) {
+      forgetHistoryDeletion(ownerIdentityId, job.operationId);
+      setHistoryDeletionBusy((readHistoryDeletionJobs()[ownerIdentityId] || []).length > 0);
+      message.textContent = (await response.text()) || '기록 삭제 요청이 거부됐습니다.';
+      return;
+    }
+    pollHistoryDeletion(job);
+  } catch (_) {
+    if (identityId.textContent.trim() === ownerIdentityId) {
+      message.textContent = '요청 응답을 받지 못했습니다. 실제 처리 여부를 상태에서 확인하고 있습니다.';
+      pollHistoryDeletion(job);
+    }
+  }
+}
+
 async function deleteHistoryRange(start, end, prompt) {
   if (!selectedHistoryPeer || !window.confirm(prompt)) return;
-  const response = await request('/api/history/delete-range', `${selectedHistoryPeer}\n${start}\n${end}`);
-  if (response.status === 409) {
-    message.textContent = '먼저 해당 대화의 연결을 종료한 뒤 다시 시도하세요.';
-    return;
-  }
-  if (!response.ok) { message.textContent = (await response.text()) || '기록을 삭제하지 못했습니다.'; return; }
-  if (!(await reloadHistoryDetail())) {
-    message.textContent = '삭제는 완료했지만 기록 화면을 다시 불러오지 못했습니다. 새로 불러와 확인하세요.';
-    return;
-  }
-  message.textContent = '선택한 기간의 기록을 삭제했습니다.';
+  await submitHistoryDeletion('/api/history/delete-range', {
+    peerId: selectedHistoryPeer, start, end,
+  }, selectedHistoryPeer);
 }
 
 document.querySelector('#delete-selected').addEventListener('click', async () => {
   if (!selectedHistoryIndices.size) return;
   const count = selectedHistoryIndices.size;
   if (!window.confirm(`선택한 메시지 ${count}개를 이 기기에서 삭제할까요?`)) return;
-  const response = await request('/api/history/delete-messages', JSON.stringify({
+  await submitHistoryDeletion('/api/history/delete-messages', {
     peerId: selectedHistoryPeer,
     version: historyPageVersion,
-    indices: [...selectedHistoryIndices]
-  }));
-  if (response.status === 409) {
-    message.textContent = (await response.text()) || '기록이 바뀌어 선택을 적용하지 않았습니다. 다시 불러와 선택을 갱신하세요.';
-    return;
-  }
-  if (!response.ok) { message.textContent = (await response.text()) || '기록을 삭제하지 못했습니다.'; return; }
-  if (!(await reloadHistoryDetail())) {
-    message.textContent = '삭제는 완료했지만 기록 화면을 다시 불러오지 못했습니다. 새로 불러와 확인하세요.';
-    return;
-  }
-  message.textContent = `${count}개 메시지를 삭제했습니다.`;
+    indices: [...selectedHistoryIndices],
+  }, selectedHistoryPeer);
 });
 
 document.querySelector('#delete-range').addEventListener('click', async () => {
