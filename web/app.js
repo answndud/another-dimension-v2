@@ -282,20 +282,24 @@ async function refreshNetworkSettings() {
 }
 
 async function refreshHistoryList() {
+  const requestedIdentityId = identityId.textContent.trim();
   historyList.replaceChildren();
   historySummaries = [];
   let items;
   try {
     const response = await request('/api/history/list');
+    if (identityId.textContent.trim() !== requestedIdentityId) return;
     if (!response.ok) throw new Error('history list unavailable');
     items = await response.json();
   } catch (_) {
+    if (identityId.textContent.trim() !== requestedIdentityId) return;
     const error = document.createElement('p');
     error.className = 'meta';
     error.textContent = '대화 기록 목록을 불러오지 못했습니다.';
     historyList.append(error);
     return;
   }
+  if (identityId.textContent.trim() !== requestedIdentityId) return;
   historySummaries = items;
   verifiedPeers = new Set(items.filter(item => item.verified).map(item => item.peerId));
   for (const item of items) {

@@ -38,6 +38,10 @@ const BACKUP_SALT_BYTES: usize = 16;
 pub(crate) const IDENTITY_EVENT_PREFIX: &str = "[AD2-IDENTITY-EVENT/1] ";
 static INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CONVERSATION_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+#[cfg(test)]
+pub(crate) type HistoryDeleteTestGate = Arc<(Mutex<(bool, bool)>, std::sync::Condvar)>;
+#[cfg(test)]
+static HISTORY_DELETE_TEST_GATE: Mutex<Option<HistoryDeleteTestGate>> = Mutex::new(None);
 const RESTORE_SORT_RUN_RECORDS: usize = 512;
 const RESTORE_SORT_RUN_BYTES: usize = 2 * 1024 * 1024;
 const RESTORE_MERGE_FAN_IN: usize = 16;
@@ -1064,6 +1068,8 @@ impl History {
         mut keep: impl FnMut(u64, &StoredMessage) -> bool,
         validate: impl FnOnce(u64) -> io::Result<()>,
     ) -> io::Result<HistoryDeleteSummary> {
+        #[cfg(test)]
+        wait_history_delete_test_gate();
         let suffix = hex_encode(&random_nonce()?);
         let filename = self
             .path
@@ -4119,6 +4125,24 @@ pub(crate) fn set_test_data_directory(path: Option<PathBuf>) {
 #[cfg(test)]
 pub(crate) fn test_data_directory() -> Option<PathBuf> {
     TEST_DATA_DIRECTORY.with(|directory| directory.borrow().clone())
+}
+
+#[cfg(test)]
+pub(crate) fn set_history_delete_test_gate(gate: Option<HistoryDeleteTestGate>) {
+    *HISTORY_DELETE_TEST_GATE.lock().unwrap() = gate;
+}
+
+#[cfg(test)]
+fn wait_history_delete_test_gate() {
+    let gate = HISTORY_DELETE_TEST_GATE.lock().unwrap().clone();
+    let Some(gate) = gate else { return };
+    let (state, changed) = &*gate;
+    let mut state = state.lock().unwrap();
+    state.0 = true;
+    changed.notify_all();
+    while !state.1 {
+        state = changed.wait(state).unwrap();
+    }
 }
 
 #[cfg(test)]

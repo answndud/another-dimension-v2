@@ -41,10 +41,6 @@ const MAX_MERGE_PENDING_BYTES: usize = 1024 * 1024;
 const RESTORE_MERGE_SEND_REJECTION: &str =
     "기록 병합 중이라 메시지를 전송하지 않았습니다. 병합 완료 후 다시 보내세요.";
 
-#[cfg(test)]
-static TEST_HISTORY_DELETE_GATE: Mutex<Option<Arc<(Mutex<bool>, std::sync::Condvar)>>> =
-    Mutex::new(None);
-
 struct State {
     code: String,
     issued: Instant,
@@ -1991,6 +1987,7 @@ mod send_tests {
             .version;
         let operation_a = closed_test_operation(identity_a.public_id().as_str(), &peer_id, 1, 9);
         let operation_b = closed_test_operation(identity_b.public_id().as_str(), &peer_id, 7, 12);
+        operation_a.message_reader.lock().unwrap().take();
         let state = Arc::new(Mutex::new(State {
             code: String::new(),
             issued: Instant::now(),
@@ -2008,8 +2005,8 @@ mod send_tests {
             notifications_enabled: Arc::new(AtomicBool::new(false)),
             last_notification: Arc::new(Mutex::new(None)),
         }));
-        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        *TEST_HISTORY_DELETE_GATE.lock().unwrap() = Some(Arc::clone(&gate));
+        let gate = Arc::new((Mutex::new((false, false)), std::sync::Condvar::new()));
+        history::set_history_delete_test_gate(Some(Arc::clone(&gate)));
         let request_body = serde_json::json!({
             "operationId": "test-delete-job-1",
             "peerId": peer_id,
@@ -2024,40 +2021,151 @@ mod send_tests {
             "test-session",
         );
         assert!(accepted.starts_with("HTTP/1.1 202 Accepted"), "{accepted}");
+        let (gate_state, gate_changed) = &*gate;
+        let gate_deadline = Instant::now() + Duration::from_secs(2);
+        let mut gate_state = gate_state.lock().unwrap();
+        while !gate_state.0 {
+            let remaining = gate_deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "delete did not reach the locked rewrite gate"
+            );
+            let (next, timeout) = gate_changed.wait_timeout(gate_state, remaining).unwrap();
+            gate_state = next;
+            assert!(
+                !timeout.timed_out() || gate_state.0,
+                "delete did not reach the locked rewrite gate"
+            );
+        }
+        drop(gate_state);
         assert!(history_delete_active(
             &state.lock().unwrap(),
             &identity_a.public_id(),
             &peer_id,
         ));
 
+        let data_directory = _data.0.clone();
+        let state_for_list = Arc::clone(&state);
+        let list_data_directory = data_directory.clone();
+        let (list_started_send, list_started_receive) = mpsc::channel();
+        let (list_done_send, list_done_receive) = mpsc::channel();
+        let list_worker = thread::spawn(move || {
+            history::set_test_data_directory(Some(list_data_directory));
+            list_started_send.send(()).unwrap();
+            let response = call_test_api(&state_for_list, "/api/history/list", "", "test-session");
+            history::set_test_data_directory(None);
+            list_done_send.send(response).unwrap();
+        });
+        let state_for_page = Arc::clone(&state);
+        let page_data_directory = data_directory;
+        let (page_started_send, page_started_receive) = mpsc::channel();
+        let (page_done_send, page_done_receive) = mpsc::channel();
+        let page_body =
+            serde_json::json!({"peerId": peer_id, "cursor": null, "limit": 50}).to_string();
+        let page_worker = thread::spawn(move || {
+            history::set_test_data_directory(Some(page_data_directory));
+            page_started_send.send(()).unwrap();
+            let response = call_test_api(
+                &state_for_page,
+                "/api/history/messages",
+                &page_body,
+                "test-session",
+            );
+            history::set_test_data_directory(None);
+            page_done_send.send(response).unwrap();
+        });
+        let state_for_chat_messages = Arc::clone(&state);
+        let chat_messages_data_directory = _data.0.clone();
+        let (chat_messages_started_send, chat_messages_started_receive) = mpsc::channel();
+        let (chat_messages_done_send, chat_messages_done_receive) = mpsc::channel();
+        let chat_messages_worker = thread::spawn(move || {
+            history::set_test_data_directory(Some(chat_messages_data_directory));
+            chat_messages_started_send.send(()).unwrap();
+            let response = call_test_api(
+                &state_for_chat_messages,
+                "/api/chat/messages",
+                "closed-a\n0",
+                "test-session",
+            );
+            history::set_test_data_directory(None);
+            chat_messages_done_send.send(response).unwrap();
+        });
+        list_started_receive
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        page_started_receive
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        chat_messages_started_receive
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        thread::sleep(Duration::from_millis(30));
+        assert!(list_done_receive.try_recv().is_err());
+        assert!(page_done_receive.try_recv().is_err());
+        assert!(chat_messages_done_receive.try_recv().is_err());
         let state_for_probe = Arc::clone(&state);
         let (probe_send, probe_receive) = mpsc::channel();
-        thread::spawn(move || {
+        let probe_worker = thread::spawn(move || {
             let response = call_test_api(&state_for_probe, "/api/settings/get", "", "test-session");
             let _ = probe_send.send(response);
         });
-        assert!(probe_receive
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
-            .starts_with("HTTP/1.1 200 OK"));
-
-        let reconnect = call_test_api(&state, "/api/chat/reconnect", &peer_id, "test-session");
-        assert!(reconnect.starts_with("HTTP/1.1 409 Conflict"));
-
-        state.lock().unwrap().identity = Some(Arc::new(Identity::from_code(&code_b).unwrap()));
-        let forbidden = call_test_api(
-            &state,
-            "/api/history/delete-status",
-            "test-delete-job-1",
-            "test-session",
-        );
-        assert!(forbidden.starts_with("HTTP/1.1 404 Not Found"));
+        let probe_response = probe_receive.recv_timeout(Duration::from_millis(500)).ok();
+        let probe_was_immediate = probe_response.is_some();
+        if probe_response.is_some() {
+            let reconnect = call_test_api(&state, "/api/chat/reconnect", &peer_id, "test-session");
+            assert!(reconnect.starts_with("HTTP/1.1 409 Conflict"));
+            state.lock().unwrap().identity = Some(Arc::new(Identity::from_code(&code_b).unwrap()));
+            let forbidden = call_test_api(
+                &state,
+                "/api/history/delete-status",
+                "test-delete-job-1",
+                "test-session",
+            );
+            assert!(forbidden.starts_with("HTTP/1.1 404 Not Found"));
+        }
         {
-            let (released, changed) = &*gate;
-            *released.lock().unwrap() = true;
+            let (gate_state, changed) = &*gate;
+            gate_state.lock().unwrap().1 = true;
             changed.notify_all();
         }
-        *TEST_HISTORY_DELETE_GATE.lock().unwrap() = None;
+        history::set_history_delete_test_gate(None);
+        let probe_response =
+            probe_response.or_else(|| probe_receive.recv_timeout(Duration::from_secs(2)).ok());
+        let list_response = list_done_receive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let page_response = page_done_receive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let chat_messages_response = chat_messages_done_receive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        probe_worker.join().unwrap();
+        list_worker.join().unwrap();
+        page_worker.join().unwrap();
+        chat_messages_worker.join().unwrap();
+        assert!(probe_response
+            .as_deref()
+            .is_some_and(|response| response.starts_with("HTTP/1.1 200 OK")));
+        assert!(
+            probe_was_immediate,
+            "unrelated API waited for history file lock"
+        );
+        assert!(
+            list_response.starts_with("HTTP/1.1 200 OK"),
+            "{list_response}"
+        );
+        assert!(list_response.contains("\"messageCount\":0"));
+        assert!(
+            page_response.starts_with("HTTP/1.1 200 OK"),
+            "{page_response}"
+        );
+        assert!(page_response.contains("\"messages\":[]"));
+        assert!(
+            chat_messages_response.starts_with("HTTP/1.1 200 OK"),
+            "{chat_messages_response}"
+        );
+        assert!(chat_messages_response.contains("[]"));
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let current = state.lock().unwrap();
@@ -3855,16 +3963,6 @@ fn queue_history_deletion(
         if let Ok(mut snapshot) = operation.snapshot.lock() {
             snapshot.state = "running";
         }
-        #[cfg(test)]
-        if let Ok(gate) = TEST_HISTORY_DELETE_GATE.lock() {
-            if let Some(gate) = gate.as_ref() {
-                let (released, changed) = &**gate;
-                let mut released = released.lock().expect("test deletion gate lock");
-                while !*released {
-                    released = changed.wait(released).expect("test deletion gate wait");
-                }
-            }
-        }
         let result = match action {
             HistoryDeletionAction::Selected { version, indices } => {
                 history::History::delete_indices_if_version(&identity, &peer_id, &version, &indices)
@@ -4785,9 +4883,10 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Ok(cursor) = cursor.parse::<usize>() else {
             return reject(&mut stream, "400 Bad Request");
         };
-        let Some(operation) = owned_chat_operation(&state, operation_id) else {
+        let Some(operation) = owned_chat_operation(&state, operation_id).cloned() else {
             return reject(&mut stream, "404 Not Found");
         };
+        let identity = state.identity.as_ref().cloned();
         let Ok(snapshot) = operation.snapshot.lock() else {
             return reject(&mut stream, "503 Service Unavailable");
         };
@@ -4802,8 +4901,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             .cloned()
             .collect::<Vec<_>>();
         drop(snapshot);
+        drop(state);
         let messages: Vec<_> = if let (Some(identity), Some(peer_id)) =
-            (state.identity.as_ref().cloned(), peer_id.as_deref())
+            (identity, peer_id.as_deref())
         {
             let Ok(mut reader_state) = operation.message_reader.lock() else {
                 return reject(&mut stream, "503 Service Unavailable");
@@ -4898,17 +4998,18 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         );
     }
     if first == "POST /api/history/list HTTP/1.1" {
-        let Some(identity) = state.identity.as_ref() else {
+        let Some(identity) = state.identity.as_ref().cloned() else {
             return reject(&mut stream, "401 Unauthorized");
         };
-        let summaries = match history::History::list(identity) {
+        drop(state);
+        let summaries = match history::History::list(&identity) {
             Ok(summaries) => summaries,
             Err(_) => return reject(&mut stream, "500 Internal Server Error"),
         };
         let directory = history::data_directory()?
             .join(identity.public_id())
             .join("verified-contacts");
-        let verified: HashSet<_> = match contacts::list_known(&directory, identity) {
+        let verified: HashSet<_> = match contacts::list_known(&directory, &identity) {
             Ok(contacts) => contacts
                 .into_iter()
                 .map(|contact| encode_hex(&contact.peer_key))
@@ -4934,7 +5035,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         );
     }
     if first == "POST /api/history/messages HTTP/1.1" {
-        let Some(identity) = state.identity.as_ref() else {
+        let Some(identity) = state.identity.as_ref().cloned() else {
             return reject(&mut stream, "401 Unauthorized");
         };
         let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
@@ -4972,7 +5073,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 })
             }
         };
-        let page = match history::History::read_page(identity, peer_id, cursor.as_ref(), limit) {
+        let peer_id = peer_id.to_owned();
+        drop(state);
+        let page = match history::History::read_page(&identity, &peer_id, cursor.as_ref(), limit) {
             Ok(page) => page,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 return reject(&mut stream, "409 Conflict")
