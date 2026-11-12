@@ -67,6 +67,7 @@ enum ChatCommand {
 
 struct ChatOperation {
     owner_identity_id: String,
+    history_state_lock: Mutex<()>,
     snapshot: Mutex<ChatSnapshot>,
     message_reader: Mutex<Option<MessagePageReader>>,
     sender: Sender<ChatCommand>,
@@ -686,6 +687,7 @@ mod send_tests {
     fn restore_merge_acceptance_is_async_idempotent_and_reports_final_state() {
         let operation = Arc::new(ChatOperation {
             owner_identity_id: "test-identity".to_owned(),
+            history_state_lock: Mutex::new(()),
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connected",
                 fingerprint: None,
@@ -755,9 +757,12 @@ mod send_tests {
 
     #[test]
     fn restore_merge_api_returns_202_without_waiting_and_status_reports_completion() {
+        let (test_identity, _) = Identity::create().unwrap();
+        let owner_identity_id = test_identity.public_id().to_owned();
         let (command_sender, command_receiver) = mpsc::channel();
         let operation = Arc::new(ChatOperation {
-            owner_identity_id: "test-identity".to_owned(),
+            owner_identity_id,
+            history_state_lock: Mutex::new(()),
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connected",
                 fingerprint: None,
@@ -792,7 +797,7 @@ mod send_tests {
             issued: Instant::now(),
             attempts: 0,
             sessions: vec!["test-session".to_owned()],
-            identity: None,
+            identity: Some(Arc::new(test_identity)),
             chats,
             tor_socks: None,
             settings: AppSettings::default(),
@@ -879,6 +884,7 @@ mod send_tests {
         let peer_id = "7a".repeat(32);
         let operation = Arc::new(ChatOperation {
             owner_identity_id: owner_id.clone(),
+            history_state_lock: Mutex::new(()),
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connected",
                 fingerprint: None,
@@ -978,6 +984,184 @@ mod send_tests {
         );
         assert!(owner_status.starts_with("HTTP/1.1 200 OK"));
         assert!(owner_status.contains("private preview"));
+    }
+
+    #[test]
+    fn restore_merge_serializes_snapshot_count_with_pre_and_post_replace_appends() {
+        let data = TestDataDirectory::new();
+        let (identity, access_code) = Identity::create().unwrap();
+        let code = access_code.to_string();
+        let owner_id = identity.public_id().to_owned();
+        let peer_id = "8b".repeat(32);
+        let (mut history, _, _) = history::History::open_for_chat(&identity, &peer_id).unwrap();
+        let stored = |time, text: &str| history::StoredMessage {
+            unix_time: time,
+            sender: history::MessageSender::Me,
+            text: text.to_owned(),
+            proof: None,
+        };
+        history.append(&stored(1, "baseline")).unwrap();
+
+        let operation = Arc::new(ChatOperation {
+            owner_identity_id: owner_id,
+            history_state_lock: Mutex::new(()),
+            snapshot: Mutex::new(ChatSnapshot {
+                phase: "connected",
+                fingerprint: None,
+                peer_id: Some(peer_id.clone()),
+                error: None,
+                storage_error: None,
+                messages: Vec::new(),
+                message_count: 1,
+                relay_ack: None,
+                pending_sends: 0,
+                identity_transition: None,
+                history_restore_in_progress: true,
+                history_restore_state: "merging",
+                history_restore_estimate_bytes: 0,
+                history_restore_cleanup_error: None,
+                history_restore_offer: Vec::new(),
+                history_restore_offer_count: 0,
+                history_restore_legacy_count: 0,
+                history_restore_received: 0,
+                history_restore_total: 0,
+                history_restore_status: Some("merging".to_owned()),
+                message_epoch: 0,
+            }),
+            message_reader: Mutex::new(None),
+            sender: mpsc::channel().0,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+
+        {
+            let _guard = operation.history_state_lock.lock().unwrap();
+            history.append(&stored(2, "before merge lock")).unwrap();
+            chat_update(&operation, |snapshot| {
+                snapshot.message_count += 1;
+                snapshot.messages.push(ChatEntry {
+                    unix_time: 2,
+                    sender: "나",
+                    text: "before merge lock".to_owned(),
+                });
+            });
+        }
+
+        let mut staging =
+            history::RestoreStaging::create(&identity, &peer_id, &"9c".repeat(32)).unwrap();
+        staging
+            .append_verified(&stored(3, "restored proposal"))
+            .unwrap();
+        staging.finish().unwrap();
+
+        let (replaced_send, replaced_receive) = mpsc::channel();
+        let (release_replace_send, release_replace_receive) = mpsc::channel();
+        let (status_send, status_receive) = mpsc::channel();
+        let (release_status_send, release_status_receive) = mpsc::channel();
+        let merge_operation = Arc::clone(&operation);
+        let merge_directory = data.0.clone();
+        let merge_code = code.clone();
+        let merge_peer = peer_id.clone();
+        let merge = thread::spawn(move || {
+            history::set_test_data_directory(Some(merge_directory));
+            let merge_identity = Identity::from_code(&merge_code).unwrap();
+            let _guard = merge_operation.history_state_lock.lock().unwrap();
+            let (mut current, _, _) =
+                history::History::open_for_chat(&merge_identity, &merge_peer).unwrap();
+            let summary = current
+                .merge_restore_staging(&merge_identity, &mut staging)
+                .unwrap();
+            replaced_send.send(summary.total_count).unwrap();
+            release_replace_receive.recv().unwrap();
+            chat_update(&merge_operation, |snapshot| {
+                snapshot.message_count = summary.total_count as usize;
+                snapshot.message_epoch = snapshot.message_epoch.wrapping_add(1);
+                snapshot.history_restore_in_progress = false;
+                snapshot.history_restore_state = "completed";
+                snapshot.history_restore_status = Some("merge complete".to_owned());
+            });
+            status_send.send(()).unwrap();
+            release_status_receive.recv().unwrap();
+            staging.cleanup().unwrap();
+            history::set_test_data_directory(None);
+        });
+        assert_eq!(
+            replaced_receive
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            3
+        );
+
+        let (append_done_send, append_done_receive) = mpsc::channel();
+        let (append_started_send, append_started_receive) = mpsc::channel();
+        let append_operation = Arc::clone(&operation);
+        let append_directory = data.0.clone();
+        let append_code = code.clone();
+        let append_peer = peer_id.clone();
+        let append = thread::spawn(move || {
+            history::set_test_data_directory(Some(append_directory));
+            let append_identity = Identity::from_code(&append_code).unwrap();
+            append_started_send.send(()).unwrap();
+            let _guard = append_operation.history_state_lock.lock().unwrap();
+            let (mut current, _, _) =
+                history::History::open_for_chat(&append_identity, &append_peer).unwrap();
+            let new_message = history::StoredMessage {
+                unix_time: 4,
+                sender: history::MessageSender::Other,
+                text: "after replacement".to_owned(),
+                proof: None,
+            };
+            current.append(&new_message).unwrap();
+            chat_update(&append_operation, |snapshot| {
+                snapshot.message_count += 1;
+                snapshot.messages.push(chat_entry(new_message));
+            });
+            append_done_send.send(()).unwrap();
+            history::set_test_data_directory(None);
+        });
+        append_started_receive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(append_done_receive
+            .recv_timeout(Duration::from_millis(30))
+            .is_err());
+        release_replace_send.send(()).unwrap();
+        status_receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(append_done_receive
+            .recv_timeout(Duration::from_millis(30))
+            .is_err());
+        release_status_send.send(()).unwrap();
+        append_done_receive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        merge.join().unwrap();
+        append.join().unwrap();
+
+        let snapshot = operation.snapshot.lock().unwrap();
+        assert_eq!(snapshot.message_count, 4);
+        assert_eq!(snapshot.message_epoch, 1);
+        drop(snapshot);
+        let restored_identity = Identity::from_code(&code).unwrap();
+        let state = Arc::new(Mutex::new(State {
+            code: String::new(),
+            issued: Instant::now(),
+            attempts: 0,
+            sessions: vec!["test-session".to_owned()],
+            identity: Some(Arc::new(restored_identity)),
+            chats: HashMap::from([("count-operation".to_owned(), Arc::clone(&operation))]),
+            tor_socks: None,
+            settings: AppSettings::default(),
+            notifications_enabled: Arc::new(AtomicBool::new(false)),
+            last_notification: Arc::new(Mutex::new(None)),
+        }));
+        let response = call_test_api(
+            &state,
+            "/api/chat/messages",
+            "count-operation\n0",
+            "test-session",
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("after replacement"));
+        assert!(response.contains("restored proposal"));
     }
 
     #[test]
@@ -1517,6 +1701,10 @@ fn spawn_chat_worker(
                         match session.send(&frame) {
                             Ok(event_id) => {
                                 pending_events.insert(event_id);
+                                let _history_state_guard = operation
+                                    .history_state_lock
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
                                 let save_error = match history.as_mut() {
                                     Some(history) => history.append(&entry).err(),
                                     None => Some(io::Error::other("history unavailable")),
@@ -1541,6 +1729,10 @@ fn spawn_chat_worker(
                                 let _ = processed.send(());
                             }
                             Err(_) => {
+                                let _history_state_guard = operation
+                                    .history_state_lock
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
                                 let save_error = match history.as_mut() {
                                     Some(history) => history.append(&entry).err(),
                                     None => Some(io::Error::other("history unavailable")),
@@ -1714,6 +1906,10 @@ fn spawn_chat_worker(
                                 snapshot.history_restore_status = Some("최종 병합 중입니다. 대화 기록 저장은 잠금 때문에 잠시 대기할 수 있습니다. 연결 종료 후에도 병합과 결과 상태는 유지됩니다.".to_owned());
                             });
                             thread::spawn(move || {
+                                let _history_state_guard = merge_operation
+                                    .history_state_lock
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
                                 let result = (|| -> io::Result<history::RestoreMergeSummary> {
                                     let (mut current, _, _) = history::History::open_for_chat(
                                         &merge_identity,
@@ -1722,12 +1918,6 @@ fn spawn_chat_worker(
                                     current.merge_restore_staging(&merge_identity, &mut staging)
                                 })();
                                 let cleanup = staging.cleanup();
-                                let result = match (result, cleanup) {
-                                    (Ok(summary), Ok(())) => Ok(summary),
-                                    (Err(error), Ok(())) => Err(error.to_string()),
-                                    (Ok(_), Err(error)) => Err(format!("기록 병합은 완료됐지만 임시 저장소 정리에 실패했습니다: {error}")),
-                                    (Err(error), Err(cleanup)) => Err(format!("기록 병합 실패 ({error}); 임시 저장소 정리도 실패 ({cleanup})")),
-                                };
                                 chat_update(&merge_operation, |snapshot| {
                                     snapshot.history_restore_in_progress = false;
                                     snapshot.history_restore_offer.clear();
@@ -1742,12 +1932,24 @@ fn spawn_chat_worker(
                                                 summary.total_count.min(usize::MAX as u64) as usize;
                                             snapshot.message_epoch =
                                                 snapshot.message_epoch.wrapping_add(1);
-                                            snapshot.history_restore_status = Some(format!("{}개 메시지를 병합했습니다. 서명 없는 구형 메시지는 완전한 중복 판정이 불가능합니다.", summary.imported_count));
+                                            snapshot.history_restore_status = Some(match cleanup {
+                                                Ok(()) => format!("{}개 메시지를 병합했습니다. 서명 없는 구형 메시지는 완전한 중복 판정이 불가능합니다.", summary.imported_count),
+                                                Err(error) => {
+                                                    snapshot.history_restore_cleanup_error = Some(error.to_string());
+                                                    format!("{}개 메시지 병합은 완료됐지만 임시 저장소 정리에 실패했습니다: {error}", summary.imported_count)
+                                                }
+                                            });
                                         }
                                         Err(error) => {
                                             snapshot.history_restore_state = "failed";
-                                            snapshot.history_restore_status =
-                                                Some(format!("기록 병합 실패: {error}"));
+                                            snapshot.history_restore_status = Some(match cleanup {
+                                                Ok(()) => format!("기록 병합 실패: {error}"),
+                                                Err(cleanup) => {
+                                                    snapshot.history_restore_cleanup_error =
+                                                        Some(cleanup.to_string());
+                                                    format!("기록 병합 실패 ({error}); 임시 저장소 정리도 실패 ({cleanup})")
+                                                }
+                                            });
                                         }
                                     }
                                 });
@@ -1820,6 +2022,10 @@ fn spawn_chat_worker(
                                     return;
                                 }
                             };
+                            let _history_state_guard = operation
+                                .history_state_lock
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
                             let save_error = match history.as_mut() {
                                 Some(history) => history.append(&entry).err(),
                                 None => Some(io::Error::other("history unavailable")),
@@ -2602,6 +2808,10 @@ fn spawn_chat_worker(
                                     text,
                                     proof: None,
                                 };
+                                let _history_state_guard = operation
+                                    .history_state_lock
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
                                 let save_error = match history.as_mut() {
                                     Some(history) => history.append(&entry).err(),
                                     None => Some(io::Error::other("history unavailable")),
@@ -3309,6 +3519,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let (sender, receiver) = mpsc::channel();
         let operation = Arc::new(ChatOperation {
             owner_identity_id: identity.public_id().to_owned(),
+            history_state_lock: Mutex::new(()),
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connecting",
                 fingerprint: None,
