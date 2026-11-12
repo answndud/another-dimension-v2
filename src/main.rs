@@ -537,6 +537,10 @@ fn restore_merge_send_error(operation: &ChatOperation) -> Option<&'static str> {
     restore_merge_active(operation).then_some(RESTORE_MERGE_SEND_REJECTION)
 }
 
+fn queue_incoming_message(operation: &ChatOperation, queued_len: usize) -> bool {
+    queued_len > 0 || restore_merge_active(operation)
+}
+
 fn append_pending_restore_messages(
     operation: &ChatOperation,
     history: &mut Option<history::History>,
@@ -1194,18 +1198,20 @@ mod send_tests {
 
         let mut merge_pending = VecDeque::new();
         let mut merge_pending_bytes = 0;
-        queue_message_during_restore_merge(
-            &mut merge_pending,
-            &mut merge_pending_bytes,
-            history::StoredMessage {
-                unix_time: 5,
-                sender: history::MessageSender::Other,
-                text: "received during merge".to_owned(),
-                proof: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(merge_pending.len(), 1);
+        for index in 0..10 {
+            queue_message_during_restore_merge(
+                &mut merge_pending,
+                &mut merge_pending_bytes,
+                history::StoredMessage {
+                    unix_time: 5 + index,
+                    sender: history::MessageSender::Other,
+                    text: format!("queued-{index}"),
+                    proof: None,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(merge_pending.len(), 10);
 
         let (append_done_send, append_done_receive) = mpsc::channel();
         let (append_started_send, append_started_receive) = mpsc::channel();
@@ -1257,6 +1263,7 @@ mod send_tests {
                 .unwrap()
                 .0,
         );
+        assert!(queue_incoming_message(&operation, merge_pending.len()));
         assert_eq!(
             append_pending_restore_messages(
                 &operation,
@@ -1266,13 +1273,39 @@ mod send_tests {
                 8,
             )
             .unwrap(),
-            1
+            8
+        );
+        assert_eq!(merge_pending.len(), 2);
+        let late_entry = history::StoredMessage {
+            unix_time: 15,
+            sender: history::MessageSender::Other,
+            text: "arrived-after-first-batch".to_owned(),
+            proof: None,
+        };
+        assert!(queue_incoming_message(&operation, merge_pending.len()));
+        queue_message_during_restore_merge(
+            &mut merge_pending,
+            &mut merge_pending_bytes,
+            late_entry,
+        )
+        .unwrap();
+        assert_eq!(merge_pending.len(), 3);
+        assert_eq!(
+            append_pending_restore_messages(
+                &operation,
+                &mut current,
+                &mut merge_pending,
+                &mut merge_pending_bytes,
+                8,
+            )
+            .unwrap(),
+            3
         );
         assert!(merge_pending.is_empty());
 
         let snapshot = operation.snapshot.lock().unwrap();
-        assert_eq!(snapshot.message_count, 5);
-        assert_eq!(snapshot.message_epoch, 2);
+        assert_eq!(snapshot.message_count, 15);
+        assert_eq!(snapshot.message_epoch, 12);
         drop(snapshot);
         let restored_identity = Identity::from_code(&code).unwrap();
         let state = Arc::new(Mutex::new(State {
@@ -1295,7 +1328,15 @@ mod send_tests {
         );
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("after replacement"));
-        assert!(response.contains("received during merge"));
+        let first_queued = response.find("queued-0").unwrap();
+        let eighth_queued = response.find("queued-7").unwrap();
+        let ninth_queued = response.find("queued-8").unwrap();
+        let tenth_queued = response.find("queued-9").unwrap();
+        let late_message = response.find("arrived-after-first-batch").unwrap();
+        assert!(first_queued < eighth_queued);
+        assert!(eighth_queued < ninth_queued);
+        assert!(ninth_queued < tenth_queued);
+        assert!(tenth_queued < late_message);
         operation.snapshot.lock().unwrap().history_restore_state = "merging";
         let rejected_send = call_test_api(
             &state,
@@ -1310,6 +1351,79 @@ mod send_tests {
             Err(mpsc::TryRecvError::Empty)
         ));
         assert!(response.contains("restored proposal"));
+
+        let mut unavailable_queue = VecDeque::new();
+        let mut unavailable_bytes = 0;
+        queue_message_during_restore_merge(
+            &mut unavailable_queue,
+            &mut unavailable_bytes,
+            history::StoredMessage {
+                unix_time: 16,
+                sender: history::MessageSender::Other,
+                text: "not saved".to_owned(),
+                proof: None,
+            },
+        )
+        .unwrap();
+        let snapshot_count = operation.snapshot.lock().unwrap().message_count;
+        let mut missing_history = None;
+        assert!(append_pending_restore_messages(
+            &operation,
+            &mut missing_history,
+            &mut unavailable_queue,
+            &mut unavailable_bytes,
+            8,
+        )
+        .is_err());
+        assert_eq!(
+            operation.snapshot.lock().unwrap().message_count,
+            snapshot_count
+        );
+    }
+
+    #[test]
+    fn merge_pending_message_queue_enforces_count_and_byte_limits() {
+        let mut messages = VecDeque::new();
+        let mut bytes = 0;
+        for index in 0..MAX_MERGE_PENDING_MESSAGES {
+            queue_message_during_restore_merge(
+                &mut messages,
+                &mut bytes,
+                history::StoredMessage {
+                    unix_time: index as u64,
+                    sender: history::MessageSender::Other,
+                    text: "x".to_owned(),
+                    proof: None,
+                },
+            )
+            .unwrap();
+        }
+        assert!(queue_message_during_restore_merge(
+            &mut messages,
+            &mut bytes,
+            history::StoredMessage {
+                unix_time: MAX_MERGE_PENDING_MESSAGES as u64,
+                sender: history::MessageSender::Other,
+                text: "overflow".to_owned(),
+                proof: None,
+            },
+        )
+        .is_err());
+        assert_eq!(messages.len(), MAX_MERGE_PENDING_MESSAGES);
+
+        let mut empty = VecDeque::new();
+        let mut bytes_at_limit = MAX_MERGE_PENDING_BYTES - 1;
+        assert!(queue_message_during_restore_merge(
+            &mut empty,
+            &mut bytes_at_limit,
+            history::StoredMessage {
+                unix_time: 0,
+                sender: history::MessageSender::Other,
+                text: "xx".to_owned(),
+                proof: None,
+            },
+        )
+        .is_err());
     }
 
     #[test]
@@ -2201,7 +2315,7 @@ fn spawn_chat_worker(
                                     return;
                                 }
                             };
-                            if restore_merge_active(&operation) {
+                            if queue_incoming_message(&operation, merge_pending_messages.len()) {
                                 if queue_message_during_restore_merge(
                                     &mut merge_pending_messages,
                                     &mut merge_pending_bytes,
