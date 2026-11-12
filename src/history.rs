@@ -493,8 +493,19 @@ impl History {
         previous_password: Option<&str>,
         replacement_password: Option<&str>,
     ) -> io::Result<Vec<u8>> {
-        let (peer_id, messages, links) =
+        let (peer_id, messages, mut links) =
             decode_backup_with_links(previous_identity, backup, previous_password)?;
+        // Re-protection is an explicit act by the old identity holder. Preserve
+        // that authenticated identity as a local alias so proofs created before
+        // the replacement remain verifiable under the new backup key.
+        let previous_id = previous_identity.public_id();
+        let replacement_id = replacement_identity.public_id();
+        if previous_id != replacement_id {
+            if !links.origins.contains(&previous_id) {
+                links.origins.push(previous_id.clone());
+            }
+            links.local.insert(previous_id);
+        }
         encode_backup_with_links(
             replacement_identity,
             &peer_id,
@@ -554,8 +565,29 @@ impl History {
         // marker was already present in one of the snapshots.
         merged.sort_by_key(|item| item.unix_time);
         let old_trust = read_linked_keys(identity, &self.peer_id)?;
+        let previous_trust = read_linked_keys(identity, previous_peer_id)?;
         let mut new_trust = old_trust.clone();
         new_trust.1.insert(previous_peer_id.to_ascii_lowercase());
+        let local_lineage: HashSet<_> = crate::identity::previous_public_ids(identity)?
+            .into_iter()
+            .map(|id| id.to_ascii_lowercase())
+            .collect();
+        if previous_trust
+            .0
+            .iter()
+            .any(|id| !local_lineage.contains(id))
+        {
+            return Err(invalid_data(
+                "prior conversation contains a local identity link outside this identity lineage",
+            ));
+        }
+        new_trust.0.extend(previous_trust.0);
+        new_trust.1.extend(previous_trust.1);
+        if !new_trust.0.is_disjoint(&new_trust.1) {
+            return Err(invalid_data(
+                "prior conversation has conflicting linked identity roles",
+            ));
+        }
         self.replace(&merged)?;
         if let Err(error) = write_linked_keys(identity, &self.peer_id, &new_trust) {
             let rollback = self.replace(&current);
@@ -3473,6 +3505,102 @@ mod tests {
             Identity::from_code(&old_code).unwrap().public_id(),
             old_identity.public_id()
         );
+    }
+
+    #[test]
+    fn reprotected_backup_preserves_proofs_bound_to_previous_local_identity() {
+        let _data = IsolatedData::new();
+        let (previous, _) = Identity::create().unwrap();
+        let (replacement, _) = Identity::create().unwrap();
+        let (peer, _) = Identity::create().unwrap();
+        let peer_id = peer.public_id();
+        let outgoing =
+            super::sign_message(&previous, &peer_id, 41, "signed before change".into()).unwrap();
+        let mut incoming = super::sign_message(
+            &peer,
+            &previous.public_id(),
+            42,
+            "received before change".into(),
+        )
+        .unwrap();
+        incoming.sender = super::MessageSender::Other;
+        let source = super::encode_backup_with_links(
+            &previous,
+            &peer_id,
+            &[outgoing, incoming],
+            None,
+            &super::BackupLinks::default(),
+        )
+        .unwrap();
+
+        let result =
+            History::reprotect_backup(&previous, &replacement, &source, None, None).unwrap();
+        assert_eq!(
+            History::verify_backup(&replacement, &result, None).unwrap(),
+            (peer_id, 2)
+        );
+        let (_, _, links) = super::decode_backup_with_links(&replacement, &result, None).unwrap();
+        assert!(links.local.contains(&previous.public_id()));
+        assert!(links.origins.contains(&previous.public_id()));
+    }
+
+    #[test]
+    fn linking_multiple_peer_identity_epochs_carries_authenticated_aliases() {
+        let _data = IsolatedData::new();
+        let (local, _) = Identity::create().unwrap();
+        let (peer_a, _) = Identity::create().unwrap();
+        let (peer_b, _) = Identity::create().unwrap();
+        let (peer_c, _) = Identity::create().unwrap();
+        let peer_a_id = peer_a.public_id();
+        let peer_b_id = peer_b.public_id();
+        let peer_c_id = peer_c.public_id();
+        let mut signed_by_a = super::sign_message(
+            &peer_a,
+            &local.public_id(),
+            70,
+            "proof from first peer identity".into(),
+        )
+        .unwrap();
+        signed_by_a.sender = super::MessageSender::Other;
+        let (mut history_a, _, _) = History::open(&local, &peer_a_id).unwrap();
+        history_a.append(&signed_by_a).unwrap();
+
+        let (mut history_b, _, _) = History::open(&local, &peer_b_id).unwrap();
+        history_b
+            .link_prior_identity(
+                &local,
+                &peer_a_id,
+                message(
+                    71,
+                    &format!(
+                        "{}peer:{peer_a_id}:{peer_b_id}",
+                        super::IDENTITY_EVENT_PREFIX
+                    ),
+                ),
+            )
+            .unwrap();
+        let (mut history_c, _, _) = History::open(&local, &peer_c_id).unwrap();
+        history_c
+            .link_prior_identity(
+                &local,
+                &peer_b_id,
+                message(
+                    72,
+                    &format!(
+                        "{}peer:{peer_b_id}:{peer_c_id}",
+                        super::IDENTITY_EVENT_PREFIX
+                    ),
+                ),
+            )
+            .unwrap();
+
+        let (messages, _) = History::read_for_identity_copy(&local, &peer_c_id).unwrap();
+        let (_, peer_aliases) =
+            super::linked_identity_keys(&local, &messages, &local.public_id(), &peer_c_id, &[])
+                .unwrap();
+        assert!(peer_aliases.contains(&peer_a.public_key()));
+        assert!(peer_aliases.contains(&peer_b.public_key()));
+        super::verify_stored_proof(&local, &peer_c_id, &signed_by_a, &[], &peer_aliases).unwrap();
     }
 
     fn messages_with_payload_len(payload_len: usize) -> Vec<StoredMessage> {
