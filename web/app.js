@@ -905,17 +905,24 @@ document.querySelector('#history-backup-import').addEventListener('click', async
       reader.readAsDataURL(file);
     });
     const encoded = String(dataUrl).slice(String(dataUrl).indexOf(',') + 1);
+    const header = atob(encoded.slice(0, 16));
+    const backupMagic = header.slice(0, 8);
+    if ((backupMagic === 'ADBACK5\0' || backupMagic === 'ADPACK1\0')
+      && !window.confirm('이 백업에는 이전 신원 연결 정보가 포함될 수 있습니다. 파일 인증에 성공한 경우에만 해당 관계를 이 기기에 복원합니다. 계속할까요?')) return;
     const response = await request('/api/history/import-backup', JSON.stringify({ backup: encoded, password }));
     if (response.status === 409) { message.textContent = '먼저 모든 대화 연결을 종료한 뒤 다시 시도하세요.'; return; }
-    if (!response.ok) { message.textContent = '파일, 비밀번호 또는 신원 코드가 맞지 않습니다.'; return; }
+    if (!response.ok) { message.textContent = (await response.text()) || '백업을 검증하거나 저장하지 못했습니다.'; return; }
     const result = await response.json();
     document.querySelector('#history-backup-file').value = '';
     await refreshHistoryList();
     if (Array.isArray(result.conversations)) {
-      message.textContent = `${result.conversations.length}개 대화 백업을 기존 기록과 병합했습니다.`;
+      const linked = result.conversations.filter(item => item.linkedIdentityRestored).length;
+      message.textContent = `${result.conversations.length}개 대화 백업을 기존 기록과 병합했습니다.${linked ? ` ${linked}개 대화의 인증된 이전 신원 관계도 복원했습니다.` : ''}`;
     } else {
       await openHistory(result.peerId);
-      message.textContent = '백업을 확인해 기존 기록과 병합했습니다.';
+      message.textContent = result.linkedIdentityRestored
+        ? '백업을 확인해 기존 기록과 인증된 이전 신원 관계를 복원했습니다.'
+        : '백업을 확인해 기존 기록과 병합했습니다.';
     }
   } catch (_) {
     message.textContent = '백업 파일을 읽지 못했습니다.';

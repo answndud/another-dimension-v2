@@ -24,6 +24,8 @@ const BACKUP_MAGIC: &[u8; 8] = b"ADBACK1\0";
 const BACKUP_PASSWORD_MAGIC: &[u8; 8] = b"ADBACK2\0";
 const BACKUP_COMBINED_MAGIC: &[u8; 8] = b"ADBACK3\0";
 const BACKUP_SIGNED_MAGIC: &[u8; 8] = b"ADBACK4\0";
+const BACKUP_LINKED_MAGIC: &[u8; 8] = b"ADBACK5\0";
+const BACKUP_LINKS_TRAILER: &[u8; 8] = b"ADLNK1\0\0";
 const BACKUP_BUNDLE_MAGIC: &[u8; 8] = b"ADPACK1\0";
 const LINKED_KEYS_MAGIC: &[u8; 8] = b"ADLKEY1\0";
 const TRANSFER_MAGIC: &[u8; 6] = b"ADREC1";
@@ -47,10 +49,25 @@ const FAIL_DELETE_RESTORE: u8 = 2;
 const FAIL_ROLLBACK_REPLACE: u8 = 8;
 #[cfg(test)]
 const FAIL_LINKED_STORE: u8 = 16;
+#[cfg(test)]
+const FAIL_HISTORY_REPLACE_ONCE: u8 = 32;
 
 #[cfg(test)]
 fn test_failure(failure: u8) -> bool {
     TEST_FAILURES.with(|failures| failures.get() & failure != 0)
+}
+
+#[cfg(test)]
+fn test_failure_once(failure: u8) -> bool {
+    TEST_FAILURES.with(|failures| {
+        let current = failures.get();
+        if current & failure == 0 {
+            false
+        } else {
+            failures.set(current & !failure);
+            true
+        }
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -198,6 +215,10 @@ impl History {
     }
 
     pub fn replace(&mut self, messages: &[StoredMessage]) -> io::Result<()> {
+        #[cfg(test)]
+        if test_failure_once(FAIL_HISTORY_REPLACE_ONCE) {
+            return Err(io::Error::other("injected conversation replace failure"));
+        }
         let suffix = hex_encode(&random_nonce()?);
         let temporary = self.path.with_extension(format!("{suffix}.tmp"));
         let result = (|| {
@@ -378,6 +399,16 @@ impl History {
         identity: &Identity,
         bundle: &[u8],
     ) -> io::Result<Vec<(String, usize)>> {
+        Ok(Self::import_backup_bundle_with_info(identity, bundle)?
+            .into_iter()
+            .map(|(peer, count, _)| (peer, count))
+            .collect())
+    }
+
+    pub fn import_backup_bundle_with_info(
+        identity: &Identity,
+        bundle: &[u8],
+    ) -> io::Result<Vec<(String, usize, bool)>> {
         if bundle.len() > MAX_BACKUP_BYTES
             || !bundle.starts_with(BACKUP_BUNDLE_MAGIC)
             || bundle.len() < 12
@@ -402,7 +433,8 @@ impl History {
             if len > MAX_BACKUP_BYTES || bundle.len().saturating_sub(cursor) < len {
                 return Err(invalid_data("truncated backup bundle"));
             }
-            let (peer_id, messages) = decode_backup(identity, &bundle[cursor..cursor + len], None)?;
+            let (peer_id, messages, _) =
+                decode_backup_with_links(identity, &bundle[cursor..cursor + len], None)?;
             if !unique.insert(peer_id.clone()) {
                 return Err(invalid_data("duplicate conversation in backup bundle"));
             }
@@ -420,13 +452,25 @@ impl History {
                 u32::from_be_bytes(bundle[cursor..cursor + 4].try_into().expect("fixed slice"))
                     as usize;
             cursor += 4;
-            let (_, messages) = decode_backup(identity, &bundle[cursor..cursor + len], None)?;
+            let (_, messages, links) =
+                decode_backup_with_links(identity, &bundle[cursor..cursor + len], None)?;
             cursor += len;
             let (mut history, existing, _) = Self::open(identity, &peer_id)?;
-            let merged = merge_snapshot(existing, messages)?;
+            let merged = merge_snapshot(existing.clone(), messages)?;
             let count = merged.len();
+            let has_links = !links.local.is_empty() || !links.peer.is_empty();
             history.replace(&merged)?;
-            imported.push((peer_id, count));
+            if let Err(error) = apply_backup_links(identity, &peer_id, &links) {
+                let failure = match history.replace(&existing) {
+                    Ok(()) => error.to_string(),
+                    Err(rollback) => format!("{error}; conversation rollback failed ({rollback})"),
+                };
+                return Err(io::Error::other(format!(
+                    "backup bundle stopped after {} conversations; {failure}",
+                    imported.len()
+                )));
+            }
+            imported.push((peer_id, count, has_links));
         }
         Ok(imported)
     }
@@ -440,12 +484,14 @@ impl History {
         previous_password: Option<&str>,
         replacement_password: Option<&str>,
     ) -> io::Result<Vec<u8>> {
-        let (peer_id, messages) = decode_backup(previous_identity, backup, previous_password)?;
-        encode_backup(
+        let (peer_id, messages, links) =
+            decode_backup_with_links(previous_identity, backup, previous_password)?;
+        encode_backup_with_links(
             replacement_identity,
             &peer_id,
             &messages,
             replacement_password,
+            &links,
         )
     }
 
@@ -570,13 +616,29 @@ impl History {
         backup: &[u8],
         password: Option<&str>,
     ) -> io::Result<(String, usize)> {
-        let (peer_id, imported) = decode_backup(identity, backup, password)?;
+        let (peer_id, count, _) = Self::import_backup_with_info(identity, backup, password)?;
+        Ok((peer_id, count))
+    }
+
+    pub fn import_backup_with_info(
+        identity: &Identity,
+        backup: &[u8],
+        password: Option<&str>,
+    ) -> io::Result<(String, usize, bool)> {
+        let (peer_id, imported, links) = decode_backup_with_links(identity, backup, password)?;
 
         let (mut history, existing, _) = Self::open(identity, &peer_id)?;
-        let merged = merge_snapshot(existing, imported)?;
+        let merged = merge_snapshot(existing.clone(), imported)?;
         let count = merged.len();
+        let has_links = !links.local.is_empty() || !links.peer.is_empty();
         history.replace(&merged)?;
-        Ok((peer_id, count))
+        if let Err(error) = apply_backup_links(identity, &peer_id, &links) {
+            return match history.replace(&existing) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(io::Error::other(format!("backup relationship restore failed ({error}); conversation rollback failed ({rollback})"))),
+            };
+        }
+        Ok((peer_id, count, has_links))
     }
 }
 
@@ -610,6 +672,83 @@ fn encode_backup(
     messages: &[StoredMessage],
     password: Option<&str>,
 ) -> io::Result<Vec<u8>> {
+    let links = backup_links_for(identity, peer_id)?;
+    encode_backup_with_links(identity, peer_id, messages, password, &links)
+}
+
+fn backup_links_for(identity: &Identity, peer_id: &str) -> io::Result<BackupLinks> {
+    let (local, peer) = read_linked_keys(identity, peer_id)?;
+    let origins = crate::identity::previous_public_ids(identity)?;
+    let local = local
+        .into_iter()
+        .filter(|id| origins.contains(id))
+        .collect();
+    Ok(BackupLinks {
+        local,
+        peer,
+        origins,
+    })
+}
+
+fn apply_backup_links(
+    identity: &Identity,
+    peer_id: &str,
+    imported: &BackupLinks,
+) -> io::Result<()> {
+    if imported.local.is_empty() && imported.peer.is_empty() && imported.origins.is_empty() {
+        return Ok(());
+    }
+    let current = read_linked_keys(identity, peer_id)?;
+    let old_origins = crate::identity::previous_public_ids(identity)?;
+    let mut origins: HashSet<String> = old_origins.iter().cloned().collect();
+    origins.extend(imported.origins.iter().cloned());
+    let mut local = current.0.clone();
+    local.extend(imported.local.iter().cloned());
+    let mut peer = current.1.clone();
+    peer.extend(imported.peer.iter().cloned());
+    if !local.is_disjoint(&peer) {
+        return Err(invalid_data(
+            "backup identity links conflict with local links",
+        ));
+    }
+    if local.iter().any(|id| !origins.contains(id)) {
+        return Err(invalid_data(
+            "backup local identity link is outside confirmed lineage",
+        ));
+    }
+    if peer.iter().any(|id| id == peer_id) {
+        return Err(invalid_data(
+            "backup peer identity link refers to current peer",
+        ));
+    }
+    let new_origins: Vec<_> = origins.into_iter().collect();
+    crate::identity::replace_previous_public_ids(identity, &new_origins)?;
+    if let Err(error) = write_linked_keys(identity, peer_id, &(local, peer)) {
+        if let Err(rollback_error) =
+            crate::identity::replace_previous_public_ids(identity, &old_origins)
+        {
+            return Err(io::Error::other(format!("linked relationship save failed ({error}); lineage rollback failed ({rollback_error})")));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn encode_backup_with_links(
+    identity: &Identity,
+    peer_id: &str,
+    messages: &[StoredMessage],
+    password: Option<&str>,
+    links: &BackupLinks,
+) -> io::Result<Vec<u8>> {
+    if links.peer.iter().any(|id| id.eq_ignore_ascii_case(peer_id)) {
+        return Err(invalid_data("linked peer identity equals current peer"));
+    }
+    if links.local.iter().any(|id| !links.origins.contains(id))
+        || !links.local.is_disjoint(&links.peer)
+    {
+        return Err(invalid_data("invalid linked identity backup relationships"));
+    }
     let mut payload = Zeroizing::new(Vec::new());
     if let Some(password) = password {
         validate_backup_password(password)?;
@@ -651,6 +790,28 @@ fn encode_backup(
             ));
         }
     }
+    if links.local.len() > 32 || links.peer.len() > 32 || links.origins.len() > 32 {
+        return Err(invalid_data("too many linked identity records"));
+    }
+    payload.extend_from_slice(BACKUP_LINKS_TRAILER);
+    payload.push(links.local.len() as u8);
+    payload.push(links.peer.len() as u8);
+    payload.push(links.origins.len() as u8);
+    for id in &links.local {
+        payload.extend_from_slice(&decode_peer_id(id)?);
+    }
+    for id in &links.peer {
+        payload.extend_from_slice(&decode_peer_id(id)?);
+    }
+    for id in &links.origins {
+        payload.extend_from_slice(&decode_peer_id(id)?);
+    }
+    if payload.len().saturating_add(header_len + 16) > MAX_BACKUP_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "backup is too large",
+        ));
+    }
     let mut salt = [0; BACKUP_SALT_BYTES];
     File::open("/dev/urandom")?.read_exact(&mut salt)?;
     let nonce = random_nonce()?;
@@ -658,12 +819,12 @@ fn encode_backup(
         Some(password) => {
             let password_key = derive_password_backup_key(password, &salt)?;
             (
-                BACKUP_SIGNED_MAGIC,
+                BACKUP_LINKED_MAGIC,
                 derive_combined_backup_key(&identity.storage_key(), &password_key),
             )
         }
         None => (
-            BACKUP_SIGNED_MAGIC,
+            BACKUP_LINKED_MAGIC,
             derive_backup_key(&identity.storage_key()),
         ),
     };
@@ -693,11 +854,20 @@ fn decode_backup(
     backup: &[u8],
     password: Option<&str>,
 ) -> io::Result<(String, Vec<StoredMessage>)> {
+    let (peer_id, messages, _) = decode_backup_with_links(identity, backup, password)?;
+    Ok((peer_id, messages))
+}
+
+fn decode_backup_with_links(
+    identity: &Identity,
+    backup: &[u8],
+    password: Option<&str>,
+) -> io::Result<(String, Vec<StoredMessage>, BackupLinks)> {
     if backup.len() > MAX_BACKUP_BYTES || backup.len() < BACKUP_MAGIC.len() + NONCE_BYTES + 16 {
         return Err(invalid_data("invalid backup file"));
     }
     let magic = &backup[..BACKUP_MAGIC.len()];
-    let signed_version = magic == BACKUP_SIGNED_MAGIC;
+    let signed_version = magic == BACKUP_SIGNED_MAGIC || magic == BACKUP_LINKED_MAGIC;
     let (salt, nonce_start, key) = if magic == BACKUP_MAGIC {
         if password.is_some() {
             return Err(invalid_data("legacy backup does not use a password"));
@@ -708,7 +878,7 @@ fn decode_backup(
             nonce_start,
             derive_backup_key(&identity.storage_key()),
         )
-    } else if magic == BACKUP_SIGNED_MAGIC && password.is_none() {
+    } else if (magic == BACKUP_SIGNED_MAGIC || magic == BACKUP_LINKED_MAGIC) && password.is_none() {
         (
             None,
             BACKUP_SIGNED_MAGIC.len(),
@@ -732,7 +902,10 @@ fn decode_backup(
             nonce_start,
             derive_password_backup_key(password, &salt)?,
         )
-    } else if magic == BACKUP_COMBINED_MAGIC || magic == BACKUP_SIGNED_MAGIC {
+    } else if magic == BACKUP_COMBINED_MAGIC
+        || magic == BACKUP_SIGNED_MAGIC
+        || magic == BACKUP_LINKED_MAGIC
+    {
         let password = password.ok_or_else(|| invalid_data("backup password required"))?;
         validate_backup_password(password)?;
         let salt_start = BACKUP_MAGIC.len();
@@ -851,21 +1024,80 @@ fn decode_backup(
             proof: message.proof,
         });
     }
+    let links = if magic == BACKUP_LINKED_MAGIC {
+        if payload.len().saturating_sub(cursor) < 11
+            || &payload[cursor..cursor + 8] != BACKUP_LINKS_TRAILER
+        {
+            return Err(invalid_data("missing linked identity backup data"));
+        }
+        cursor += 8;
+        let local_count = payload[cursor] as usize;
+        let peer_count = payload[cursor + 1] as usize;
+        let origin_count = payload[cursor + 2] as usize;
+        cursor += 3;
+        if local_count > 32
+            || peer_count > 32
+            || origin_count > 32
+            || payload.len() - cursor != (local_count + peer_count + origin_count) * 32
+        {
+            return Err(invalid_data("invalid linked identity backup data"));
+        }
+        let mut links = BackupLinks::default();
+        for index in 0..local_count + peer_count + origin_count {
+            let id = hex_encode(&payload[cursor..cursor + 32]);
+            cursor += 32;
+            if index < local_count {
+                links.local.insert(id);
+            } else if index < local_count + peer_count {
+                links.peer.insert(id);
+            } else {
+                links.origins.push(id);
+            }
+        }
+        if links.local.iter().any(|id| !links.origins.contains(id)) {
+            return Err(invalid_data(
+                "backup local identity link is outside its lineage",
+            ));
+        }
+        if links.origins.iter().collect::<HashSet<_>>().len() != links.origins.len()
+            || links.origins.contains(&identity.public_id())
+            || !links.local.is_disjoint(&links.peer)
+        {
+            return Err(invalid_data("conflicting linked identity backup records"));
+        }
+        links
+    } else {
+        BackupLinks::default()
+    };
     if cursor != payload.len() {
         return Err(invalid_data("unexpected backup data"));
     }
     let previous_local_ids = crate::identity::previous_public_ids(identity)?;
-    let (local_aliases, peer_aliases) = linked_identity_keys(
-        identity,
-        &imported,
-        &identity.public_id(),
-        &peer_id,
-        &previous_local_ids,
-    )?;
+    let (stored_local, stored_peer) = read_linked_keys(identity, &peer_id)?;
+    let mut local_ids: HashSet<_> = previous_local_ids.into_iter().collect();
+    local_ids.extend(links.origins.iter().cloned());
+    let mut local_keys: HashSet<_> = stored_local
+        .into_iter()
+        .chain(links.local.iter().cloned())
+        .filter(|id| local_ids.contains(id))
+        .collect();
+    let mut peer_keys: HashSet<_> = stored_peer;
+    peer_keys.extend(links.peer.iter().cloned());
+    if !local_keys.is_disjoint(&peer_keys) {
+        return Err(invalid_data("conflicting linked identity roles in backup"));
+    }
+    let local_aliases = local_keys
+        .drain()
+        .map(|id| decode_peer_id(&id))
+        .collect::<io::Result<Vec<_>>>()?;
+    let peer_aliases = peer_keys
+        .into_iter()
+        .map(|id| decode_peer_id(&id))
+        .collect::<io::Result<Vec<_>>>()?;
     for message in imported.iter().filter(|message| message.proof.is_some()) {
         verify_stored_proof(identity, &peer_id, message, &local_aliases, &peer_aliases)?;
     }
-    Ok((peer_id, imported))
+    Ok((peer_id, imported, links))
 }
 
 /// Backups contain snapshots without record IDs. Preserve the greatest count of
@@ -1165,6 +1397,13 @@ pub(crate) fn linked_identity_keys(
 }
 
 type LinkedIds = (HashSet<String>, HashSet<String>);
+
+#[derive(Clone, Default)]
+struct BackupLinks {
+    local: HashSet<String>,
+    peer: HashSet<String>,
+    origins: Vec<String>,
+}
 
 fn linked_key_path(identity: &Identity, peer_id: &str) -> io::Result<PathBuf> {
     let identity_id = identity.public_id();
@@ -2174,6 +2413,143 @@ mod tests {
     }
 
     #[test]
+    fn linked_backup_restores_original_proofs_and_relations_on_another_store() {
+        let _data = IsolatedData::new();
+        let root = super::data_directory().unwrap();
+        let store_a = root.join("store-a");
+        let store_b = root.join("store-b");
+        std::fs::create_dir_all(&store_a).unwrap();
+        std::fs::create_dir_all(&store_b).unwrap();
+        super::TEST_DATA_DIRECTORY
+            .with(|directory| *directory.borrow_mut() = Some(store_a.clone()));
+        let (old_local, _) = Identity::create().unwrap();
+        let (replacement, code) = Identity::create().unwrap();
+        old_local.copy_local_data_to(&replacement).unwrap();
+        let (peer, _) = Identity::create().unwrap();
+        let peer_id = peer.public_id();
+        let old_proof =
+            super::sign_message(&old_local, &peer_id, 777, "before replacement".into()).unwrap();
+        let (mut history, _, _) = History::open(&replacement, &peer_id).unwrap();
+        history.append(&old_proof).unwrap();
+        super::record_linked_local_identity(&replacement, &peer_id, &old_local.public_id())
+            .unwrap();
+        let backup = History::export_backup(&replacement, &peer_id, None).unwrap();
+        assert!(backup.starts_with(super::BACKUP_LINKED_MAGIC));
+
+        super::TEST_DATA_DIRECTORY
+            .with(|directory| *directory.borrow_mut() = Some(store_b.clone()));
+        let restored_identity = Identity::from_code(&code).unwrap();
+        assert_eq!(restored_identity.public_id(), replacement.public_id());
+        let (restored_peer, _) = History::import_backup(&restored_identity, &backup, None).unwrap();
+        assert_eq!(restored_peer, peer_id);
+        let (messages, _) = History::read_for_identity_copy(&restored_identity, &peer_id).unwrap();
+        assert_eq!(messages, vec![old_proof.clone()]);
+        let (locals, _) = super::linked_identity_keys(
+            &restored_identity,
+            &messages,
+            &restored_identity.public_id(),
+            &peer_id,
+            &crate::identity::previous_public_ids(&restored_identity).unwrap(),
+        )
+        .unwrap();
+        assert!(locals.contains(&old_local.public_key()));
+
+        let mut tampered = backup.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(History::verify_backup(&restored_identity, &tampered, None).is_err());
+
+        let mut bad_signature = old_proof.clone();
+        bad_signature.proof.as_mut().unwrap().signature[0] ^= 1;
+        let bad_signature_backup =
+            super::encode_backup(&replacement, &peer_id, &[bad_signature], None).unwrap();
+        assert!(History::verify_backup(&restored_identity, &bad_signature_backup, None).is_err());
+
+        let bundle = History::export_backup_bundle(&replacement, &[peer_id.clone()]).unwrap();
+        let store_c = root.join("store-c");
+        std::fs::create_dir_all(&store_c).unwrap();
+        super::TEST_DATA_DIRECTORY
+            .with(|directory| *directory.borrow_mut() = Some(store_c.clone()));
+        let bundle_identity = Identity::from_code(&code).unwrap();
+        History::import_backup_bundle(&bundle_identity, &bundle).unwrap();
+        let (bundle_messages, _) = History::read_for_identity_copy(&bundle_identity, &peer_id).unwrap();
+        let (bundle_local, _) = super::linked_identity_keys(
+            &bundle_identity, &bundle_messages, &bundle_identity.public_id(), &peer_id,
+            &crate::identity::previous_public_ids(&bundle_identity).unwrap()).unwrap();
+        assert!(bundle_local.contains(&old_local.public_key()));
+
+        let store_d = root.join("store-d");
+        std::fs::create_dir_all(&store_d).unwrap();
+        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(store_d));
+        let failed_identity = Identity::from_code(&code).unwrap();
+        super::TEST_FAILURES.with(|flags| flags.set(super::FAIL_LINKED_STORE));
+        let failure = History::import_backup(&failed_identity, &backup, None).unwrap_err();
+        super::TEST_FAILURES.with(|flags| flags.set(0));
+        assert!(failure
+            .to_string()
+            .contains("injected linked identity store failure"));
+        assert!(crate::identity::previous_public_ids(&failed_identity)
+            .unwrap()
+            .is_empty());
+        assert!(!super::is_linked_local_identity(
+            &failed_identity,
+            &peer_id,
+            &old_local.public_id()
+        )
+        .unwrap());
+        let (untouched, _) = History::read_for_identity_copy(&failed_identity, &peer_id).unwrap();
+        assert!(untouched.is_empty());
+
+        let store_e = root.join("store-e");
+        std::fs::create_dir_all(&store_e).unwrap();
+        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(store_e));
+        let replace_failed_identity = Identity::from_code(&code).unwrap();
+        let (mut preexisting, _, _) = History::open(&replace_failed_identity, &peer_id).unwrap();
+        preexisting
+            .append(&message(3, "preserve this record"))
+            .unwrap();
+        super::TEST_FAILURES.with(|flags| flags.set(super::FAIL_HISTORY_REPLACE_ONCE));
+        assert!(History::import_backup(&replace_failed_identity, &backup, None).is_err());
+        super::TEST_FAILURES.with(|flags| flags.set(0));
+        let (preserved, _) =
+            History::read_for_identity_copy(&replace_failed_identity, &peer_id).unwrap();
+        assert_eq!(preserved, vec![message(3, "preserve this record")]);
+
+        // ADBACK4 carries signed messages but no authenticated relationship metadata.
+        let mut legacy_payload = Vec::new();
+        legacy_payload.extend_from_slice(&super::decode_peer_id(&peer_id).unwrap());
+        legacy_payload.extend_from_slice(&1_u32.to_be_bytes());
+        let text = old_proof.text.as_bytes();
+        legacy_payload.extend_from_slice(&old_proof.unix_time.to_be_bytes());
+        legacy_payload.push(0);
+        legacy_payload.extend_from_slice(&(text.len() as u32).to_be_bytes());
+        legacy_payload.extend_from_slice(text);
+        let proof = old_proof.proof.as_ref().unwrap();
+        legacy_payload.push(1);
+        legacy_payload.extend_from_slice(&proof.id);
+        legacy_payload.extend_from_slice(&proof.signer);
+        legacy_payload.extend_from_slice(&proof.recipient);
+        legacy_payload.extend_from_slice(&proof.signature);
+        let nonce = super::random_nonce().unwrap();
+        let cipher = ChaCha20Poly1305::new_from_slice(
+            super::derive_backup_key(&replacement.storage_key()).as_ref(),
+        )
+        .unwrap();
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &legacy_payload,
+                    aad: &super::backup_aad(&replacement, super::BACKUP_SIGNED_MAGIC, None),
+                },
+            )
+            .unwrap();
+        let mut old_backup = super::BACKUP_SIGNED_MAGIC.to_vec();
+        old_backup.extend_from_slice(&nonce);
+        old_backup.extend_from_slice(&ciphertext);
+        assert!(History::verify_backup(&failed_identity, &old_backup, None).is_err());
+    }
+
+    #[test]
     fn legacy_messages_remain_unsigned_and_are_not_claimed_as_verified() {
         let _data = IsolatedData::new();
         let (identity, _) = Identity::create().unwrap();
@@ -2724,9 +3100,9 @@ mod tests {
             .replace(&[repeated.clone(), repeated.clone()])
             .unwrap();
 
-        // New exports use ADBACK4 and remain idempotent on repeated imports.
+        // New exports use ADBACK5 and remain idempotent on repeated imports.
         let backup = History::export_backup(&identity, &peer, None).unwrap();
-        assert_eq!(&backup[..8], b"ADBACK4\0");
+        assert_eq!(&backup[..8], b"ADBACK5\0");
         assert_eq!(
             History::import_backup(&identity, &backup, None).unwrap().1,
             2
@@ -2740,7 +3116,7 @@ mod tests {
 
         let password_backup =
             History::export_backup(&identity, &peer, Some("correct horse battery")).unwrap();
-        assert_eq!(&password_backup[..8], b"ADBACK4\0");
+        assert_eq!(&password_backup[..8], b"ADBACK5\0");
         let other_identity = Identity::create().unwrap().0;
         assert!(History::import_backup(
             &other_identity,
@@ -2870,7 +3246,7 @@ mod tests {
     }
 
     fn messages_with_payload_len(payload_len: usize) -> Vec<StoredMessage> {
-        // ADBACK4 adds one proof-presence byte to each legacy record.
+        // ADBACK4/5 add one proof-presence byte to each legacy record.
         let record_bytes = payload_len - 36;
         let count = record_bytes.div_ceil(MAX_MESSAGE_BYTES + 14);
         let mut remaining = record_bytes;
@@ -2893,7 +3269,7 @@ mod tests {
         let peer = "cd".repeat(32);
         for password in [None, Some("correct horse battery")] {
             let envelope_len = 8 + password.map_or(0, |_| 16) + 12 + 16;
-            let exact_payload_len = MAX_BACKUP_BYTES - envelope_len;
+            let exact_payload_len = MAX_BACKUP_BYTES - envelope_len - 11;
             let mut history = History::open(&identity, &peer).unwrap().0;
             history
                 .replace(&messages_with_payload_len(exact_payload_len))

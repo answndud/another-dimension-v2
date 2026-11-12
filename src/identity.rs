@@ -266,6 +266,56 @@ pub(crate) fn previous_public_ids(identity: &Identity) -> io::Result<Vec<String>
     Ok(ids)
 }
 
+pub(crate) fn replace_previous_public_ids(identity: &Identity, ids: &[String]) -> io::Result<()> {
+    let current = identity.public_id();
+    let mut normalized: Vec<_> = ids.iter().map(|id| id.to_ascii_lowercase()).collect();
+    if normalized.iter().any(|id| {
+        id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) || id == &current
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid identity lineage record",
+        ));
+    }
+    normalized.sort();
+    normalized.dedup();
+    if normalized.len() > 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "identity lineage is too long",
+        ));
+    }
+    let directory = crate::history::data_directory()?.join(current);
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(ORIGINS_FILE);
+    let mut suffix = [0_u8; 12];
+    File::open("/dev/urandom")?.read_exact(&mut suffix)?;
+    let suffix = suffix
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let temporary = directory.join(format!(".{ORIGINS_FILE}.{suffix}.tmp"));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&temporary)?;
+        for id in &normalized {
+            writeln!(file, "{id}")?;
+        }
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
 fn derive_code_key(wrap_key: &[u8; CODE_KEY_BYTES]) -> Zeroizing<[u8; 32]> {
     let mut key = Zeroizing::new([0; 32]);
     Hkdf::<Sha256>::new(None, wrap_key)

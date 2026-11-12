@@ -3148,16 +3148,24 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             _ => return reject(&mut stream, "400 Bad Request"),
         };
         if backup.starts_with(b"ADPACK1\0") {
-            let restored = match history::History::import_backup_bundle(identity, &backup) {
+            let restored = match history::History::import_backup_bundle_with_info(identity, &backup)
+            {
                 Ok(result) => result,
-                Err(_) => return reject(&mut stream, "400 Bad Request"),
+                Err(error) => {
+                    return respond(
+                        &mut stream,
+                        "400 Bad Request",
+                        "text/plain; charset=utf-8",
+                        format!("{error}").as_bytes(),
+                    )
+                }
             };
-            for (peer_id, _) in &restored {
+            for (peer_id, _, _) in &restored {
                 if let Ok((_, messages, _)) = history::History::open(identity, peer_id) {
                     update_closed_chat_history(&state, peer_id, Some(&messages));
                 }
             }
-            let payload = serde_json::json!({ "conversations": restored.iter().map(|(peer_id, count)| serde_json::json!({ "peerId": peer_id, "messageCount": count })).collect::<Vec<_>>() }).to_string();
+            let payload = serde_json::json!({ "conversations": restored.iter().map(|(peer_id, count, linked)| serde_json::json!({ "peerId": peer_id, "messageCount": count, "linkedIdentityRestored": linked })).collect::<Vec<_>>() }).to_string();
             return respond(
                 &mut stream,
                 "200 OK",
@@ -3165,14 +3173,22 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 payload.as_bytes(),
             );
         }
-        let (peer_id, count) = match history::History::import_backup(identity, &backup, password) {
-            Ok(result) => result,
-            Err(_) => return reject(&mut stream, "400 Bad Request"),
-        };
+        let (peer_id, count, linked) =
+            match history::History::import_backup_with_info(identity, &backup, password) {
+                Ok(result) => result,
+                Err(error) => {
+                    return respond(
+                        &mut stream,
+                        "400 Bad Request",
+                        "text/plain; charset=utf-8",
+                        error.to_string().as_bytes(),
+                    )
+                }
+            };
         if let Ok((_, messages, _)) = history::History::open(identity, &peer_id) {
             update_closed_chat_history(&state, &peer_id, Some(&messages));
         }
-        let payload = serde_json::json!({ "peerId": peer_id, "messageCount": count }).to_string();
+        let payload = serde_json::json!({ "peerId": peer_id, "messageCount": count, "linkedIdentityRestored": linked }).to_string();
         return respond(
             &mut stream,
             "200 OK",

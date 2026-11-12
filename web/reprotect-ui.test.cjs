@@ -167,6 +167,17 @@ test('actual UI: request A then B, and B completes before A', async () => {
   assert.equal(original.file.dataUrl, file('source.adbak', 'encrypted-source').dataUrl);
 });
 
+test('backup restore asks before applying authenticated linked identity data', async () => {
+  const h = createHarness();
+  h.element('#history-backup-file').files = [file('linked.adbak', 'ADBACK5\0payload')];
+  h.element('#history-backup-import-password').value = 'long-enough-password';
+  let prompt = '';
+  h.window.confirm = (message) => { prompt = message; return false; };
+  await h.click('#history-backup-import');
+  assert.match(prompt, /이전 신원 연결 정보/);
+  assert.equal(h.requests.some((item) => item.path === '/api/history/import-backup'), false);
+});
+
 function createOutputHandle() {
   const output = { written: '', closed: false, aborted: false };
   output.isSameEntry = async () => false;
