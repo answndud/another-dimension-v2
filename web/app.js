@@ -280,7 +280,7 @@ async function refreshNetworkSettings() {
   document.querySelector('#active-relay').textContent = `현재 실행 설정 relay 목록: ${activeRelays.join(', ') || '없음'} · 연결 가능한 목록의 relay 경로를 사용합니다.`;
   document.querySelector('#tor-settings').hidden = modeChoice.value !== 'tor';
   document.querySelector('#network-mode').textContent = settings.activeMode === 'tor'
-    ? `현재 연결: Tor SOCKS (${settings.activeSocks}) · 서비스를 Tor로 검증하지 않습니다.`
+    ? `현재 연결: Tor SOCKS (${settings.activeSocks}) · SOCKS 서비스가 Tor인지 앱에서 확인하지 않으며, 외부 브라우저의 네트워크 경로도 제어하지 않습니다.`
     : '현재 연결: 일반 연결 · relay에 실제 IP가 보일 수 있습니다.';
   status.textContent = settings.restartRequired
     ? '저장된 연결 설정이 실행 중인 설정과 다릅니다. 터미널에서 프로그램을 종료하고 다시 실행하세요.'
@@ -825,7 +825,7 @@ document.querySelector('#save-settings').addEventListener('click', async () => {
       ? '설정을 저장했습니다. 연결 설정 적용을 위해 터미널에서 프로그램을 종료한 뒤 다시 실행하세요. 터미널의 새 주소와 로컬 연결 코드를 사용하고, 다시 연 화면에서 개인 접속 코드로 로그인하세요.'
       : '설정을 저장했습니다.';
     document.querySelector('#network-mode').textContent = saved.activeMode === 'tor'
-      ? `현재 연결: Tor SOCKS (${saved.activeSocks}) · 서비스를 Tor로 검증하지 않습니다.`
+      ? `현재 연결: Tor SOCKS (${saved.activeSocks}) · SOCKS 서비스가 Tor인지 앱에서 확인하지 않으며, 외부 브라우저의 네트워크 경로도 제어하지 않습니다.`
       : '현재 연결: 일반 연결 · relay에 실제 IP가 보일 수 있습니다.';
     const activeRelays = Array.isArray(saved.activeRelays)
       ? saved.activeRelays

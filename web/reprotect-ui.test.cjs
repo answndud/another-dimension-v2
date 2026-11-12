@@ -685,6 +685,23 @@ test('actual UI: relay settings display the active relay list and save edited li
     await saving;
     assert.equal(h.element('#settings-status').textContent, '2번째 relay 주소가 올바르지 않습니다.');
   });
+
+  await t.test('Tor guidance states service and external-browser limits', async () => {
+    const torHarness = createHarness();
+    const torSettings = {
+      savedMode: 'tor', socks: '127.0.0.1:9050',
+      activeMode: 'tor', activeSocks: '127.0.0.1:9050',
+      notifications: false, savedRelays: ['wss://relay.one'],
+      activeRelays: ['wss://relay.one'], restartRequired: false,
+    };
+    const refreshing = torHarness.evaluate('refreshNetworkSettings()');
+    torHarness.requestFor('/api/settings/get').resolve(response(JSON.stringify(torSettings)));
+    await refreshing;
+    assert.match(torHarness.element('#network-mode').textContent, /SOCKS 서비스가 Tor인지 앱에서 확인하지 않으며/);
+    assert.match(torHarness.element('#network-mode').textContent, /외부 브라우저의 네트워크 경로도 제어하지 않습니다/);
+    assert.match(fs.readFileSync('web/index.html', 'utf8'), /Tor 서비스를 별도로 실행하세요/);
+    assert.match(fs.readFileSync('web/index.html', 'utf8'), /외부 브라우저의 네트워크 경로도 제어하지 않습니다/);
+  });
 });
 
 test('actual UI: stale polls cannot change another identity after response or JSON awaits', async (t) => {

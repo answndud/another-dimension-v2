@@ -1254,10 +1254,10 @@ fn wait_for_any_subscription(
         if relays.is_empty() {
             return Err(RelayError::NoRelayAvailable);
         }
-        if let Some(ready_at) = first_ready_at {
-            if ready_at.elapsed() >= READ_TIMEOUT {
-                return Ok(());
-            }
+        if !relays.iter().any(|relay| relay.ready) {
+            first_ready_at = None;
+        } else if first_ready_at.is_some_and(|ready_at| ready_at.elapsed() >= READ_TIMEOUT) {
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return if relays.iter().any(|relay| relay.ready) {
@@ -1430,6 +1430,7 @@ mod tests {
         failed: BTreeSet<String>,
         malformed_subscriptions: BTreeSet<String>,
         closed_subscriptions: BTreeSet<String>,
+        close_after_eose: HashMap<String, Duration>,
         silent_subscriptions: BTreeSet<String>,
         overflowing_subscriptions: BTreeSet<String>,
         delayed_subscriptions: HashMap<String, (usize, Duration)>,
@@ -1493,6 +1494,22 @@ mod tests {
             if closed {
                 state.closed_subscriptions.insert(endpoint.to_owned());
             }
+        }
+
+        fn close_after_eose(&self, endpoint: &str, delay: Duration) {
+            self.state
+                .lock()
+                .unwrap()
+                .close_after_eose
+                .insert(endpoint.to_owned(), delay);
+        }
+
+        fn silence_subscription(&self, endpoint: &str) {
+            self.state
+                .lock()
+                .unwrap()
+                .silent_subscriptions
+                .insert(endpoint.to_owned());
         }
 
         fn set_ack_mode(&self, endpoint: &str, mode: FakeAckMode) {
@@ -1646,6 +1663,7 @@ mod tests {
                             (*request_number == current_request).then_some(*delay)
                         },
                     );
+                    let close_delay = state.close_after_eose.get(&self.endpoint).copied();
                     if state.overflowing_subscriptions.contains(&self.endpoint) {
                         for _ in 0..65 {
                             self.sender
@@ -1662,6 +1680,22 @@ mod tests {
                             thread::sleep(delay);
                             let _ = sender.send(Message::text(
                                 serde_json::json!(["EOSE", subscription_id]).to_string(),
+                            ));
+                        });
+                        return Ok(());
+                    }
+                    if let Some(delay) = close_delay {
+                        self.sender
+                            .send(Message::text(
+                                serde_json::json!(["EOSE", subscription_id]).to_string(),
+                            ))
+                            .map_err(|_| RelayError::Disconnected)?;
+                        let sender = self.sender.clone();
+                        thread::spawn(move || {
+                            thread::sleep(delay);
+                            let _ = sender.send(Message::text(
+                                serde_json::json!(["CLOSED", subscription_id, "late close"])
+                                    .to_string(),
                             ));
                         });
                         return Ok(());
@@ -1881,6 +1915,25 @@ mod tests {
                 |endpoint| all_bad.open(endpoint),
             ),
             Err(RelayError::NoRelayAvailable)
+        ));
+
+        let flicker = "wss://ready-then-closed.test".to_owned();
+        let silent = "wss://still-pending.test".to_owned();
+        let unstable = FakeRelayNetwork::default();
+        unstable.close_after_eose(&flicker, Duration::from_millis(20));
+        unstable.silence_subscription(&silent);
+        let mut links = Vec::new();
+        for (id, endpoint) in [flicker, silent].into_iter().enumerate() {
+            let subscription = SubscriptionId::new(format!("test-sub-{id}"));
+            let mut link =
+                super::RelayLink::new(id, unstable.open(&endpoint).unwrap(), subscription.clone());
+            let request = super::ClientMessage::req(subscription, vec![super::Filter::new()]);
+            link.send_text(&request.as_json()).unwrap();
+            links.push(link);
+        }
+        assert!(matches!(
+            super::wait_for_any_subscription(&mut links, Duration::from_millis(350)),
+            Err(RelayError::TimedOut("relay subscription"))
         ));
 
         let flood = "wss://flood.test".to_owned();
@@ -2341,6 +2394,64 @@ mod tests {
         let stream = super::connect_socks5(proxy, "relay.example", 443).unwrap();
         drop(stream);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn socks_proxy_failure_never_falls_back_to_direct_relay_connection() {
+        let relay_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        relay_listener.set_nonblocking(true).unwrap();
+        let relay_address = relay_listener.local_addr().unwrap();
+        let (direct_seen_tx, direct_seen_rx) = mpsc::channel();
+        let direct_probe = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match relay_listener.accept() {
+                    Ok((stream, _)) => {
+                        drop(stream);
+                        let _ = direct_seen_tx.send(true);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            let _ = direct_seen_tx.send(false);
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => {
+                        let _ = direct_seen_tx.send(false);
+                        return;
+                    }
+                }
+            }
+        });
+
+        let proxy_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let proxy = proxy_listener.local_addr().unwrap();
+        let proxy_server = thread::spawn(move || {
+            let (mut stream, _) = proxy_listener.accept().unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).unwrap();
+
+            let mut request = [0; 5];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request[..4], &[5, 1, 0, 3]);
+            let mut host = vec![0; request[4] as usize];
+            stream.read_exact(&mut host).unwrap();
+            assert_eq!(host, b"127.0.0.1");
+            let mut port = [0; 2];
+            stream.read_exact(&mut port).unwrap();
+            assert_eq!(u16::from_be_bytes(port), relay_address.port());
+            stream.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+        });
+
+        let endpoint = format!("wss://127.0.0.1:{}", relay_address.port());
+        assert!(super::open_socket(&endpoint, Some(proxy)).is_err());
+        proxy_server.join().unwrap();
+        assert!(!direct_seen_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        direct_probe.join().unwrap();
     }
 
     #[test]
