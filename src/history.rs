@@ -448,29 +448,38 @@ impl History {
         let mut imported = Vec::with_capacity(entries.len());
         cursor = 12;
         for (peer_id, _) in entries {
-            let len =
-                u32::from_be_bytes(bundle[cursor..cursor + 4].try_into().expect("fixed slice"))
-                    as usize;
-            cursor += 4;
-            let (_, messages, links) =
-                decode_backup_with_links(identity, &bundle[cursor..cursor + len], None)?;
-            cursor += len;
-            let (mut history, existing, _) = Self::open(identity, &peer_id)?;
-            let merged = merge_snapshot(existing.clone(), messages)?;
-            let count = merged.len();
-            let has_links = !links.local.is_empty() || !links.peer.is_empty();
-            history.replace(&merged)?;
-            if let Err(error) = apply_backup_links(identity, &peer_id, &links) {
-                let failure = match history.replace(&existing) {
-                    Ok(()) => error.to_string(),
-                    Err(rollback) => format!("{error}; conversation rollback failed ({rollback})"),
-                };
-                return Err(io::Error::other(format!(
-                    "backup bundle stopped after {} conversations; {failure}",
-                    imported.len()
-                )));
+            let result = (|| {
+                let len =
+                    u32::from_be_bytes(bundle[cursor..cursor + 4].try_into().expect("fixed slice"))
+                        as usize;
+                cursor += 4;
+                let (_, messages, links) =
+                    decode_backup_with_links(identity, &bundle[cursor..cursor + len], None)?;
+                cursor += len;
+                let (mut history, existing, _) = Self::open(identity, &peer_id)?;
+                let merged = merge_snapshot(existing.clone(), messages)?;
+                let count = merged.len();
+                let has_links = !links.local.is_empty() || !links.peer.is_empty();
+                history.replace(&merged)?;
+                if let Err(error) = apply_backup_links(identity, &peer_id, &links) {
+                    return match history.replace(&existing) {
+                        Ok(()) => Err(error),
+                        Err(rollback) => Err(io::Error::other(format!(
+                            "{error}; conversation rollback failed ({rollback})"
+                        ))),
+                    };
+                }
+                Ok((peer_id, count, has_links))
+            })();
+            match result {
+                Ok(item) => imported.push(item),
+                Err(error) => {
+                    return Err(io::Error::other(format!(
+                        "backup bundle stopped after {} conversations; {error}",
+                        imported.len()
+                    )))
+                }
             }
-            imported.push((peer_id, count, has_links));
         }
         Ok(imported)
     }
@@ -2823,6 +2832,40 @@ mod tests {
         assert_eq!(
             History::open(&identity, &second).unwrap().1[0].text,
             "second conversation"
+        );
+    }
+
+    #[test]
+    fn bundle_partial_restore_error_reports_already_applied_conversations() {
+        let data = IsolatedData::new();
+        let (identity, code) = Identity::create().unwrap();
+        let first = "63".repeat(32);
+        let second = "64".repeat(32);
+        for (peer, text) in [(&first, "first"), (&second, "second")] {
+            let (mut history, _, _) = History::open(&identity, peer).unwrap();
+            history.append(&message(1, text)).unwrap();
+        }
+        let bundle =
+            History::export_backup_bundle(&identity, &[first.clone(), second.clone()]).unwrap();
+        let destination = data.0.join("bundle-target");
+        std::fs::create_dir_all(&destination).unwrap();
+        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(destination));
+        let target_identity = Identity::from_code(&code).unwrap();
+        let (missing_history, _, _) = History::open(&target_identity, &second).unwrap();
+        let missing_path = missing_history.path.clone();
+        drop(missing_history);
+        std::fs::remove_file(missing_path).unwrap();
+
+        let error = History::import_backup_bundle(&target_identity, &bundle)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stopped after 1 conversations"));
+        assert_eq!(
+            History::read_for_identity_copy(&target_identity, &first)
+                .unwrap()
+                .0[0]
+                .text,
+            "first"
         );
     }
 
