@@ -2080,6 +2080,7 @@ pub(crate) fn is_linked_peer_identity(
         .contains(&previous_id.to_ascii_lowercase()))
 }
 
+#[cfg(test)]
 pub(crate) fn is_linked_local_identity(
     identity: &Identity,
     peer_id: &str,
@@ -2704,6 +2705,7 @@ fn encode_wire_message(message: &StoredMessage, magic: &[u8; 6]) -> io::Result<V
     Ok(frame)
 }
 
+#[cfg(test)]
 pub(crate) fn decode_transfer(
     identity: &Identity,
     peer_id: &str,
@@ -3062,27 +3064,6 @@ pub(crate) fn merge_restored(
     }
     merged.sort_by_key(|message| message.unix_time);
     Ok(merged)
-}
-
-pub(crate) fn missing_restored(
-    existing: &[StoredMessage],
-    offered: &[StoredMessage],
-) -> io::Result<Vec<StoredMessage>> {
-    let merged = merge_restored(existing, offered)?;
-    let mut counts = HashMap::<StoredMessage, usize>::new();
-    for message in existing {
-        *counts.entry(message.clone()).or_default() += 1;
-    }
-    let mut missing = Vec::new();
-    for message in merged {
-        let count = counts.entry(message.clone()).or_default();
-        if *count > 0 {
-            *count -= 1;
-        } else {
-            missing.push(message);
-        }
-    }
-    Ok(missing)
 }
 
 fn message_signing_payload(unix_time: u64, text: &str, proof: &MessageProof) -> Vec<u8> {
@@ -4892,13 +4873,12 @@ mod tests {
             super::decode_transfer(&bob, &local_peer_id, &alice.public_key(), &frame).unwrap();
         assert_eq!(received.sender, MessageSender::Other);
         assert_eq!(
-            super::missing_restored(&[], &[received.clone()]).unwrap(),
+            super::merge_restored(&[], &[received.clone()]).unwrap(),
             vec![received.clone()]
         );
-        assert!(
-            super::missing_restored(&[received.clone()], &[received.clone()])
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            super::merge_restored(&[received.clone()], &[received.clone()]).unwrap(),
+            vec![received.clone()]
         );
 
         let mut changed_text = frame.clone();

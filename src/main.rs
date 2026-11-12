@@ -830,6 +830,7 @@ mod send_tests {
             vec![],
             vec!["ws://relay.example".to_owned()],
             vec!["wss://relay.example:65536".to_owned()],
+            vec![format!("wss://relay.example/{}", "a".repeat(4096))],
             vec![
                 "wss://relay.example".to_owned(),
                 "wss://RELAY.EXAMPLE:443/".to_owned(),
@@ -4166,13 +4167,15 @@ fn load_settings() -> io::Result<AppSettings> {
     load_settings_from_path(&preferences_path()?)
 }
 
+const MAX_SETTINGS_BYTES: usize = 4096;
+
 fn load_settings_from_path(path: &std::path::Path) -> io::Result<AppSettings> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(AppSettings::default()),
         Err(error) => return Err(error),
     };
-    if file.metadata()?.len() > 4096 {
+    if file.metadata()?.len() > MAX_SETTINGS_BYTES as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "settings file is too large",
@@ -4243,6 +4246,12 @@ fn save_settings_to_path(path: &std::path::Path, settings: &AppSettings) -> io::
         "notifications": settings.notifications,
         "relayUrls": relays,
     }))?;
+    if contents.len() > MAX_SETTINGS_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "settings file is too large",
+        ));
+    }
     let temporary = path.with_extension(format!("{}.tmp", random_token()?));
     let result = (|| {
         let mut file = OpenOptions::new()
@@ -4605,7 +4614,15 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             notifications,
             relays,
         };
-        if save_settings(&settings).is_err() {
+        if let Err(error) = save_settings(&settings) {
+            if error.kind() == io::ErrorKind::InvalidInput {
+                return respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    "text/plain; charset=utf-8",
+                    error.to_string().as_bytes(),
+                );
+            }
             return reject(&mut stream, "500 Internal Server Error");
         }
         state
