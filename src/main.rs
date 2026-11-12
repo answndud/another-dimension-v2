@@ -55,7 +55,7 @@ struct AppSettings {
 enum ChatCommand {
     Confirm,
     Send(String, Sender<()>),
-    AcceptIdentityTransition(String, Sender<bool>),
+    AcceptIdentityTransition(String, Sender<Result<(), String>>),
     Cancel,
 }
 
@@ -379,7 +379,7 @@ fn spawn_chat_worker(
                     Ok(ChatCommand::Cancel) => return Err("취소되었습니다.".to_owned()),
                     Ok(ChatCommand::Send(_, _)) => {}
                     Ok(ChatCommand::AcceptIdentityTransition(_, result)) => {
-                        let _ = result.send(false);
+                        let _ = result.send(Err("상대 기록 연결 요청을 처리할 수 없습니다.".to_owned()));
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return Err("취소되었습니다.".to_owned()),
@@ -565,13 +565,13 @@ fn spawn_chat_worker(
                                                 snapshot.message_epoch.wrapping_add(1);
                                         });
                                     })
-                                    .is_ok(),
-                                None => false,
+                                    .map_err(|error| error.to_string()),
+                                None => Err("현재 대화 기록을 사용할 수 없습니다.".to_owned()),
                             }
                         } else {
-                            false
+                            Err("상대가 알린 이전 대화를 찾을 수 없습니다.".to_owned())
                         };
-                        if linked {
+                        if linked.is_ok() {
                             let frame = chat_control(serde_json::json!({
                                 "type": "identity-linked",
                                 "previousPeerId": previous_peer_id,
@@ -582,7 +582,7 @@ fn spawn_chat_worker(
                                 });
                             }
                         }
-                        let _ = result.send(linked);
+                        let _ = result.send(linked.map(|_| ()));
                     }
                     Ok(ChatCommand::Confirm) => {}
                     Err(TryRecvError::Empty) => break,
@@ -1572,8 +1572,14 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             return reject(&mut stream, "409 Conflict");
         }
         return match result_receiver.recv_timeout(Duration::from_secs(10)) {
-            Ok(true) => respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok"),
-            _ => reject(&mut stream, "409 Conflict"),
+            Ok(Ok(())) => respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok"),
+            Ok(Err(error)) => respond(
+                &mut stream,
+                "500 Internal Server Error",
+                "text/plain; charset=utf-8",
+                error.as_bytes(),
+            ),
+            Err(_) => reject(&mut stream, "409 Conflict"),
         };
     }
     if first == "POST /api/chat/cancel HTTP/1.1" {
@@ -1854,8 +1860,13 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         if peer_chat_active(&state, body) {
             return reject(&mut stream, "409 Conflict");
         }
-        if history::History::delete_conversation(identity, body).is_err() {
-            return reject(&mut stream, "500 Internal Server Error");
+        if let Err(error) = history::History::delete_conversation(identity, body) {
+            return respond(
+                &mut stream,
+                "500 Internal Server Error",
+                "text/plain; charset=utf-8",
+                error.to_string().as_bytes(),
+            );
         }
         update_closed_chat_history(&state, body, None);
         return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");

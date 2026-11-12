@@ -28,6 +28,19 @@ static INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 #[cfg(test)]
 thread_local! {
     static TEST_DATA_DIRECTORY: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static TEST_FAILURES: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+const FAIL_INDEX_WRITE: u8 = 1;
+#[cfg(test)]
+const FAIL_DELETE_RESTORE: u8 = 2;
+#[cfg(test)]
+const FAIL_ROLLBACK_REPLACE: u8 = 8;
+
+#[cfg(test)]
+fn test_failure(failure: u8) -> bool {
+    TEST_FAILURES.with(|failures| failures.get() & failure != 0)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -91,6 +104,16 @@ impl History {
             "{}.adlog",
             opaque_conversation_name(&index_key, &peer_id)
         ));
+        if !path.exists()
+            && read_index(identity, &identity_id, &directory)?
+                .iter()
+                .any(|existing| existing == &peer_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("indexed conversation file is missing: {}", path.display()),
+            ));
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -254,7 +277,22 @@ impl History {
         peers.retain(|existing| existing != &peer_id);
         if let Err(error) = write_index(identity, &identity_id, &directory, &peers) {
             if tombstone.exists() {
-                let _ = rename(&tombstone, &path);
+                #[cfg(test)]
+                let restore_result = if test_failure(FAIL_DELETE_RESTORE) {
+                    Err(io::Error::other(
+                        "injected prior conversation restore failure",
+                    ))
+                } else {
+                    rename(&tombstone, &path)
+                };
+                #[cfg(not(test))]
+                let restore_result = rename(&tombstone, &path);
+                if let Err(restore_error) = restore_result {
+                    return Err(io::Error::other(format!(
+                        "history index update failed ({error}); restoring prior conversation failed ({restore_error}); recoverable file: {}",
+                        tombstone.display()
+                    )));
+                }
             }
             return Err(error);
         }
@@ -338,11 +376,23 @@ impl History {
             .any(|item| item.sender == transition.sender && item.text == transition.text)
         {
             merged.push(transition);
-            merged.sort_by_key(|item| item.unix_time);
         }
+        // Always restore chronological ordering, including when the transition
+        // marker was already present in one of the snapshots.
+        merged.sort_by_key(|item| item.unix_time);
         self.replace(&merged)?;
         if let Err(delete_error) = Self::delete_conversation(identity, previous_peer_id) {
-            if let Err(rollback_error) = self.replace(&current) {
+            #[cfg(test)]
+            let rollback = if test_failure(FAIL_ROLLBACK_REPLACE) {
+                Err(io::Error::other(
+                    "injected current conversation rollback failure",
+                ))
+            } else {
+                self.replace(&current)
+            };
+            #[cfg(not(test))]
+            let rollback = self.replace(&current);
+            if let Err(rollback_error) = rollback {
                 return Err(io::Error::other(format!(
                     "prior conversation cleanup failed ({delete_error}); restoring destination also failed ({rollback_error})"
                 )));
@@ -800,6 +850,10 @@ fn write_index(
     directory: &std::path::Path,
     peers: &[String],
 ) -> io::Result<()> {
+    #[cfg(test)]
+    if test_failure(FAIL_INDEX_WRITE) {
+        return Err(io::Error::other("injected history index write failure"));
+    }
     let count = u32::try_from(peers.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many conversations"))?;
     let mut payload = Vec::with_capacity(4 + peers.len() * 32);
@@ -1198,6 +1252,100 @@ mod tests {
         assert!(!History::known_peer_ids(&identity)
             .unwrap()
             .contains(&previous_peer));
+    }
+
+    #[test]
+    fn delete_index_write_failure_restores_encrypted_history() {
+        let data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "71".repeat(32);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history.append(&message(1, "preserve me")).unwrap();
+        let original = std::fs::read(&history.path).unwrap();
+        drop(history);
+        super::TEST_FAILURES.with(|flags| flags.set(super::FAIL_INDEX_WRITE));
+        assert!(History::delete_conversation(&identity, &peer).is_err());
+        super::TEST_FAILURES.with(|flags| flags.set(0));
+        assert_eq!(
+            std::fs::read(data.0.join(identity.public_id()).join(format!(
+                "{}.adlog",
+                super::opaque_conversation_name(
+                    &super::derive_index_key(&identity.storage_key()),
+                    &peer
+                )
+            )))
+            .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn delete_restore_failure_reports_recoverable_tombstone() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "72".repeat(32);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history.append(&message(1, "preserve me")).unwrap();
+        let original = std::fs::read(&history.path).unwrap();
+        drop(history);
+        super::TEST_FAILURES
+            .with(|flags| flags.set(super::FAIL_INDEX_WRITE | super::FAIL_DELETE_RESTORE));
+        let error = History::delete_conversation(&identity, &peer)
+            .unwrap_err()
+            .to_string();
+        super::TEST_FAILURES.with(|flags| flags.set(0));
+        let tombstone = error.split("recoverable file: ").nth(1).unwrap();
+        assert_eq!(std::fs::read(tombstone).unwrap(), original);
+        assert!(error.contains("injected prior conversation restore failure"));
+    }
+
+    #[test]
+    fn missing_indexed_history_is_not_recreated_as_empty() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "73".repeat(32);
+        let (history, _, _) = History::open(&identity, &peer).unwrap();
+        let path = history.path.clone();
+        drop(history);
+        std::fs::remove_file(path).unwrap();
+        let error = match History::open(&identity, &peer) {
+            Ok(_) => panic!("missing indexed history was recreated"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn link_reports_prior_recovery_and_current_rollback_failures_together() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let previous_peer = "74".repeat(32);
+        let current_peer = "75".repeat(32);
+        let (mut previous, _, _) = History::open(&identity, &previous_peer).unwrap();
+        previous.append(&message(1, "prior record")).unwrap();
+        let (mut current, _, _) = History::open(&identity, &current_peer).unwrap();
+        current.append(&message(2, "current record")).unwrap();
+        super::TEST_FAILURES.with(|flags| {
+            flags.set(
+                super::FAIL_INDEX_WRITE | super::FAIL_DELETE_RESTORE | super::FAIL_ROLLBACK_REPLACE,
+            )
+        });
+        let error = current
+            .link_prior_identity(&identity, &previous_peer, message(3, "transition"))
+            .unwrap_err()
+            .to_string();
+        super::TEST_FAILURES.with(|flags| flags.set(0));
+        assert!(error.contains("recoverable file:"));
+        let recovery_path = error
+            .split("recoverable file: ")
+            .nth(1)
+            .unwrap()
+            .split("); restoring destination")
+            .next()
+            .unwrap();
+        assert!(std::path::Path::new(recovery_path).is_file());
+        assert!(error.contains("restoring destination also failed"));
+        assert!(error.contains("injected current conversation rollback failure"));
     }
 
     #[test]

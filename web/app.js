@@ -43,6 +43,7 @@ let reprotectSourceHandle = null;
 let reprotectSourceName = '';
 let reprotectOutput = null;
 let reprotectPassword = '';
+const reprotectWork = new window.ReprotectWork();
 let historySummaries = [];
 let dismissedTransitionKey = '';
 
@@ -54,6 +55,7 @@ function clearReprotectSecrets() {
 }
 
 function clearReprotectState() {
+  reprotectWork.begin();
   clearReprotectSecrets();
   reprotectSourceHandle = null;
   reprotectSourceName = '';
@@ -650,12 +652,14 @@ document.querySelector('#identity-transition-accept').addEventListener('click', 
   button.disabled = true;
   try {
     const response = await request('/api/chat/link-identity', `${operationId}\n${previousPeerId}`);
-    if (!response.ok) throw new Error('link failed');
+    if (!response.ok) throw new Error((await response.text()) || 'link failed');
     document.querySelector('#identity-transition-panel').hidden = true;
     message.textContent = '기존 기록을 현재 대화에 연결했습니다. 상대가 변경 알림을 받았는지는 확인되지 않습니다.';
     await refreshHistoryList();
-  } catch (_) {
-    message.textContent = '기록을 연결하지 못했습니다. 기존 기록은 유지되어 있습니다.';
+  } catch (error) {
+    message.textContent = error instanceof Error && error.message && error.message !== 'link failed'
+      ? error.message
+      : '기록을 연결하지 못했습니다. 기존 기록은 유지되어 있습니다.';
   } finally {
     button.disabled = false;
   }
@@ -817,8 +821,11 @@ document.querySelector('#history-backup-import').addEventListener('click', async
 });
 
 document.querySelector('#history-reprotect-choose').addEventListener('click', async () => {
+  const generation = reprotectWork.begin();
   if (!window.showOpenFilePicker) {
-    message.textContent = '이 브라우저는 안전한 재보호 파일 선택을 지원하지 않습니다. Chromium 기반 브라우저에서 다시 시도하세요.';
+    if (reprotectWork.isCurrent(generation)) {
+      message.textContent = '이 브라우저는 안전한 재보호 파일 선택을 지원하지 않습니다. Chromium 기반 브라우저에서 다시 시도하세요.';
+    }
     return;
   }
   try {
@@ -826,14 +833,10 @@ document.querySelector('#history-reprotect-choose').addEventListener('click', as
       multiple: false,
       types: [{ description: '암호화 대화 백업', accept: { 'application/octet-stream': ['.adbak'] } }],
     });
+    if (!reprotectWork.isCurrent(generation)) return;
     const file = await handle.getFile();
+    if (!reprotectWork.isCurrent(generation)) return;
     if (file.size > 16 * 1024 * 1024) {
-      reprotectSourceHandle = null;
-      reprotectSourceName = '';
-      reprotectOutput = null;
-      reprotectPassword = '';
-      document.querySelector('#history-reprotect-source').textContent = '선택한 파일 없음';
-      document.querySelector('#history-reprotect-save').disabled = true;
       message.textContent = '백업 파일은 16 MB 이하여야 합니다.';
       return;
     }
@@ -845,39 +848,42 @@ document.querySelector('#history-reprotect-choose').addEventListener('click', as
     document.querySelector('#history-reprotect-source').textContent = `${file.name} (${file.size.toLocaleString()} bytes)`;
     message.textContent = '이전 백업 파일을 선택했습니다.';
   } catch (error) {
+    if (!reprotectWork.isCurrent(generation)) return;
     if (error.name !== 'AbortError') message.textContent = '백업 파일을 열지 못했습니다.';
   }
 });
 
 document.querySelector('#history-reprotect').addEventListener('click', async () => {
-  // A new attempt invalidates any output produced by an earlier attempt.
-  reprotectOutput = null;
-  reprotectPassword = '';
-  document.querySelector('#history-reprotect-save').disabled = true;
   const codeField = document.querySelector('#history-reprotect-previous-code');
   const oldPasswordField = document.querySelector('#history-reprotect-previous-password');
   const newPasswordField = document.querySelector('#history-reprotect-new-password');
   const confirmField = document.querySelector('#history-reprotect-new-password-confirm');
-  const previousCode = codeField.value;
-  const previousPassword = oldPasswordField.value;
-  const replacementPassword = newPasswordField.value;
-  if (!reprotectSourceHandle) {
-    clearReprotectSecrets();
+  const { generation, values } = reprotectWork.beginAndClear([
+    codeField, oldPasswordField, newPasswordField, confirmField,
+  ]);
+  const [previousCode, previousPassword, replacementPassword, replacementConfirmation] = values;
+  const sourceHandle = reprotectSourceHandle;
+
+  // Invalidate any prior output before validation or asynchronous work.
+  reprotectOutput = null;
+  reprotectPassword = '';
+  document.querySelector('#history-reprotect-save').disabled = true;
+
+  if (!sourceHandle) {
     message.textContent = '먼저 이전 백업 파일을 선택하세요.';
     return;
   }
-  if (replacementPassword !== confirmField.value) {
-    clearReprotectSecrets();
+  if (replacementPassword !== replacementConfirmation) {
     message.textContent = '새 백업 비밀번호가 일치하지 않습니다.';
     return;
   }
   if (replacementPassword && [...replacementPassword].length < 12) {
-    clearReprotectSecrets();
     message.textContent = '새 백업 비밀번호는 12자 이상이어야 합니다.';
     return;
   }
   try {
-    const file = await reprotectSourceHandle.getFile();
+    const file = await sourceHandle.getFile();
+    if (!reprotectWork.isCurrent(generation)) return;
     if (file.size > 16 * 1024 * 1024) throw new Error('oversized backup');
     const dataUrl = await new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -885,6 +891,7 @@ document.querySelector('#history-reprotect').addEventListener('click', async () 
       reader.onerror = () => reject(reader.error);
       reader.readAsDataURL(file);
     });
+    if (!reprotectWork.isCurrent(generation)) return;
     const backup = String(dataUrl).slice(String(dataUrl).indexOf(',') + 1);
     const response = await request('/api/history/reprotect-backup', JSON.stringify({
       backup,
@@ -892,71 +899,94 @@ document.querySelector('#history-reprotect').addEventListener('click', async () 
       previousPassword,
       replacementPassword,
     }));
+    if (!reprotectWork.isCurrent(generation)) return;
     if (!response.ok) throw new Error('reprotect failed');
-    reprotectOutput = await response.text();
+    const output = await response.text();
+    if (!reprotectWork.isCurrent(generation)) return;
+    reprotectOutput = output;
     reprotectPassword = replacementPassword;
     document.querySelector('#history-reprotect-save').disabled = false;
     message.textContent = '새 백업을 만들었습니다. 저장 후 파일을 다시 읽어 확인하세요. 원본은 아직 보존되어 있습니다.';
   } catch (_) {
+    if (!reprotectWork.isCurrent(generation)) return;
     reprotectOutput = null;
     reprotectPassword = '';
     document.querySelector('#history-reprotect-save').disabled = true;
     message.textContent = '백업, 이전 코드 또는 비밀번호를 확인하지 못했습니다. 원본 파일은 변경하지 않았습니다.';
-  } finally {
-    codeField.value = '';
-    oldPasswordField.value = '';
-    newPasswordField.value = '';
-    confirmField.value = '';
   }
 });
 
 document.querySelector('#history-reprotect-save').addEventListener('click', async () => {
-  if (!reprotectOutput || !reprotectSourceHandle) return;
+  const sourceHandle = reprotectSourceHandle;
+  const output = reprotectOutput;
+  const password = reprotectPassword;
+  const sourceName = reprotectSourceName;
+  if (!output || !sourceHandle) return;
   if (!window.showSaveFilePicker) {
     message.textContent = '이 브라우저는 새 백업을 저장 위치에서 다시 확인하는 기능을 지원하지 않습니다.';
     return;
   }
+  const generation = reprotectWork.begin();
+  const isCurrent = () => reprotectWork.isCurrent(generation);
   let writable = null;
   let saveStarted = false;
   try {
-    const suggestedName = `${reprotectSourceName.replace(/\.adbak$/i, '')}.new-identity.adbak`;
+    const suggestedName = `${sourceName.replace(/\.adbak$/i, '')}.new-identity.adbak`;
     const outputHandle = await window.showSaveFilePicker({
       suggestedName,
       types: [{ description: '암호화 대화 백업', accept: { 'application/octet-stream': ['.adbak'] } }],
     });
-    if (await reprotectSourceHandle.isSameEntry(outputHandle)) {
-      message.textContent = '원본 백업과 다른 새 파일을 선택하세요. 원본은 변경하지 않았습니다.';
+    if (!isCurrent()) return;
+    if (await sourceHandle.isSameEntry(outputHandle)) {
+      if (isCurrent()) message.textContent = '원본 백업과 다른 새 파일을 선택하세요. 원본은 변경하지 않았습니다.';
       return;
     }
+    if (!isCurrent()) return;
     saveStarted = true;
-    const binary = atob(reprotectOutput);
+    const binary = atob(output);
     const bytes = new Uint8Array(binary.length);
     for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
     writable = await outputHandle.createWritable();
+    if (!isCurrent()) {
+      await writable.abort();
+      writable = null;
+      return;
+    }
     await writable.write(bytes);
+    if (!isCurrent()) {
+      await writable.abort();
+      writable = null;
+      return;
+    }
     await writable.close();
     writable = null;
+    if (!isCurrent()) return;
 
     const savedFile = await outputHandle.getFile();
+    if (!isCurrent()) return;
     const dataUrl = await new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result);
       reader.onerror = () => reject(reader.error);
       reader.readAsDataURL(savedFile);
     });
+    if (!isCurrent()) return;
     const savedBackup = String(dataUrl).slice(String(dataUrl).indexOf(',') + 1);
     const verification = await request('/api/history/verify-backup', JSON.stringify({
       backup: savedBackup,
-      password: reprotectPassword,
+      password,
     }));
+    if (!isCurrent()) return;
     if (!verification.ok) throw new Error('saved backup verification failed');
     const result = await verification.json();
+    if (!isCurrent()) return;
     reprotectOutput = null;
     reprotectPassword = '';
     document.querySelector('#history-reprotect-save').disabled = true;
     const removeSource = window.confirm(
       `새 파일을 저장 위치에서 다시 읽어 확인했습니다 (${result.messageCount}개 메시지).\n\n원본 파일은 그대로 있습니다. 원본을 삭제하려면 Finder에서 직접 삭제해야 합니다. 원본을 직접 삭제하시겠습니까?`,
     );
+    if (!isCurrent()) return;
     message.textContent = removeSource
       ? '새 백업 확인 완료. Finder에서 선택한 원본 파일만 직접 삭제하세요. 다른 사본은 별도로 관리해야 합니다.'
       : '새 백업 확인 완료. 원본 파일을 보존했습니다.';
@@ -967,6 +997,7 @@ document.querySelector('#history-reprotect-save').addEventListener('click', asyn
     if (writable) {
       try { await writable.abort(); } catch (_) { /* keep the original backup */ }
     }
+    if (!isCurrent()) return;
     if (error.name !== 'AbortError') {
       if (saveStarted) {
         reprotectOutput = null;
@@ -1038,7 +1069,11 @@ document.querySelector('#delete-conversation').addEventListener('click', async (
     message.textContent = '먼저 해당 대화의 연결을 종료한 뒤 다시 시도하세요.';
     return;
   }
-  if (!response.ok) { message.textContent = '대화를 삭제하지 못했습니다.'; return; }
+  if (!response.ok) {
+    const detail = await response.text();
+    message.textContent = detail || '대화를 삭제하지 못했습니다.';
+    return;
+  }
   selectedHistoryPeer = '';
   selectedHistoryMessages = [];
   selectedHistoryIndices.clear();
