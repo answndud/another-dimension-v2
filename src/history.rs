@@ -259,7 +259,9 @@ impl History {
             return Err(error);
         }
         if tombstone.exists() {
-            std::fs::remove_file(tombstone)?;
+            // The index update is the logical delete. A leftover encrypted
+            // tombstone must not make callers believe the operation rolled back.
+            let _ = std::fs::remove_file(tombstone);
         }
         Ok(())
     }
@@ -327,7 +329,10 @@ impl History {
                 "current conversation has an incomplete record",
             ));
         }
-        let mut merged = merge_snapshot(current, previous);
+        // These snapshots belong to different identity epochs. Equal message
+        // contents do not prove they are the same message, so preserve both.
+        let mut merged = current.clone();
+        merged.extend(previous);
         if !merged
             .iter()
             .any(|item| item.sender == transition.sender && item.text == transition.text)
@@ -336,7 +341,14 @@ impl History {
             merged.sort_by_key(|item| item.unix_time);
         }
         self.replace(&merged)?;
-        Self::delete_conversation(identity, previous_peer_id)?;
+        if let Err(delete_error) = Self::delete_conversation(identity, previous_peer_id) {
+            if let Err(rollback_error) = self.replace(&current) {
+                return Err(io::Error::other(format!(
+                    "prior conversation cleanup failed ({delete_error}); restoring destination also failed ({rollback_error})"
+                )));
+            }
+            return Err(delete_error);
+        }
         Ok(merged)
     }
 
@@ -1186,6 +1198,24 @@ mod tests {
         assert!(!History::known_peer_ids(&identity)
             .unwrap()
             .contains(&previous_peer));
+    }
+
+    #[test]
+    fn identity_transition_merge_preserves_equal_messages_from_both_epochs() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let previous_peer = "61".repeat(32);
+        let current_peer = "62".repeat(32);
+        let same = message(10, "same text at same second");
+        let (mut old_history, _, _) = History::open(&identity, &previous_peer).unwrap();
+        old_history.append(&same).unwrap();
+        let (mut new_history, _, _) = History::open(&identity, &current_peer).unwrap();
+        new_history.append(&same).unwrap();
+        let transition = message(20, "transition marker");
+        let merged = new_history
+            .link_prior_identity(&identity, &previous_peer, transition)
+            .unwrap();
+        assert_eq!(merged.iter().filter(|item| *item == &same).count(), 2);
     }
 
     #[test]

@@ -53,6 +53,18 @@ function clearReprotectSecrets() {
   document.querySelector('#history-reprotect-new-password-confirm').value = '';
 }
 
+function clearReprotectState() {
+  clearReprotectSecrets();
+  reprotectSourceHandle = null;
+  reprotectSourceName = '';
+  reprotectOutput = null;
+  reprotectPassword = '';
+  const source = document.querySelector('#history-reprotect-source');
+  if (source) source.textContent = '선택한 파일 없음';
+  const save = document.querySelector('#history-reprotect-save');
+  if (save) save.disabled = true;
+}
+
 function show(view) {
   bridgeForm.hidden = view !== 'bridge';
   entry.hidden = view !== 'entry';
@@ -545,6 +557,7 @@ document.querySelector('#logout').addEventListener('click', async () => {
     selectedHistoryMessages = [];
     historySummaries = [];
     dismissedTransitionKey = '';
+    clearReprotectState();
     historyMessages.replaceChildren();
     historyList.replaceChildren();
     show('entry');
@@ -837,6 +850,10 @@ document.querySelector('#history-reprotect-choose').addEventListener('click', as
 });
 
 document.querySelector('#history-reprotect').addEventListener('click', async () => {
+  // A new attempt invalidates any output produced by an earlier attempt.
+  reprotectOutput = null;
+  reprotectPassword = '';
+  document.querySelector('#history-reprotect-save').disabled = true;
   const codeField = document.querySelector('#history-reprotect-previous-code');
   const oldPasswordField = document.querySelector('#history-reprotect-previous-password');
   const newPasswordField = document.querySelector('#history-reprotect-new-password');
