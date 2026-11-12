@@ -8,7 +8,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use identity::Identity;
 use relay::{InviteCode, RelayError, RelayRendezvous, RelaySession, RelayUpdate, DEFAULT_RELAY};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{create_dir_all, rename, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -36,6 +36,10 @@ const PEER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 const SYNC_CHUNK_RECORDS: usize = 32;
 const SYNC_CHUNK_BYTES: usize = 64 * 1024;
 const RESTORE_PREVIEW_RECORDS: usize = 12;
+const MAX_MERGE_PENDING_MESSAGES: usize = 256;
+const MAX_MERGE_PENDING_BYTES: usize = 1024 * 1024;
+const RESTORE_MERGE_SEND_REJECTION: &str =
+    "기록 병합 중이라 메시지를 전송하지 않았습니다. 병합 완료 후 다시 보내세요.";
 
 struct State {
     code: String,
@@ -58,7 +62,7 @@ struct AppSettings {
 
 enum ChatCommand {
     Confirm,
-    Send(String, Sender<()>),
+    Send(String, Sender<Result<(), String>>),
     AcceptIdentityTransition(String, Sender<Result<(), String>>),
     RequestHistoryRestore(Sender<Result<(), String>>),
     ResolveHistoryRestore(bool),
@@ -72,6 +76,25 @@ struct ChatOperation {
     message_reader: Mutex<Option<MessagePageReader>>,
     sender: Sender<ChatCommand>,
     cancelled: Arc<AtomicBool>,
+}
+
+struct PendingMergeQueueNotice {
+    operation: Arc<ChatOperation>,
+    has_pending: Arc<AtomicBool>,
+}
+
+impl Drop for PendingMergeQueueNotice {
+    fn drop(&mut self) {
+        if self.has_pending.load(Ordering::SeqCst) {
+            chat_update(&self.operation, |snapshot| {
+                snapshot.storage_error = Some(
+                    "연결 종료로 병합 중 임시 대기하던 수신 메시지를 기록에 반영하지 못했습니다. 상대 기록 복원을 다시 요청해 확인하세요."
+                        .to_owned(),
+                );
+                snapshot.error = snapshot.storage_error.clone();
+            });
+        }
+    }
 }
 
 fn owned_chat_operation<'a>(
@@ -484,9 +507,84 @@ fn discard_restore_staging(
     });
 }
 
-fn submit_chat_message(sender: &Sender<ChatCommand>, text: String, timeout: Duration) -> bool {
+fn submit_chat_message(
+    sender: &Sender<ChatCommand>,
+    text: String,
+    timeout: Duration,
+) -> Result<(), String> {
     let (processed, result) = mpsc::channel();
-    sender.send(ChatCommand::Send(text, processed)).is_ok() && result.recv_timeout(timeout).is_ok()
+    sender
+        .send(ChatCommand::Send(text, processed))
+        .map_err(|_| "채팅 작업자가 종료되었습니다.".to_owned())?;
+    result.recv_timeout(timeout).map_err(|_| {
+        "전송 결과를 확인할 수 없습니다. 입력을 보존하고 다시 보내기 전 기록을 확인하세요."
+            .to_owned()
+    })?
+}
+
+fn restore_merge_active(operation: &ChatOperation) -> bool {
+    operation
+        .snapshot
+        .lock()
+        .map(|snapshot| {
+            snapshot.history_restore_in_progress
+                || matches!(snapshot.history_restore_state, "merge-queued" | "merging")
+        })
+        .unwrap_or(true)
+}
+
+fn restore_merge_send_error(operation: &ChatOperation) -> Option<&'static str> {
+    restore_merge_active(operation).then_some(RESTORE_MERGE_SEND_REJECTION)
+}
+
+fn append_pending_restore_messages(
+    operation: &ChatOperation,
+    history: &mut Option<history::History>,
+    messages: &mut VecDeque<history::StoredMessage>,
+    queued_bytes: &mut usize,
+    max_messages: usize,
+) -> io::Result<usize> {
+    if messages.is_empty() {
+        return Ok(0);
+    }
+    let _history_state_guard = operation
+        .history_state_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut appended = 0usize;
+    while appended < max_messages {
+        let Some(entry) = messages.pop_front() else {
+            break;
+        };
+        *queued_bytes = queued_bytes.saturating_sub(entry.text.len());
+        let Some(current) = history.as_mut() else {
+            return Err(io::Error::other("대화 기록 핸들을 사용할 수 없습니다."));
+        };
+        current.append(&entry)?;
+        chat_update(operation, |snapshot| {
+            snapshot.message_count = snapshot.message_count.saturating_add(1);
+            snapshot.message_epoch = snapshot.message_epoch.wrapping_add(1);
+            snapshot.messages.push(chat_entry(entry));
+        });
+        appended += 1;
+    }
+    Ok(appended)
+}
+
+fn queue_message_during_restore_merge(
+    messages: &mut VecDeque<history::StoredMessage>,
+    queued_bytes: &mut usize,
+    entry: history::StoredMessage,
+) -> Result<(), history::StoredMessage> {
+    let bytes = entry.text.len();
+    if messages.len() >= MAX_MERGE_PENDING_MESSAGES
+        || queued_bytes.saturating_add(bytes) > MAX_MERGE_PENDING_BYTES
+    {
+        return Err(entry);
+    }
+    *queued_bytes += bytes;
+    messages.push_back(entry);
+    Ok(())
 }
 
 fn chat_control(value: serde_json::Value) -> Vec<u8> {
@@ -993,6 +1091,7 @@ mod send_tests {
         let code = access_code.to_string();
         let owner_id = identity.public_id().to_owned();
         let peer_id = "8b".repeat(32);
+        let (command_sender, command_receiver) = mpsc::channel();
         let (mut history, _, _) = history::History::open_for_chat(&identity, &peer_id).unwrap();
         let stored = |time, text: &str| history::StoredMessage {
             unix_time: time,
@@ -1029,7 +1128,7 @@ mod send_tests {
                 message_epoch: 0,
             }),
             message_reader: Mutex::new(None),
-            sender: mpsc::channel().0,
+            sender: command_sender,
             cancelled: Arc::new(AtomicBool::new(false)),
         });
 
@@ -1052,6 +1151,8 @@ mod send_tests {
             .append_verified(&stored(3, "restored proposal"))
             .unwrap();
         staging.finish().unwrap();
+        assert!(restore_merge_active(&operation));
+        assert!(restore_merge_send_error(&operation).is_some());
 
         let (replaced_send, replaced_receive) = mpsc::channel();
         let (release_replace_send, release_replace_receive) = mpsc::channel();
@@ -1090,6 +1191,21 @@ mod send_tests {
                 .unwrap(),
             3
         );
+
+        let mut merge_pending = VecDeque::new();
+        let mut merge_pending_bytes = 0;
+        queue_message_during_restore_merge(
+            &mut merge_pending,
+            &mut merge_pending_bytes,
+            history::StoredMessage {
+                unix_time: 5,
+                sender: history::MessageSender::Other,
+                text: "received during merge".to_owned(),
+                proof: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(merge_pending.len(), 1);
 
         let (append_done_send, append_done_receive) = mpsc::channel();
         let (append_started_send, append_started_receive) = mpsc::channel();
@@ -1136,9 +1252,27 @@ mod send_tests {
         merge.join().unwrap();
         append.join().unwrap();
 
+        let mut current = Some(
+            history::History::open_for_chat(&identity, &peer_id)
+                .unwrap()
+                .0,
+        );
+        assert_eq!(
+            append_pending_restore_messages(
+                &operation,
+                &mut current,
+                &mut merge_pending,
+                &mut merge_pending_bytes,
+                8,
+            )
+            .unwrap(),
+            1
+        );
+        assert!(merge_pending.is_empty());
+
         let snapshot = operation.snapshot.lock().unwrap();
-        assert_eq!(snapshot.message_count, 4);
-        assert_eq!(snapshot.message_epoch, 1);
+        assert_eq!(snapshot.message_count, 5);
+        assert_eq!(snapshot.message_epoch, 2);
         drop(snapshot);
         let restored_identity = Identity::from_code(&code).unwrap();
         let state = Arc::new(Mutex::new(State {
@@ -1161,6 +1295,20 @@ mod send_tests {
         );
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("after replacement"));
+        assert!(response.contains("received during merge"));
+        operation.snapshot.lock().unwrap().history_restore_state = "merging";
+        let rejected_send = call_test_api(
+            &state,
+            "/api/chat/send",
+            "count-operation\nkeep during merge",
+            "test-session",
+        );
+        assert!(rejected_send.starts_with("HTTP/1.1 409 Conflict"));
+        assert!(rejected_send.contains(RESTORE_MERGE_SEND_REJECTION));
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         assert!(response.contains("restored proposal"));
     }
 
@@ -1360,11 +1508,7 @@ mod send_tests {
             let command = receiver.recv().unwrap();
             drop(command);
         });
-        assert!(!submit_chat_message(
-            &sender,
-            "unsent".into(),
-            Duration::from_secs(1)
-        ));
+        assert!(submit_chat_message(&sender, "unsent".into(), Duration::from_secs(1)).is_err());
         worker.join().unwrap();
     }
 
@@ -1374,16 +1518,12 @@ mod send_tests {
         let worker = thread::spawn(move || {
             if let ChatCommand::Send(text, processed) = receiver.recv().unwrap() {
                 assert_eq!(text, "hello");
-                processed.send(()).unwrap();
+                processed.send(Ok(())).unwrap();
             } else {
                 panic!("expected message");
             }
         });
-        assert!(submit_chat_message(
-            &sender,
-            "hello".into(),
-            Duration::from_secs(1)
-        ));
+        assert!(submit_chat_message(&sender, "hello".into(), Duration::from_secs(1)).is_ok());
         worker.join().unwrap();
     }
 
@@ -1603,11 +1743,43 @@ fn spawn_chat_worker(
         let mut restore_started_at = None::<Instant>;
         let mut outgoing_sync = None::<HistorySyncSender>;
         let mut outgoing_sync_started_at = None::<Instant>;
+        let mut merge_pending_messages = VecDeque::<history::StoredMessage>::new();
+        let mut merge_pending_bytes = 0usize;
+        let merge_queue_has_pending = Arc::new(AtomicBool::new(false));
+        let _merge_queue_notice = PendingMergeQueueNotice {
+            operation: Arc::clone(&operation),
+            has_pending: Arc::clone(&merge_queue_has_pending),
+        };
         let mut last_peer_activity = Instant::now();
         let mut last_heartbeat = Instant::now();
 
         while !operation.cancelled.load(Ordering::SeqCst) {
             let now = Instant::now();
+            if !merge_pending_messages.is_empty() && !restore_merge_active(&operation) {
+                match append_pending_restore_messages(
+                    &operation,
+                    &mut history,
+                    &mut merge_pending_messages,
+                    &mut merge_pending_bytes,
+                    8,
+                ) {
+                    Ok(_) => {
+                        merge_queue_has_pending
+                            .store(!merge_pending_messages.is_empty(), Ordering::SeqCst);
+                    }
+                    Err(error) => {
+                        chat_update(&operation, |snapshot| {
+                            snapshot.storage_error = Some(format!(
+                                "병합 중 받은 메시지를 로컬 기록에 저장하지 못했습니다. 연결을 다시 설정하고 상대 기록 복원을 재시도하세요: {error}"
+                            ));
+                            snapshot.error = snapshot.storage_error.clone();
+                            snapshot.phase = "disconnected";
+                        });
+                        discard_restore_staging(&mut pending_restore, &operation);
+                        return;
+                    }
+                }
+            }
             if restore_started_at
                 .is_some_and(|started| now.duration_since(started) > Duration::from_secs(30))
             {
@@ -1669,6 +1841,10 @@ fn spawn_chat_worker(
             loop {
                 match commands.try_recv() {
                     Ok(ChatCommand::Send(text, processed)) => {
+                        if let Some(error) = restore_merge_send_error(&operation) {
+                            let _ = processed.send(Err(error.to_owned()));
+                            continue;
+                        }
                         let entry = match history::sign_message(
                             &identity,
                             &peer_id,
@@ -1677,7 +1853,8 @@ fn spawn_chat_worker(
                         ) {
                             Ok(entry) => entry,
                             Err(_) => {
-                                let _ = processed.send(());
+                                let _ = processed
+                                    .send(Err("메시지 서명을 만들지 못했습니다.".to_owned()));
                                 chat_update(&operation, |snapshot| {
                                     snapshot.storage_error =
                                         Some("메시지에 발신 서명을 만들지 못했습니다.".to_owned())
@@ -1688,7 +1865,9 @@ fn spawn_chat_worker(
                         let frame = match history::encode_signed_message(&entry) {
                             Ok(frame) => frame,
                             Err(_) => {
-                                let _ = processed.send(());
+                                let _ = processed.send(Err(
+                                    "서명 메시지를 전송 형식으로 만들지 못했습니다.".to_owned(),
+                                ));
                                 chat_update(&operation, |snapshot| {
                                     snapshot.storage_error = Some(
                                         "서명된 메시지를 전송 형식으로 만들지 못했습니다."
@@ -1726,7 +1905,7 @@ fn spawn_chat_worker(
                                         snapshot.storage_error = Some("대화 기록을 저장하지 못했습니다. 프로그램을 종료하면 이 메시지를 잃을 수 있습니다.".to_owned());
                                     }
                                 });
-                                let _ = processed.send(());
+                                let _ = processed.send(Ok(()));
                             }
                             Err(_) => {
                                 let _history_state_guard = operation
@@ -1755,7 +1934,7 @@ fn spawn_chat_worker(
                                         "메시지를 로컬 기록에 보존했습니다. relay 전송 결과는 알 수 없으며 다시 보내면 중복될 수 있습니다.".to_owned()
                                     });
                                 });
-                                let _ = processed.send(());
+                                let _ = processed.send(Err("메시지 전송 결과를 알 수 없습니다. 입력을 보존하고 기록을 확인하세요.".to_owned()));
                                 discard_restore_staging(&mut pending_restore, &operation);
                                 return;
                             }
@@ -1903,7 +2082,7 @@ fn spawn_chat_worker(
                             chat_update(&operation, |snapshot| {
                                 snapshot.history_restore_state = "merging";
                                 snapshot.history_restore_in_progress = true;
-                                snapshot.history_restore_status = Some("최종 병합 중입니다. 대화 기록 저장은 잠금 때문에 잠시 대기할 수 있습니다. 연결 종료 후에도 병합과 결과 상태는 유지됩니다.".to_owned());
+                                snapshot.history_restore_status = Some("최종 병합 중입니다. 메시지 전송은 병합 완료 후 다시 시도해야 하며, 수신 메시지는 제한된 메모리 대기열에 보관한 뒤 기록에 반영합니다. heartbeat와 relay 수신은 계속 처리합니다. 연결 종료 뒤에도 병합 결과를 확인할 수 있습니다.".to_owned());
                             });
                             thread::spawn(move || {
                                 let _history_state_guard = merge_operation
@@ -2022,6 +2201,28 @@ fn spawn_chat_worker(
                                     return;
                                 }
                             };
+                            if restore_merge_active(&operation) {
+                                if queue_message_during_restore_merge(
+                                    &mut merge_pending_messages,
+                                    &mut merge_pending_bytes,
+                                    entry,
+                                )
+                                .is_err()
+                                {
+                                    drop(history.take());
+                                    chat_update(&operation, |snapshot| {
+                                        snapshot.storage_error = Some(
+                                            "기록 병합 중 수신 메시지 대기 한도를 초과했습니다. 새 메시지는 저장하지 못했으며 상대 기록 복원 후 대화를 다시 연결해 확인하세요.".to_owned(),
+                                        );
+                                        snapshot.error = snapshot.storage_error.clone();
+                                        snapshot.phase = "disconnected";
+                                    });
+                                    discard_restore_staging(&mut pending_restore, &operation);
+                                    return;
+                                }
+                                merge_queue_has_pending.store(true, Ordering::SeqCst);
+                                continue;
+                            }
                             let _history_state_guard = operation
                                 .history_state_lock
                                 .lock()
@@ -3819,9 +4020,33 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         if snapshot.phase != "connected" {
             return reject(&mut stream, "409 Conflict");
         }
+        if snapshot.history_restore_in_progress
+            || matches!(snapshot.history_restore_state, "merge-queued" | "merging")
+        {
+            return respond(
+                &mut stream,
+                "409 Conflict",
+                "text/plain; charset=utf-8",
+                RESTORE_MERGE_SEND_REJECTION.as_bytes(),
+            );
+        }
         drop(snapshot);
-        if !submit_chat_message(&operation.sender, text.to_owned(), Duration::from_secs(10)) {
-            return reject(&mut stream, "503 Service Unavailable");
+        if let Err(error) =
+            submit_chat_message(&operation.sender, text.to_owned(), Duration::from_secs(10))
+        {
+            let status = if error == RESTORE_MERGE_SEND_REJECTION {
+                "409 Conflict"
+            } else if error.contains("전송 결과를 확인할 수 없습니다") {
+                "503 Service Unavailable"
+            } else {
+                "503 Service Unavailable"
+            };
+            return respond(
+                &mut stream,
+                status,
+                "text/plain; charset=utf-8",
+                error.as_bytes(),
+            );
         }
         return respond(
             &mut stream,

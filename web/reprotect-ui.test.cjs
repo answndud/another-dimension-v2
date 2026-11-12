@@ -577,6 +577,17 @@ test('actual UI: restore jobs reopen only for the identity that created them', a
   });
 });
 
+test('actual UI: send rejected during restore merge preserves input and explains retry timing', async () => {
+  const h = createHarness();
+  h.evaluate("operationId = 'merge-operation'; lastPhase = 'connected'; chatText.value = 'keep this message'");
+  const submit = h.element('#send-form').listeners.submit;
+  const pending = submit({ preventDefault() {} });
+  h.requestFor('/api/chat/send').resolve(response('기록 병합 중이라 메시지를 전송하지 않았습니다. 병합 완료 후 다시 보내세요.', 409));
+  await pending;
+  assert.equal(h.element('#chat-text').value, 'keep this message');
+  assert.equal(h.element('#chat-status').textContent, '기록 병합 중이라 메시지를 전송하지 않았습니다. 병합 완료 후 다시 보내세요.');
+});
+
 test('actual UI: staging cleanup failure remains visible after disconnect', () => {
   const h = createHarness();
   h.evaluate(`updateChatView({

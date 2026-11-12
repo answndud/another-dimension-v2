@@ -872,7 +872,14 @@ sendForm.addEventListener('submit', async (event) => {
   button.disabled = true;
   try {
     const response = await request('/api/chat/send', body);
-    if (!response.ok) throw new Error('send failed');
+    if (!response.ok) {
+      const detail = await response.text();
+      if (response.status === 409 && detail) {
+        chatStatus.textContent = detail;
+        return;
+      }
+      throw new Error('send failed');
+    }
     if (chatText.value === text) chatText.value = '';
     chatText.focus();
   } catch (_) {
