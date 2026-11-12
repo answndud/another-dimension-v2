@@ -829,6 +829,7 @@ mod send_tests {
             "test-session",
         );
         assert!(pending.contains("\"historyRestoreState\":\"merge-queued\""));
+        chat_update(&operation, |snapshot| snapshot.phase = "disconnected");
         {
             let (lock, changed) = &*gate;
             *lock.lock().unwrap() = true;
