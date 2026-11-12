@@ -304,7 +304,7 @@ impl RelaySession {
         let (keys, peer_author, session_tag) = transport.relay_credentials();
         let keys = keys.clone();
         let topic = hex(session_tag);
-        let subscription = SubscriptionId::new(SUBSCRIPTION_ID);
+        let subscription = new_subscription_id()?;
         let filter = Filter::new()
             .kind(Kind::Custom(EVENT_KIND))
             .custom_tag(SingleLetterTag::LOWERCASE_T, topic.clone())
@@ -376,12 +376,14 @@ impl RelaySession {
         let mut awaiting = BTreeSet::new();
         let mut index = 0;
         while index < self.relays.len() {
-            if self.relays[index].ready && self.relays[index].send_text(&text).is_err() {
+            // REQ is sent when each RelayLink is created. EOSE only marks the
+            // end of historical results; it does not mean the subscription
+            // becomes active. Publish to every subscribed socket so a late
+            // EOSE on a shared relay cannot lose the first live message.
+            if self.relays[index].send_text(&text).is_err() {
                 self.remove_relay(index);
-            } else if self.relays[index].ready {
-                awaiting.insert(self.relays[index].id);
-                index += 1;
             } else {
+                awaiting.insert(self.relays[index].id);
                 index += 1;
             }
         }
@@ -818,7 +820,7 @@ impl RelayRendezvous {
             Role::Initiator => Some(random_hex(16)?),
             Role::Responder => None,
         };
-        let subscription = SubscriptionId::new(SUBSCRIPTION_ID);
+        let subscription = new_subscription_id()?;
         let mut filter = Filter::new()
             .kind(Kind::Custom(EVENT_KIND))
             .custom_tag(SingleLetterTag::LOWERCASE_T, topic.clone())
@@ -1031,17 +1033,17 @@ impl RelayRendezvous {
             ))
             .finalize(&self.keys)?;
         let serialized = ClientMessage::event(event).as_json();
-        if !self.relays.iter().any(|relay| relay.ready) {
-            self.wait_until_relay_ready(self.timeout)?;
-        }
         let mut delivered = false;
         let mut index = 0;
         while index < self.relays.len() {
-            if self.relays[index].ready && self.relays[index].send_text(&serialized).is_err() {
+            // All links already sent REQ during connect_with. Do not gate an
+            // ephemeral rendezvous frame on EOSE: a late shared relay is
+            // subscribed and can deliver this same event immediately.
+            if self.relays[index].send_text(&serialized).is_err() {
                 self.relays.remove(index);
                 self.next_relay = 0;
             } else {
-                delivered |= self.relays[index].ready;
+                delivered = true;
                 index += 1;
             }
         }
@@ -1205,73 +1207,6 @@ impl RelayRendezvous {
             Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => Ok(None),
         }
     }
-
-    fn wait_until_relay_ready(&mut self, timeout: Duration) -> Result<(), RelayError> {
-        let deadline = Instant::now() + timeout;
-        while !self.relays.iter().any(|relay| relay.ready) {
-            if self
-                .cancelled
-                .as_ref()
-                .is_some_and(|token| token.load(Ordering::SeqCst))
-            {
-                return Err(RelayError::Cancelled);
-            }
-            if Instant::now() >= deadline {
-                return Err(RelayError::TimedOut("relay subscription"));
-            }
-            let Some((_index, incoming)) = self.poll_any_raw_message()? else {
-                continue;
-            };
-            self.buffer_incoming(_index, incoming)?;
-        }
-        Ok(())
-    }
-
-    fn poll_any_raw_message(&mut self) -> Result<Option<(usize, Message)>, RelayError> {
-        if self.relays.is_empty() {
-            return Err(RelayError::NoRelayAvailable);
-        }
-        let mut attempts = self.relays.len();
-        while attempts > 0 && !self.relays.is_empty() {
-            let index = self.next_relay % self.relays.len();
-            self.next_relay = (index + 1) % self.relays.len();
-            attempts -= 1;
-            match self.relays[index].io.read_message() {
-                Ok(Some(message)) => return Ok(Some((index, message))),
-                Ok(None) => {}
-                Err(_) => {
-                    self.relays.remove(index);
-                    self.next_relay = if self.relays.is_empty() {
-                        0
-                    } else {
-                        index % self.relays.len()
-                    };
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn buffer_incoming(&mut self, index: usize, incoming: Message) -> Result<(), RelayError> {
-        match incoming {
-            Message::Text(text) => {
-                if let Ok(RelayMessage::EndOfStoredEvents(subscription)) =
-                    RelayMessage::from_json(text.as_str())
-                {
-                    if subscription.as_ref() == &self.relays[index].subscription {
-                        self.relays[index].ready = true;
-                        return Ok(());
-                    }
-                }
-                self.relays[index].buffered.push_back(Message::Text(text));
-            }
-            Message::Ping(payload) => {
-                self.relays[index].io.send_message(Message::Pong(payload))?;
-            }
-            other => self.relays[index].buffered.push_back(other),
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1279,6 +1214,7 @@ enum SubscriptionStatus {
     Pending,
     Ready,
     Closed(String),
+    Stale,
 }
 
 fn subscription_status(
@@ -1286,14 +1222,22 @@ fn subscription_status(
     expected: &SubscriptionId,
 ) -> Result<SubscriptionStatus, RelayError> {
     Ok(match RelayMessage::from_json(text)? {
-        RelayMessage::EndOfStoredEvents(subscription) if subscription.as_ref() == expected => {
-            SubscriptionStatus::Ready
+        RelayMessage::EndOfStoredEvents(subscription) => {
+            if subscription.as_ref() == expected {
+                SubscriptionStatus::Ready
+            } else {
+                SubscriptionStatus::Stale
+            }
         }
         RelayMessage::Closed {
             subscription_id,
             message,
-        } if subscription_id.as_ref() == expected => {
-            SubscriptionStatus::Closed(message.to_string())
+        } => {
+            if subscription_id.as_ref() == expected {
+                SubscriptionStatus::Closed(message.to_string())
+            } else {
+                SubscriptionStatus::Stale
+            }
         }
         _ => SubscriptionStatus::Pending,
     })
@@ -1339,6 +1283,7 @@ fn wait_for_any_subscription(
                         relays[index].ready = true;
                         first_ready_at.get_or_insert_with(Instant::now);
                     }
+                    Ok(SubscriptionStatus::Stale) => {}
                     Ok(SubscriptionStatus::Closed(_)) | Err(_) => {
                         relays.remove(index);
                         next = 0;
@@ -1422,6 +1367,13 @@ fn random_hex(bytes_len: usize) -> io::Result<String> {
     Ok(hex(&bytes))
 }
 
+fn new_subscription_id() -> Result<SubscriptionId, RelayError> {
+    Ok(SubscriptionId::new(format!(
+        "{SUBSCRIPTION_ID}-{}",
+        random_hex(12)?
+    )))
+}
+
 fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut result = String::with_capacity(bytes.len() * 2);
@@ -1480,7 +1432,8 @@ mod tests {
         closed_subscriptions: BTreeSet<String>,
         silent_subscriptions: BTreeSet<String>,
         overflowing_subscriptions: BTreeSet<String>,
-        delayed_subscriptions: HashMap<String, Duration>,
+        delayed_subscriptions: HashMap<String, (usize, Duration)>,
+        request_counts: HashMap<(String, usize), usize>,
         ack_modes: HashMap<String, FakeAckMode>,
         published: Vec<(String, String)>,
     }
@@ -1558,12 +1511,31 @@ mod tests {
                 .insert(endpoint.to_owned());
         }
 
-        fn delay_subscription(&self, endpoint: &str, delay: Duration) {
+        fn delay_subscription(&self, endpoint: &str, request_number: usize, delay: Duration) {
             self.state
                 .lock()
                 .unwrap()
                 .delayed_subscriptions
-                .insert(endpoint.to_owned(), delay);
+                .insert(endpoint.to_owned(), (request_number, delay));
+        }
+
+        fn delay_current_eose(&self, endpoint: &str, delay: Duration) {
+            let subscriptions = self
+                .state
+                .lock()
+                .unwrap()
+                .subscriptions
+                .get(endpoint)
+                .cloned()
+                .unwrap_or_default();
+            thread::spawn(move || {
+                thread::sleep(delay);
+                for subscription in subscriptions {
+                    let _ = subscription.sender.send(Message::text(
+                        serde_json::json!(["EOSE", subscription.subscription_id]).to_string(),
+                    ));
+                }
+            });
         }
 
         fn published(&self) -> Vec<(String, String)> {
@@ -1647,6 +1619,12 @@ mod tests {
                             ))
                             .map_err(|_| RelayError::Disconnected);
                     }
+                    let request_count = state
+                        .request_counts
+                        .entry((self.endpoint.clone(), self.socket_id))
+                        .or_default();
+                    *request_count += 1;
+                    let current_request = *request_count;
                     let subscriptions = state
                         .subscriptions
                         .entry(self.endpoint.clone())
@@ -1663,7 +1641,11 @@ mod tests {
                             sender: self.sender.clone(),
                         });
                     }
-                    let delay = state.delayed_subscriptions.get(&self.endpoint).copied();
+                    let delay = state.delayed_subscriptions.get(&self.endpoint).and_then(
+                        |(request_number, delay)| {
+                            (*request_number == current_request).then_some(*delay)
+                        },
+                    );
                     if state.overflowing_subscriptions.contains(&self.endpoint) {
                         for _ in 0..65 {
                             self.sender
@@ -1791,13 +1773,17 @@ mod tests {
         role: Role,
         identity: Identity,
         expected_peer: Option<[u8; 32]>,
+        subscription_barrier: Option<Arc<Barrier>>,
     ) -> Result<(super::RelaySession, zeroize::Zeroizing<[u8; 32]>), RelayError> {
         let invite = InviteCode::parse(&invite_code).ok_or(RelayError::InvalidEvent)?;
         let mut rendezvous =
             RelayRendezvous::connect_with(&endpoints, &invite, role, |endpoint| {
                 network.open(endpoint)
             })?;
-        rendezvous.timeout = Duration::from_secs(2);
+        rendezvous.timeout = Duration::from_secs(4);
+        if let Some(barrier) = subscription_barrier {
+            barrier.wait();
+        }
         let channel = rendezvous.complete_handshake()?;
         let verification = rendezvous.authenticate(channel, &identity, expected_peer)?;
         if expected_peer.is_some() {
@@ -1841,6 +1827,7 @@ mod tests {
                 role_a,
                 Identity::from_code(&code_a_for_worker).unwrap(),
                 None,
+                None,
             )
         });
         let code_b_for_worker = code_b.clone();
@@ -1851,6 +1838,7 @@ mod tests {
                 invite_code,
                 role_b,
                 Identity::from_code(&code_b_for_worker).unwrap(),
+                None,
                 None,
             )
         });
@@ -1918,7 +1906,7 @@ mod tests {
         let network = FakeRelayNetwork::default();
         let slow = "wss://slow-eose.test";
         let ready = "wss://ready-eose.test";
-        network.delay_subscription(slow, Duration::from_secs(2));
+        network.delay_subscription(slow, 1, Duration::from_secs(2));
         let invite = InviteCode::generate().unwrap();
         let code = invite.code().to_owned();
         let invite = InviteCode::parse(&code).unwrap();
@@ -2013,6 +2001,8 @@ mod tests {
         let network_a = network.clone();
         let invite_a = invite_code.clone();
         let code_a_for_first = code_a.clone();
+        let subscriptions_ready = Arc::new(Barrier::new(2));
+        let subscriptions_ready_a = Arc::clone(&subscriptions_ready);
         let a_endpoints = vec![relay_a.clone(), relay_b.clone()];
         let task_a = thread::spawn(move || {
             fake_connected_party(
@@ -2022,10 +2012,12 @@ mod tests {
                 Role::Initiator,
                 identity_a,
                 None,
+                Some(subscriptions_ready_a),
             )
         });
         let network_b = network.clone();
         let code_b_for_first = code_b.clone();
+        let subscriptions_ready_b = Arc::clone(&subscriptions_ready);
         let b_endpoints = vec![relay_b.clone(), relay_c.clone()];
         let task_b = thread::spawn(move || {
             fake_connected_party(
@@ -2035,10 +2027,42 @@ mod tests {
                 Role::Responder,
                 identity_b,
                 None,
+                Some(subscriptions_ready_b),
             )
         });
         let (mut session_a, secret_a) = task_a.join().unwrap().unwrap();
         let (mut session_b, secret_b) = task_b.join().unwrap().unwrap();
+        // The live REQ is installed, but its EOSE is delayed. This separates
+        // subscription availability from historical backlog completion.
+        session_a
+            .relays
+            .iter_mut()
+            .find(|relay| relay.id == 1)
+            .unwrap()
+            .ready = false;
+        session_b
+            .relays
+            .iter_mut()
+            .find(|relay| relay.id == 0)
+            .unwrap()
+            .ready = false;
+        network.delay_current_eose(&relay_b, Duration::from_millis(500));
+        assert!(
+            !session_a
+                .relays
+                .iter()
+                .find(|relay| relay.id == 1)
+                .unwrap()
+                .ready
+        );
+        assert!(
+            !session_b
+                .relays
+                .iter()
+                .find(|relay| relay.id == 0)
+                .unwrap()
+                .ready
+        );
 
         let event_id = session_a.send(b"first multi relay message").unwrap();
         let mut ack_count = 0;
@@ -2062,6 +2086,21 @@ mod tests {
         }
         assert_eq!(ack_count, 1, "relay acknowledgements must be coalesced");
         assert_eq!(received, vec![b"first multi relay message".to_vec()]);
+
+        session_a
+            .send(b"second message after delayed common subscription")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut second_received = Vec::new();
+        while Instant::now() < deadline && second_received.is_empty() {
+            if let Some(RelayUpdate::Messages(messages)) = session_b.poll().unwrap() {
+                second_received.extend(messages);
+            }
+        }
+        assert_eq!(
+            second_received,
+            vec![b"second message after delayed common subscription".to_vec()]
+        );
 
         let mirrored_event = network
             .published()
@@ -2126,6 +2165,7 @@ mod tests {
                 role_a,
                 Identity::from_code(&reconnect_code_a_for_identity).unwrap(),
                 Some(public_b),
+                None,
             )
         });
         let network_b = reconnect_network.clone();
@@ -2138,6 +2178,7 @@ mod tests {
                 role_b,
                 Identity::from_code(&code_b_for_first).unwrap(),
                 Some(public_a),
+                None,
             )
         });
         let (mut reconnected_a, _) = task_a.join().unwrap().unwrap();
@@ -2257,7 +2298,7 @@ mod tests {
         );
         assert_eq!(
             subscription_status(r#"["EOSE","other"]"#, &expected).unwrap(),
-            SubscriptionStatus::Pending
+            SubscriptionStatus::Stale
         );
         assert_eq!(
             subscription_status(r#"["CLOSED","ad-v2-live","restricted"]"#, &expected).unwrap(),
