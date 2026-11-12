@@ -648,12 +648,12 @@ test('actual UI: send rejected during restore merge preserves input and explains
   assert.equal(h.element('#chat-status').textContent, '기록 병합 중이라 메시지를 전송하지 않았습니다. 병합 완료 후 다시 보내세요.');
 });
 
-test('actual UI: relay settings display the active first relay and save edited lists', async (t) => {
+test('actual UI: relay settings display the active relay list and save edited lists', async (t) => {
   const h = createHarness();
   const settings = {
     savedMode: 'general', socks: null, activeMode: 'general', activeSocks: null,
     notifications: false, savedRelays: ['wss://relay.one', 'wss://relay.two'],
-    activeRelays: ['wss://relay.old'], activeRelay: 'wss://relay.old',
+    activeRelays: ['wss://relay.old', 'wss://relay.backup'], activeRelay: 'wss://relay.old',
     restartRequired: true, relayRestartRequired: true,
   };
   const refresh = h.evaluate('refreshNetworkSettings()');
@@ -661,7 +661,8 @@ test('actual UI: relay settings display the active first relay and save edited l
   await refresh;
   assert.equal(h.element('#relay-list').value, 'wss://relay.one\nwss://relay.two');
   assert.match(h.element('#active-relay').textContent, /wss:\/\/relay\.old/);
-  assert.match(h.element('#active-relay').textContent, /첫 주소만/);
+  assert.match(h.element('#active-relay').textContent, /wss:\/\/relay\.backup/);
+  assert.doesNotMatch(h.element('#active-relay').textContent, /첫 주소만/);
   assert.match(h.element('#settings-status').textContent, /다시 실행/);
 
   await t.test('save sends the entered list and reports restart requirement', async () => {
@@ -675,6 +676,7 @@ test('actual UI: relay settings display the active first relay and save edited l
     await saving;
     assert.match(h.element('#settings-status').textContent, /다시 실행/);
     assert.match(h.element('#active-relay').textContent, /wss:\/\/relay\.old/);
+    assert.match(h.element('#active-relay').textContent, /wss:\/\/relay\.backup/);
   });
 
   await t.test('invalid address detail is shown as text', async () => {

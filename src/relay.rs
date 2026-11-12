@@ -170,6 +170,7 @@ pub enum RelayError {
     TimedOut(&'static str),
     SubscriptionClosed(String),
     RelayRejected { event_id: String, reason: String },
+    PendingPublishLimit,
     NoRelayAvailable,
     Disconnected,
     Cancelled,
@@ -276,6 +277,7 @@ pub struct RelaySession {
     seen: BTreeSet<String>,
     seen_order: VecDeque<String>,
     pending_publishes: HashMap<String, BTreeSet<usize>>,
+    uncertain_publishes: BTreeSet<String>,
     publish_unknown: VecDeque<String>,
 }
 
@@ -313,7 +315,22 @@ impl RelaySession {
         while index < relays.len() {
             let close =
                 serde_json::json!(["CLOSE", relays[index].subscription.to_string()]).to_string();
-            relays[index].buffered.clear();
+            // Buffered rendezvous events belong to the invite topic. Keep only
+            // already-arrived events for this live topic; old EOSE/handshake
+            // frames must not mark the replacement subscription ready.
+            relays[index].buffered.retain(|message| {
+                let Message::Text(text) = message else {
+                    return true;
+                };
+                matches!(
+                    RelayMessage::from_json(text.as_str()),
+                    Ok(RelayMessage::Event { ref event, .. })
+                        if event.kind == Kind::Custom(EVENT_KIND)
+                            && event.pubkey == peer_author
+                            && event.verify().is_ok()
+                            && has_tag(event, "t", &topic)
+                )
+            });
             if relays[index].io.send_message(Message::text(close)).is_err()
                 || relays[index]
                     .io
@@ -339,6 +356,7 @@ impl RelaySession {
             seen: BTreeSet::new(),
             seen_order: VecDeque::new(),
             pending_publishes: HashMap::new(),
+            uncertain_publishes: BTreeSet::new(),
             publish_unknown: VecDeque::new(),
         })
     }
@@ -346,6 +364,9 @@ impl RelaySession {
     /// Encrypts and publishes one live event. The returned identifier is the
     /// event id; relay acceptance arrives separately as `RelayUpdate::Published`.
     pub fn send(&mut self, message: &[u8]) -> Result<String, RelayError> {
+        if self.pending_publishes.len() >= 1024 {
+            return Err(RelayError::PendingPublishLimit);
+        }
         let envelope = self.transport.send(message)?;
         let event = EventBuilder::new(Kind::Custom(EVENT_KIND), hex(&envelope))
             .tag(Tag::custom("t", [self.topic.as_str()]))
@@ -356,7 +377,7 @@ impl RelaySession {
         let mut index = 0;
         while index < self.relays.len() {
             if self.relays[index].ready && self.relays[index].send_text(&text).is_err() {
-                self.relays.remove(index);
+                self.remove_relay(index);
             } else if self.relays[index].ready {
                 awaiting.insert(self.relays[index].id);
                 index += 1;
@@ -368,11 +389,6 @@ impl RelaySession {
             return Err(RelayError::Disconnected);
         }
         self.pending_publishes.insert(event_id.clone(), awaiting);
-        if self.pending_publishes.len() > 1024 {
-            if let Some(oldest) = self.pending_publishes.keys().next().cloned() {
-                self.pending_publishes.remove(&oldest);
-            }
-        }
         Ok(event_id)
     }
 
@@ -455,6 +471,7 @@ impl RelaySession {
                                 .remove(&event_id.to_string())
                                 .is_some()
                             {
+                                self.uncertain_publishes.remove(&event_id.to_string());
                                 return Ok(Some(RelayUpdate::Published {
                                     event_id: event_id.to_string(),
                                 }));
@@ -465,6 +482,11 @@ impl RelaySession {
                             awaiting.remove(&self.relays[link_index].id);
                             if awaiting.is_empty() {
                                 self.pending_publishes.remove(&event_id.to_string());
+                                if self.uncertain_publishes.remove(&event_id.to_string()) {
+                                    return Ok(Some(RelayUpdate::PublishUnknown {
+                                        event_id: event_id.to_string(),
+                                    }));
+                                }
                                 return Err(RelayError::RelayRejected {
                                     event_id: event_id.to_string(),
                                     reason: message.to_string(),
@@ -482,10 +504,7 @@ impl RelaySession {
                         subscription_id,
                         message,
                     } if subscription_id.as_ref() == &self.relays[link_index].subscription => {
-                        let id = self.relays[link_index].id;
-                        self.relays.remove(link_index);
-                        self.remove_pending_relay(id);
-                        self.next_relay = 0;
+                        self.remove_relay(link_index);
                         if self.relays.is_empty() {
                             return Err(RelayError::SubscriptionClosed(message.to_string()));
                         }
@@ -526,13 +545,16 @@ impl RelaySession {
     fn remove_pending_relay(&mut self, relay_id: usize) {
         let mut expired = Vec::new();
         for (event_id, awaiting) in &mut self.pending_publishes {
-            awaiting.remove(&relay_id);
+            if awaiting.remove(&relay_id) {
+                self.uncertain_publishes.insert(event_id.clone());
+            }
             if awaiting.is_empty() {
                 expired.push(event_id.clone());
             }
         }
         for event_id in expired {
             self.pending_publishes.remove(&event_id);
+            self.uncertain_publishes.remove(&event_id);
             self.publish_unknown.push_back(event_id);
         }
     }
@@ -1282,7 +1304,17 @@ fn wait_for_any_subscription(
     timeout: Duration,
 ) -> Result<(), RelayError> {
     let deadline = Instant::now() + timeout.min(SUBSCRIPTION_TIMEOUT);
+    let mut first_ready_at: Option<Instant> = None;
+    let mut next = 0;
     while relays.iter().any(|relay| !relay.ready) {
+        if relays.is_empty() {
+            return Err(RelayError::NoRelayAvailable);
+        }
+        if let Some(ready_at) = first_ready_at {
+            if ready_at.elapsed() >= READ_TIMEOUT {
+                return Ok(());
+            }
+        }
         if Instant::now() >= deadline {
             return if relays.iter().any(|relay| relay.ready) {
                 Ok(())
@@ -1290,54 +1322,65 @@ fn wait_for_any_subscription(
                 Err(RelayError::TimedOut("relay subscription"))
             };
         }
-        if relays.is_empty() {
-            return Err(RelayError::NoRelayAvailable);
-        }
-        let mut index = 0;
-        while index < relays.len() {
-            match relays[index].io.read_message() {
-                Ok(Some(Message::Text(text))) => {
-                    match subscription_status(text.as_str(), &relays[index].subscription)? {
-                        SubscriptionStatus::Pending => {
-                            if relays[index].buffered.len() < 64 {
-                                relays[index].buffered.push_back(Message::Text(text));
-                            }
-                            index += 1;
-                        }
-                        SubscriptionStatus::Ready => {
-                            relays[index].ready = true;
-                            index += 1;
-                        }
-                        SubscriptionStatus::Closed(_) => {
+        let index = next % relays.len();
+        next = (index + 1) % relays.len();
+        match relays[index].io.read_message() {
+            Ok(Some(Message::Text(text))) => {
+                match subscription_status(text.as_str(), &relays[index].subscription) {
+                    Ok(SubscriptionStatus::Pending) => {
+                        if buffer_subscription_message(&mut relays[index], Message::Text(text))
+                            .is_err()
+                        {
                             relays.remove(index);
+                            next = 0;
                         }
                     }
-                }
-                Ok(Some(Message::Ping(payload))) => {
-                    if relays[index]
-                        .io
-                        .send_message(Message::Pong(payload))
-                        .is_err()
-                    {
+                    Ok(SubscriptionStatus::Ready) => {
+                        relays[index].ready = true;
+                        first_ready_at.get_or_insert_with(Instant::now);
+                    }
+                    Ok(SubscriptionStatus::Closed(_)) | Err(_) => {
                         relays.remove(index);
-                    } else {
-                        index += 1;
+                        next = 0;
                     }
                 }
-                Ok(Some(message)) => {
-                    if relays[index].buffered.len() < 64 {
-                        relays[index].buffered.push_back(message);
-                    }
-                    index += 1;
-                }
-                Ok(None) => index += 1,
-                Err(_) => {
+            }
+            Ok(Some(Message::Ping(payload))) => {
+                if relays[index]
+                    .io
+                    .send_message(Message::Pong(payload))
+                    .is_err()
+                {
                     relays.remove(index);
+                    next = 0;
                 }
+            }
+            Ok(Some(message)) => {
+                if buffer_subscription_message(&mut relays[index], message).is_err() {
+                    relays.remove(index);
+                    next = 0;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                relays.remove(index);
+                next = 0;
             }
         }
         std::thread::yield_now();
     }
+    if relays.is_empty() {
+        Err(RelayError::NoRelayAvailable)
+    } else {
+        Ok(())
+    }
+}
+
+fn buffer_subscription_message(relay: &mut RelayLink, message: Message) -> Result<(), ()> {
+    if relay.buffered.len() >= 64 {
+        return Err(());
+    }
+    relay.buffered.push_back(message);
     Ok(())
 }
 
@@ -1433,7 +1476,20 @@ mod tests {
     struct FakeRelayState {
         subscriptions: HashMap<String, Vec<FakeSubscription>>,
         failed: BTreeSet<String>,
+        malformed_subscriptions: BTreeSet<String>,
+        closed_subscriptions: BTreeSet<String>,
+        silent_subscriptions: BTreeSet<String>,
+        overflowing_subscriptions: BTreeSet<String>,
+        delayed_subscriptions: HashMap<String, Duration>,
+        ack_modes: HashMap<String, FakeAckMode>,
         published: Vec<(String, String)>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FakeAckMode {
+        Accept,
+        Reject,
+        Silent,
     }
 
     #[derive(Clone)]
@@ -1474,6 +1530,40 @@ mod tests {
                 .unwrap()
                 .failed
                 .insert(endpoint.to_owned());
+        }
+
+        fn with_subscription_failure(&self, endpoint: &str, malformed: bool, closed: bool) {
+            let mut state = self.state.lock().unwrap();
+            if malformed {
+                state.malformed_subscriptions.insert(endpoint.to_owned());
+            }
+            if closed {
+                state.closed_subscriptions.insert(endpoint.to_owned());
+            }
+        }
+
+        fn set_ack_mode(&self, endpoint: &str, mode: FakeAckMode) {
+            self.state
+                .lock()
+                .unwrap()
+                .ack_modes
+                .insert(endpoint.to_owned(), mode);
+        }
+
+        fn overflow_subscription_buffer(&self, endpoint: &str) {
+            self.state
+                .lock()
+                .unwrap()
+                .overflowing_subscriptions
+                .insert(endpoint.to_owned());
+        }
+
+        fn delay_subscription(&self, endpoint: &str, delay: Duration) {
+            self.state
+                .lock()
+                .unwrap()
+                .delayed_subscriptions
+                .insert(endpoint.to_owned(), delay);
         }
 
         fn published(&self) -> Vec<(String, String)> {
@@ -1542,6 +1632,21 @@ mod tests {
                         .cloned()
                         .unwrap_or_else(|| vec![message[2].clone()]);
                     let mut state = self.network.state.lock().unwrap();
+                    if state.malformed_subscriptions.contains(&self.endpoint) {
+                        return self
+                            .sender
+                            .send(Message::text("not json"))
+                            .map_err(|_| RelayError::Disconnected);
+                    }
+                    if state.closed_subscriptions.contains(&self.endpoint) {
+                        return self
+                            .sender
+                            .send(Message::text(
+                                serde_json::json!(["CLOSED", subscription_id, "test close"])
+                                    .to_string(),
+                            ))
+                            .map_err(|_| RelayError::Disconnected);
+                    }
                     let subscriptions = state
                         .subscriptions
                         .entry(self.endpoint.clone())
@@ -1557,6 +1662,27 @@ mod tests {
                             filter: filter.clone(),
                             sender: self.sender.clone(),
                         });
+                    }
+                    let delay = state.delayed_subscriptions.get(&self.endpoint).copied();
+                    if state.overflowing_subscriptions.contains(&self.endpoint) {
+                        for _ in 0..65 {
+                            self.sender
+                                .send(Message::Binary(vec![1].into()))
+                                .map_err(|_| RelayError::Disconnected)?;
+                        }
+                    }
+                    if state.silent_subscriptions.contains(&self.endpoint) {
+                        return Ok(());
+                    }
+                    if let Some(delay) = delay {
+                        let sender = self.sender.clone();
+                        thread::spawn(move || {
+                            thread::sleep(delay);
+                            let _ = sender.send(Message::text(
+                                serde_json::json!(["EOSE", subscription_id]).to_string(),
+                            ));
+                        });
+                        return Ok(());
                     }
                     self.sender
                         .send(Message::text(
@@ -1589,19 +1715,25 @@ mod tests {
                         .as_str()
                         .ok_or(RelayError::InvalidEvent)?
                         .to_owned();
-                    let recipients = {
+                    let (recipients, ack_mode) = {
                         let mut state = self.network.state.lock().unwrap();
                         state
                             .published
                             .push((self.endpoint.clone(), event_id.clone()));
-                        state
+                        let recipients = state
                             .subscriptions
                             .get(&self.endpoint)
                             .into_iter()
                             .flatten()
                             .filter(|subscription| Self::event_matches(&subscription.filter, event))
                             .cloned()
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>();
+                        let mode = state
+                            .ack_modes
+                            .get(&self.endpoint)
+                            .copied()
+                            .unwrap_or(FakeAckMode::Accept);
+                        (recipients, mode)
                     };
                     for subscription in recipients {
                         let _ = subscription.sender.send(Message::text(
@@ -1609,10 +1741,21 @@ mod tests {
                                 .to_string(),
                         ));
                     }
-                    let _ = self.sender.send(Message::text(
-                        serde_json::json!(["OK", event_id, true, "stored by fake relay"])
-                            .to_string(),
-                    ));
+                    match ack_mode {
+                        FakeAckMode::Accept | FakeAckMode::Reject => {
+                            let accepted = matches!(ack_mode, FakeAckMode::Accept);
+                            let _ = self.sender.send(Message::text(
+                                serde_json::json!([
+                                    "OK",
+                                    event_id,
+                                    accepted,
+                                    if accepted { "stored" } else { "rejected" }
+                                ])
+                                .to_string(),
+                            ));
+                        }
+                        FakeAckMode::Silent => {}
+                    }
                     Ok(())
                 }
                 _ => Ok(()),
@@ -1666,6 +1809,194 @@ mod tests {
         }
     }
 
+    fn fake_session_pair(
+        network: FakeRelayNetwork,
+        endpoints_a: Vec<String>,
+        endpoints_b: Vec<String>,
+    ) -> (super::RelaySession, super::RelaySession) {
+        let (identity_a, code_a) = Identity::create().unwrap();
+        let (identity_b, code_b) = Identity::create().unwrap();
+        let public_a = identity_a.public_key();
+        let public_b = identity_b.public_key();
+        let role_a = if public_a < public_b {
+            Role::Responder
+        } else {
+            Role::Initiator
+        };
+        let role_b = if role_a == Role::Responder {
+            Role::Initiator
+        } else {
+            Role::Responder
+        };
+        let invite = InviteCode::generate().unwrap();
+        let invite_code = invite.code().to_owned();
+        let network_a = network.clone();
+        let code_a_for_worker = code_a.clone();
+        let invite_code_a = invite_code.clone();
+        let task_a = thread::spawn(move || {
+            fake_connected_party(
+                network_a,
+                endpoints_a,
+                invite_code_a,
+                role_a,
+                Identity::from_code(&code_a_for_worker).unwrap(),
+                None,
+            )
+        });
+        let code_b_for_worker = code_b.clone();
+        let task_b = thread::spawn(move || {
+            fake_connected_party(
+                network,
+                endpoints_b,
+                invite_code,
+                role_b,
+                Identity::from_code(&code_b_for_worker).unwrap(),
+                None,
+            )
+        });
+        (
+            task_a.join().unwrap().unwrap().0,
+            task_b.join().unwrap().unwrap().0,
+        )
+    }
+
+    #[test]
+    fn subscriptions_isolate_bad_relays_and_report_exhaustion_and_buffer_overflow() {
+        let invite = InviteCode::generate().unwrap();
+        let code = invite.code().to_owned();
+        let malformed = "wss://malformed.test".to_owned();
+        let closed = "wss://closed.test".to_owned();
+        let healthy = "wss://healthy.test".to_owned();
+        let network = FakeRelayNetwork::default();
+        network.with_subscription_failure(&malformed, true, false);
+        network.with_subscription_failure(&closed, false, true);
+        let invite_for_connect = InviteCode::parse(&code).unwrap();
+        let rendezvous = RelayRendezvous::connect_with(
+            &[malformed.clone(), closed.clone(), healthy.clone()],
+            &invite_for_connect,
+            Role::Initiator,
+            |endpoint| network.open(endpoint),
+        )
+        .unwrap();
+        assert_eq!(rendezvous.relays.len(), 1);
+        assert_eq!(rendezvous.relays[0].id, 2);
+
+        let all_bad = FakeRelayNetwork::default();
+        all_bad.with_subscription_failure(&malformed, true, false);
+        all_bad.with_subscription_failure(&closed, false, true);
+        let invite_for_connect = InviteCode::parse(&code).unwrap();
+        assert!(matches!(
+            RelayRendezvous::connect_with(
+                &[malformed, closed],
+                &invite_for_connect,
+                Role::Initiator,
+                |endpoint| all_bad.open(endpoint),
+            ),
+            Err(RelayError::NoRelayAvailable)
+        ));
+
+        let flood = "wss://flood.test".to_owned();
+        let network = FakeRelayNetwork::default();
+        network.overflow_subscription_buffer(&flood);
+        let invite_for_connect = InviteCode::parse(&code).unwrap();
+        let rendezvous = RelayRendezvous::connect_with(
+            &[flood, healthy],
+            &invite_for_connect,
+            Role::Initiator,
+            |endpoint| network.open(endpoint),
+        )
+        .unwrap();
+        assert_eq!(rendezvous.relays.len(), 1);
+        assert_eq!(
+            rendezvous.relays[0].id, 1,
+            "overflowing route is explicitly dropped"
+        );
+    }
+
+    #[test]
+    fn subscription_wait_does_not_wait_for_late_eose_after_a_route_is_ready() {
+        let network = FakeRelayNetwork::default();
+        let slow = "wss://slow-eose.test";
+        let ready = "wss://ready-eose.test";
+        network.delay_subscription(slow, Duration::from_secs(2));
+        let invite = InviteCode::generate().unwrap();
+        let code = invite.code().to_owned();
+        let invite = InviteCode::parse(&code).unwrap();
+        let started = Instant::now();
+        let rendezvous = RelayRendezvous::connect_with(
+            &[slow.to_owned(), ready.to_owned()],
+            &invite,
+            Role::Initiator,
+            |endpoint| network.open(endpoint),
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(rendezvous.relays.iter().any(|relay| relay.ready));
+    }
+
+    #[test]
+    fn lost_publish_path_and_pending_limit_have_explicit_results_without_sequence_gaps() {
+        let relay_a = "wss://publish-a.test".to_owned();
+        let relay_b = "wss://publish-b.test".to_owned();
+        let network = FakeRelayNetwork::default();
+        network.set_ack_mode(&relay_a, FakeAckMode::Silent);
+        network.set_ack_mode(&relay_b, FakeAckMode::Reject);
+        let (mut sender, receiver) = fake_session_pair(
+            network.clone(),
+            vec![relay_a.clone(), relay_b.clone()],
+            vec![relay_b.clone(), relay_a.clone()],
+        );
+        let uncertain_id = sender.send(b"awaiting result").unwrap();
+        network.fail(&relay_a);
+        let rejected_id = sender.send(b"rejected on remaining route").unwrap();
+        let mut unknown = None;
+        let mut rejected = None;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline && (unknown.is_none() || rejected.is_none()) {
+            match sender.poll() {
+                Ok(Some(RelayUpdate::PublishUnknown { event_id })) => unknown = Some(event_id),
+                Ok(Some(RelayUpdate::Published { event_id })) => {
+                    panic!("unexpected acceptance: {event_id}")
+                }
+                Err(RelayError::RelayRejected { event_id, .. }) => rejected = Some(event_id),
+                Ok(Some(RelayUpdate::Messages(_))) | Ok(Some(RelayUpdate::Ready)) | Ok(None) => {}
+                Err(error) => panic!("unexpected relay failure: {error:?}"),
+            }
+        }
+        assert_eq!(unknown.as_deref(), Some(uncertain_id.as_str()));
+        assert_eq!(rejected.as_deref(), Some(rejected_id.as_str()));
+        drop(receiver);
+
+        let network = FakeRelayNetwork::default();
+        let (mut sender, mut receiver) = fake_session_pair(
+            network,
+            vec![relay_a.clone(), relay_b.clone()],
+            vec![relay_b, relay_a],
+        );
+        for index in 0..1024 {
+            sender
+                .pending_publishes
+                .insert(format!("pending-{index}"), BTreeSet::from([0]));
+        }
+        assert!(matches!(
+            sender.send(b"must not consume sequence"),
+            Err(RelayError::PendingPublishLimit)
+        ));
+        assert_eq!(sender.pending_publishes.len(), 1024);
+        assert!(sender.pending_publishes.contains_key("pending-0"));
+        assert!(sender.pending_publishes.contains_key("pending-1023"));
+        sender.pending_publishes.clear();
+        sender.send(b"first accepted sequence").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut received = Vec::new();
+        while Instant::now() < deadline && received.is_empty() {
+            if let Some(RelayUpdate::Messages(messages)) = receiver.poll().unwrap() {
+                received.extend(messages);
+            }
+        }
+        assert_eq!(received, vec![b"first accepted sequence".to_vec()]);
+    }
+
     #[test]
     fn multi_relay_handshake_session_failover_and_reconnect_use_shared_paths() {
         let network = FakeRelayNetwork::default();
@@ -1677,12 +2008,12 @@ mod tests {
 
         let relay_a = "wss://relay-a.test".to_owned();
         let relay_b = "wss://relay-b.test".to_owned();
-        let offline = "wss://offline.test".to_owned();
-        network.fail(&offline);
+        let relay_c = "wss://relay-c.test".to_owned();
+        network.fail(&relay_c);
         let network_a = network.clone();
         let invite_a = invite_code.clone();
         let code_a_for_first = code_a.clone();
-        let a_endpoints = vec![offline, relay_b.clone(), relay_a.clone()];
+        let a_endpoints = vec![relay_a.clone(), relay_b.clone()];
         let task_a = thread::spawn(move || {
             fake_connected_party(
                 network_a,
@@ -1695,7 +2026,7 @@ mod tests {
         });
         let network_b = network.clone();
         let code_b_for_first = code_b.clone();
-        let b_endpoints = vec![relay_a.clone(), relay_b.clone()];
+        let b_endpoints = vec![relay_b.clone(), relay_c.clone()];
         let task_b = thread::spawn(move || {
             fake_connected_party(
                 network_b,
@@ -1761,6 +2092,7 @@ mod tests {
         assert_eq!(after_failure, vec![b"after one relay failed".to_vec()]);
 
         network.fail(&relay_b);
+        network.fail(&relay_c);
         assert!(matches!(session_a.poll(), Err(RelayError::Disconnected)));
         assert!(matches!(session_b.poll(), Err(RelayError::Disconnected)));
         drop(session_a);

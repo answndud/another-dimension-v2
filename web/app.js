@@ -274,7 +274,10 @@ async function refreshNetworkSettings() {
   torAddress.value = settings.socks || '127.0.0.1:9050';
   notificationChoice.checked = settings.notifications;
   relayList.value = settings.savedRelays.join('\n');
-  document.querySelector('#active-relay').textContent = `현재 적용 중인 relay: ${settings.activeRelay} · 목록의 첫 주소만 연결에 사용합니다.`;
+  const activeRelays = Array.isArray(settings.activeRelays)
+    ? settings.activeRelays
+    : (settings.activeRelay ? [settings.activeRelay] : []);
+  document.querySelector('#active-relay').textContent = `현재 실행 설정 relay 목록: ${activeRelays.join(', ') || '없음'} · 연결 가능한 목록의 relay 경로를 사용합니다.`;
   document.querySelector('#tor-settings').hidden = modeChoice.value !== 'tor';
   document.querySelector('#network-mode').textContent = settings.activeMode === 'tor'
     ? `현재 연결: Tor SOCKS (${settings.activeSocks}) · 서비스를 Tor로 검증하지 않습니다.`
@@ -824,7 +827,10 @@ document.querySelector('#save-settings').addEventListener('click', async () => {
     document.querySelector('#network-mode').textContent = saved.activeMode === 'tor'
       ? `현재 연결: Tor SOCKS (${saved.activeSocks}) · 서비스를 Tor로 검증하지 않습니다.`
       : '현재 연결: 일반 연결 · relay에 실제 IP가 보일 수 있습니다.';
-    document.querySelector('#active-relay').textContent = `현재 적용 중인 relay: ${saved.activeRelay} · 목록의 첫 주소만 연결에 사용합니다.`;
+    const activeRelays = Array.isArray(saved.activeRelays)
+      ? saved.activeRelays
+      : (saved.activeRelay ? [saved.activeRelay] : []);
+    document.querySelector('#active-relay').textContent = `현재 실행 설정 relay 목록: ${activeRelays.join(', ') || '없음'} · 연결 가능한 목록의 relay 경로를 사용합니다.`;
   } catch (_) {
     status.textContent = '설정을 저장하지 못했습니다.';
   }

@@ -2742,6 +2742,13 @@ fn spawn_chat_worker(
                                 });
                                 let _ = processed.send(Ok(()));
                             }
+                            Err(RelayError::PendingPublishLimit) => {
+                                let message = "relay 발행 확인 대기 한도에 도달했습니다. 기존 전송 확인이 처리된 뒤 다시 보내세요.".to_owned();
+                                chat_update(&operation, |snapshot| {
+                                    snapshot.error = Some(message.clone());
+                                });
+                                let _ = processed.send(Err(message));
+                            }
                             Err(_) => {
                                 let _history_state_guard = operation
                                     .history_state_lock
