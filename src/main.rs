@@ -450,14 +450,27 @@ fn discard_restore_staging(
     staging: &mut Option<history::RestoreStaging>,
     operation: &ChatOperation,
 ) {
+    let mut cleanup_error = None;
     if let Some(staging) = staging.take() {
         if let Err(error) = staging.cleanup() {
+            cleanup_error = Some(error.to_string());
             chat_update(operation, |snapshot| {
                 snapshot.history_restore_cleanup_error = Some(error.to_string());
                 snapshot.history_restore_state = "failed";
+                snapshot.history_restore_in_progress = false;
             });
         }
     }
+    chat_update(operation, |snapshot| {
+        if snapshot.history_restore_state == "merge-queued" {
+            snapshot.history_restore_state = "failed";
+            snapshot.history_restore_in_progress = false;
+            snapshot.history_restore_status = Some(match cleanup_error {
+                Some(error) => format!("채팅 종료 전에 병합이 시작되지 않았습니다. 기존 기록은 변경되지 않았습니다. 임시 저장소 정리 실패: {error}"),
+                None => "채팅 종료 전에 병합이 시작되지 않았습니다. 기존 기록은 변경되지 않았습니다. 다시 연결해 복원을 다시 요청하세요.".to_owned(),
+            });
+        }
+    });
 }
 
 fn submit_chat_message(sender: &Sender<ChatCommand>, text: String, timeout: Duration) -> bool {
@@ -622,6 +635,23 @@ mod send_tests {
         }
     }
 
+    fn call_test_api(state: &Arc<Mutex<State>>, path: &str, body: &str, token: &str) -> String {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nAuthorization: Bearer {token}\r\nContent-Type: text/plain;charset=UTF-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        handle(server, &address.to_string(), state).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        response
+    }
+
     #[test]
     fn identity_transition_control_and_history_marker_roundtrip() {
         let previous = "ab".repeat(32);
@@ -710,6 +740,109 @@ mod send_tests {
             snapshot.history_restore_status.as_deref(),
             Some("test merge complete")
         );
+    }
+
+    #[test]
+    fn restore_merge_api_returns_202_without_waiting_and_status_reports_completion() {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let operation = Arc::new(ChatOperation {
+            snapshot: Mutex::new(ChatSnapshot {
+                phase: "connected",
+                fingerprint: None,
+                peer_id: None,
+                error: None,
+                storage_error: None,
+                messages: Vec::new(),
+                message_count: 0,
+                relay_ack: None,
+                pending_sends: 0,
+                identity_transition: None,
+                history_restore_in_progress: false,
+                history_restore_state: "awaiting-merge-consent",
+                history_restore_estimate_bytes: 0,
+                history_restore_cleanup_error: None,
+                history_restore_offer: Vec::new(),
+                history_restore_offer_count: 1,
+                history_restore_legacy_count: 0,
+                history_restore_received: 1,
+                history_restore_total: 1,
+                history_restore_status: None,
+                message_epoch: 0,
+            }),
+            message_reader: Mutex::new(None),
+            sender: command_sender,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        let mut chats = HashMap::new();
+        chats.insert("restore-operation".to_owned(), Arc::clone(&operation));
+        let state = Arc::new(Mutex::new(State {
+            code: String::new(),
+            issued: Instant::now(),
+            attempts: 0,
+            sessions: vec!["test-session".to_owned()],
+            identity: None,
+            chats,
+            tor_socks: None,
+            settings: AppSettings::default(),
+            notifications_enabled: Arc::new(AtomicBool::new(false)),
+            last_notification: Arc::new(Mutex::new(None)),
+        }));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let worker_operation = Arc::clone(&operation);
+        let worker = thread::spawn(move || {
+            assert!(matches!(
+                command_receiver.recv().unwrap(),
+                ChatCommand::ResolveHistoryRestore(true)
+            ));
+            let (lock, changed) = &*worker_gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = changed.wait(released).unwrap();
+            }
+            chat_update(&worker_operation, |snapshot| {
+                snapshot.history_restore_state = "completed";
+                snapshot.history_restore_in_progress = false;
+                snapshot.history_restore_status = Some("merge complete".to_owned());
+            });
+        });
+        let body = r#"{"operationId":"restore-operation","accept":true}"#;
+        let accepted = call_test_api(
+            &state,
+            "/api/chat/resolve-history-restore",
+            body,
+            "test-session",
+        );
+        assert!(accepted.starts_with("HTTP/1.1 202 Accepted"));
+        assert!(accepted.contains("Content-Length"));
+        let duplicate = call_test_api(
+            &state,
+            "/api/chat/resolve-history-restore",
+            body,
+            "test-session",
+        );
+        assert!(duplicate.starts_with("HTTP/1.1 409 Conflict"));
+        let pending = call_test_api(
+            &state,
+            "/api/chat/status",
+            "restore-operation",
+            "test-session",
+        );
+        assert!(pending.contains("\"historyRestoreState\":\"merge-queued\""));
+        {
+            let (lock, changed) = &*gate;
+            *lock.lock().unwrap() = true;
+            changed.notify_one();
+        }
+        worker.join().unwrap();
+        let complete = call_test_api(
+            &state,
+            "/api/chat/status",
+            "restore-operation",
+            "test-session",
+        );
+        assert!(complete.contains("\"historyRestoreState\":\"completed\""));
+        assert!(complete.contains("merge complete"));
     }
 
     #[test]
