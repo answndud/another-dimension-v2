@@ -268,16 +268,19 @@ async function refreshNetworkSettings() {
   const modeChoice = document.querySelector('#network-mode-choice');
   const torAddress = document.querySelector('#tor-socks-address');
   const notificationChoice = document.querySelector('#notifications-enabled');
+  const relayList = document.querySelector('#relay-list');
   const status = document.querySelector('#settings-status');
   modeChoice.value = settings.savedMode;
   torAddress.value = settings.socks || '127.0.0.1:9050';
   notificationChoice.checked = settings.notifications;
+  relayList.value = settings.savedRelays.join('\n');
+  document.querySelector('#active-relay').textContent = `현재 적용 중인 relay: ${settings.activeRelay} · 목록의 첫 주소만 연결에 사용합니다.`;
   document.querySelector('#tor-settings').hidden = modeChoice.value !== 'tor';
   document.querySelector('#network-mode').textContent = settings.activeMode === 'tor'
     ? `현재 연결: Tor SOCKS (${settings.activeSocks}) · 서비스를 Tor로 검증하지 않습니다.`
     : '현재 연결: 일반 연결 · relay에 실제 IP가 보일 수 있습니다.';
   status.textContent = settings.restartRequired
-    ? '저장된 모드가 실행 중인 모드와 다릅니다. 터미널에서 프로그램을 종료하고 다시 실행하세요.'
+    ? '저장된 연결 설정이 실행 중인 설정과 다릅니다. 터미널에서 프로그램을 종료하고 다시 실행하세요.'
     : '';
 }
 
@@ -801,24 +804,27 @@ document.querySelector('#save-settings').addEventListener('click', async () => {
   const mode = document.querySelector('#network-mode-choice').value;
   const socks = document.querySelector('#tor-socks-address').value.trim();
   const notifications = document.querySelector('#notifications-enabled').checked;
+  const relayUrls = document.querySelector('#relay-list').value.split('\n');
   const status = document.querySelector('#settings-status');
   try {
-    const response = await request('/api/settings/save', JSON.stringify({ mode, socks, notifications }));
+    const response = await request('/api/settings/save', JSON.stringify({ mode, socks, notifications, relayUrls }));
     if (response.status === 409) {
       status.textContent = '연결 중인 대화를 먼저 종료하세요.';
       return;
     }
     if (!response.ok) {
-      status.textContent = '설정을 저장하지 못했습니다. SOCKS 주소를 확인하세요.';
+      const detail = await response.text();
+      status.textContent = detail || '설정을 저장하지 못했습니다. 주소와 입력값을 확인하세요.';
       return;
     }
     const saved = await response.json();
     status.textContent = saved.restartRequired
-      ? '설정을 저장했습니다. 모드 적용을 위해 터미널에서 프로그램을 종료한 뒤 다시 실행하세요. 터미널의 새 주소와 로컬 연결 코드를 사용하고, 다시 연 화면에서 개인 접속 코드로 로그인하세요.'
+      ? '설정을 저장했습니다. 연결 설정 적용을 위해 터미널에서 프로그램을 종료한 뒤 다시 실행하세요. 터미널의 새 주소와 로컬 연결 코드를 사용하고, 다시 연 화면에서 개인 접속 코드로 로그인하세요.'
       : '설정을 저장했습니다.';
     document.querySelector('#network-mode').textContent = saved.activeMode === 'tor'
       ? `현재 연결: Tor SOCKS (${saved.activeSocks}) · 서비스를 Tor로 검증하지 않습니다.`
       : '현재 연결: 일반 연결 · relay에 실제 IP가 보일 수 있습니다.';
+    document.querySelector('#active-relay').textContent = `현재 적용 중인 relay: ${saved.activeRelay} · 목록의 첫 주소만 연결에 사용합니다.`;
   } catch (_) {
     status.textContent = '설정을 저장하지 못했습니다.';
   }

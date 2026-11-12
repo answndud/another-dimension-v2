@@ -51,15 +51,27 @@ struct State {
     history_deletions: HashMap<String, Arc<HistoryDeletionOperation>>,
     active_history_deletions: HashSet<String>,
     tor_socks: Option<SocketAddr>,
+    active_relays: Vec<String>,
     settings: AppSettings,
     notifications_enabled: Arc<AtomicBool>,
     last_notification: Arc<Mutex<Option<Instant>>>,
 }
 
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct AppSettings {
     tor_socks: Option<SocketAddr>,
     notifications: bool,
+    relays: Vec<String>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            tor_socks: None,
+            notifications: false,
+            relays: vec![DEFAULT_RELAY.to_owned()],
+        }
+    }
 }
 
 enum ChatCommand {
@@ -767,6 +779,163 @@ mod send_tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn settings_relay_defaults_and_legacy_fields_are_preserved() {
+        assert_eq!(
+            first_active_relay(&[
+                "wss://first.example".to_owned(),
+                "wss://second.example".to_owned(),
+            ]),
+            "wss://first.example"
+        );
+        assert_eq!(first_active_relay(&[]), DEFAULT_RELAY);
+        let data = TestDataDirectory::new();
+        let path = data.0.join("preferences.json");
+        assert_eq!(
+            load_settings_from_path(&path).unwrap(),
+            AppSettings::default()
+        );
+
+        std::fs::write(
+            &path,
+            br#"{"torSocks":"127.0.0.1:9050","notifications":true}"#,
+        )
+        .unwrap();
+        let loaded = load_settings_from_path(&path).unwrap();
+        assert_eq!(loaded.relays, vec![DEFAULT_RELAY]);
+        assert_eq!(loaded.tor_socks, Some("127.0.0.1:9050".parse().unwrap()));
+        assert!(loaded.notifications);
+
+        let updated = AppSettings {
+            tor_socks: loaded.tor_socks,
+            notifications: loaded.notifications,
+            relays: vec!["wss://relay.example".to_owned()],
+        };
+        save_settings_to_path(&path, &updated).unwrap();
+        assert_eq!(load_settings_from_path(&path).unwrap(), updated);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["torSocks"], "127.0.0.1:9050");
+        assert_eq!(saved["notifications"], true);
+    }
+
+    #[test]
+    fn settings_reject_invalid_relay_lists_without_changing_saved_state() {
+        let data = TestDataDirectory::new();
+        let path = data.0.join("preferences.json");
+        let original = AppSettings::default();
+        save_settings_to_path(&path, &original).unwrap();
+        let original_file = std::fs::read(&path).unwrap();
+        for relays in [
+            vec![],
+            vec!["ws://relay.example".to_owned()],
+            vec!["wss://relay.example:65536".to_owned()],
+            vec![
+                "wss://relay.example".to_owned(),
+                "wss://RELAY.EXAMPLE:443/".to_owned(),
+            ],
+        ] {
+            let invalid = AppSettings {
+                relays,
+                ..original.clone()
+            };
+            assert!(save_settings_to_path(&path, &invalid).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original_file);
+        }
+        std::fs::write(&path, br#"{"relayUrls":[]}"#).unwrap();
+        assert!(load_settings_from_path(&path).is_err());
+    }
+
+    #[test]
+    fn settings_api_reports_saved_and_active_relays_and_restart_gating() {
+        let _data = TestDataDirectory::new();
+        let state = Arc::new(Mutex::new(State {
+            code: String::new(),
+            issued: Instant::now(),
+            attempts: 0,
+            sessions: vec!["test-session".to_owned()],
+            identity: None,
+            chats: HashMap::new(),
+            history_deletions: HashMap::new(),
+            active_history_deletions: HashSet::new(),
+            tor_socks: None,
+            active_relays: vec![DEFAULT_RELAY.to_owned()],
+            settings: AppSettings::default(),
+            notifications_enabled: Arc::new(AtomicBool::new(false)),
+            last_notification: Arc::new(Mutex::new(None)),
+        }));
+        let read_settings = || call_test_api(&state, "/api/settings/get", "", "test-session");
+        let initial = read_settings();
+        assert!(initial.contains("\"savedRelays\":[\"wss://relay.primal.net\"]"));
+        assert!(initial.contains("\"activeRelay\":\"wss://relay.primal.net\""));
+        assert!(initial.contains("\"restartRequired\":false"));
+
+        let changed = serde_json::json!({
+            "mode":"general", "socks":"", "notifications":true,
+            "relayUrls":["wss://relay.example", "wss://backup.example"]
+        })
+        .to_string();
+        let operation = closed_test_operation("test-owner", "test-peer", 0, 0);
+        operation.snapshot.lock().unwrap().phase = "connected";
+        state
+            .lock()
+            .unwrap()
+            .chats
+            .insert("active-chat".to_owned(), Arc::clone(&operation));
+        let blocked = call_test_api(&state, "/api/settings/save", &changed, "test-session");
+        assert!(blocked.starts_with("HTTP/1.1 409 Conflict"));
+        assert_eq!(state.lock().unwrap().settings.relays, vec![DEFAULT_RELAY]);
+        state.lock().unwrap().chats.clear();
+
+        let saved = call_test_api(&state, "/api/settings/save", &changed, "test-session");
+        assert!(saved.starts_with("HTTP/1.1 200 OK"), "{saved}");
+        assert!(saved.contains("\"relayRestartRequired\":true"));
+        assert!(saved.contains("\"activeRelay\":\"wss://relay.primal.net\""));
+        assert!(saved.contains("\"notifications\":true"));
+        let invite = call_test_api(&state, "/api/invite/create", "", "test-session");
+        assert!(invite.starts_with("HTTP/1.1 409 Conflict"));
+        for route in ["/api/chat/create", "/api/chat/join", "/api/chat/reconnect"] {
+            let blocked = call_test_api(&state, route, "test-payload", "test-session");
+            assert!(
+                blocked.starts_with("HTTP/1.1 409 Conflict"),
+                "{route}: {blocked}"
+            );
+        }
+
+        let invalid = serde_json::json!({
+            "mode":"general", "notifications":false, "relayUrls":[]
+        })
+        .to_string();
+        let rejected = call_test_api(&state, "/api/settings/save", &invalid, "test-session");
+        assert!(rejected.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(rejected.contains("비어 있을 수 없습니다"));
+        assert_eq!(
+            state.lock().unwrap().settings.relays,
+            vec!["wss://relay.example", "wss://backup.example"]
+        );
+
+        let reset = serde_json::json!({
+            "mode":"general", "notifications":true,
+            "relayUrls":[DEFAULT_RELAY]
+        })
+        .to_string();
+        let reset = call_test_api(&state, "/api/settings/save", &reset, "test-session");
+        assert!(reset.contains("\"restartRequired\":false"));
+
+        let preferences = _data.0.join("preferences.json");
+        std::fs::remove_file(&preferences).unwrap();
+        std::fs::create_dir(&preferences).unwrap();
+        std::fs::write(preferences.join("sentinel"), b"preserve").unwrap();
+        let before_failure = state.lock().unwrap().settings.clone();
+        let failed_save = call_test_api(&state, "/api/settings/save", &changed, "test-session");
+        assert!(failed_save.starts_with("HTTP/1.1 500 Internal Server Error"));
+        assert_eq!(state.lock().unwrap().settings, before_failure);
+        assert_eq!(
+            std::fs::read(preferences.join("sentinel")).unwrap(),
+            b"preserve"
+        );
+    }
+
     struct TestDataDirectory(std::path::PathBuf);
 
     impl TestDataDirectory {
@@ -1113,6 +1282,7 @@ mod send_tests {
             history_deletions: HashMap::new(),
             active_history_deletions: HashSet::new(),
             tor_socks: None,
+            active_relays: vec![DEFAULT_RELAY.to_owned()],
             settings: AppSettings::default(),
             notifications_enabled: Arc::new(AtomicBool::new(false)),
             last_notification: Arc::new(Mutex::new(None)),
@@ -1246,6 +1416,7 @@ mod send_tests {
             history_deletions: HashMap::new(),
             active_history_deletions: HashSet::new(),
             tor_socks: None,
+            active_relays: vec![DEFAULT_RELAY.to_owned()],
             settings: AppSettings::default(),
             notifications_enabled: Arc::new(AtomicBool::new(false)),
             last_notification: Arc::new(Mutex::new(None)),
@@ -1531,6 +1702,7 @@ mod send_tests {
             history_deletions: HashMap::new(),
             active_history_deletions: HashSet::new(),
             tor_socks: None,
+            active_relays: vec![DEFAULT_RELAY.to_owned()],
             settings: AppSettings::default(),
             notifications_enabled: Arc::new(AtomicBool::new(false)),
             last_notification: Arc::new(Mutex::new(None)),
@@ -1865,6 +2037,7 @@ mod send_tests {
             history_deletions: HashMap::new(),
             active_history_deletions: HashSet::new(),
             tor_socks: None,
+            active_relays: vec![DEFAULT_RELAY.to_owned()],
             settings: AppSettings::default(),
             notifications_enabled: Arc::new(AtomicBool::new(false)),
             last_notification: Arc::new(Mutex::new(None)),
@@ -1922,6 +2095,7 @@ mod send_tests {
             history_deletions: HashMap::new(),
             active_history_deletions: HashSet::new(),
             tor_socks: None,
+            active_relays: vec![DEFAULT_RELAY.to_owned()],
             settings: AppSettings::default(),
             notifications_enabled: Arc::new(AtomicBool::new(false)),
             last_notification: Arc::new(Mutex::new(None)),
@@ -2252,6 +2426,7 @@ fn spawn_chat_worker(
     identity: Arc<Identity>,
     cancelled: Arc<AtomicBool>,
     tor_socks: Option<SocketAddr>,
+    relay_url: String,
     notifications_enabled: Arc<AtomicBool>,
     last_notification: Arc<Mutex<Option<Instant>>>,
 ) {
@@ -2270,8 +2445,8 @@ fn spawn_chat_worker(
         let result = (|| -> Result<(RelaySession, Option<history::History>, Vec<ChatEntry>, usize, Option<String>, [u8; 32], String), String> {
             let invite = InviteCode::parse(&code).ok_or("초대 코드를 확인하세요.")?;
             let mut rendezvous = match role {
-                RoleForChat::Create => RelayRendezvous::create(DEFAULT_RELAY, &invite, tor_socks),
-                RoleForChat::Join => RelayRendezvous::join(DEFAULT_RELAY, &invite, tor_socks),
+                RoleForChat::Create => RelayRendezvous::create(&relay_url, &invite, tor_socks),
+                RoleForChat::Join => RelayRendezvous::join(&relay_url, &invite, tor_socks),
             }
             .map_err(|error| relay_failure_message(&error, "connect", tor_socks.is_some()))?;
             rendezvous.set_cancellation_token(Arc::clone(&cancelled));
@@ -3761,13 +3936,18 @@ fn respond_settings(stream: &mut TcpStream, state: &State) -> io::Result<()> {
     } else {
         "general"
     };
+    let relay_restart_required = state.active_relays != state.settings.relays;
     let payload = serde_json::json!({
         "activeMode": active_mode,
         "savedMode": saved_mode,
+        "savedRelays": &state.settings.relays,
+        "activeRelays": &state.active_relays,
+        "activeRelay": state.active_relays.first(),
+        "relayRestartRequired": relay_restart_required,
         "socks": state.settings.tor_socks.map(|address| address.to_string()),
         "activeSocks": state.tor_socks.map(|address| address.to_string()),
         "notifications": state.settings.notifications,
-        "restartRequired": state.tor_socks != state.settings.tor_socks,
+        "restartRequired": state.tor_socks != state.settings.tor_socks || relay_restart_required,
     })
     .to_string();
     respond(
@@ -3776,6 +3956,10 @@ fn respond_settings(stream: &mut TcpStream, state: &State) -> io::Result<()> {
         "application/json; charset=utf-8",
         payload.as_bytes(),
     )
+}
+
+fn first_active_relay(relays: &[String]) -> &str {
+    relays.first().map_or(DEFAULT_RELAY, String::as_str)
 }
 
 fn conversation_history_key(identity_id: &str, peer_id: &str) -> String {
@@ -3959,6 +4143,12 @@ fn issue_code(state: &mut State) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+fn preferences_path() -> io::Result<PathBuf> {
+    Ok(history::data_directory()?.join("preferences.json"))
+}
+
+#[cfg(not(test))]
 fn preferences_path() -> io::Result<PathBuf> {
     #[cfg(debug_assertions)]
     if std::env::var_os("ANOTHER_DIMENSION_DATA_DIR").is_some() {
@@ -3973,7 +4163,10 @@ fn preferences_path() -> io::Result<PathBuf> {
 }
 
 fn load_settings() -> io::Result<AppSettings> {
-    let path = preferences_path()?;
+    load_settings_from_path(&preferences_path()?)
+}
+
+fn load_settings_from_path(path: &std::path::Path) -> io::Result<AppSettings> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(AppSettings::default()),
@@ -4003,14 +4196,43 @@ fn load_settings() -> io::Result<AppSettings> {
         .get("notifications")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let relays = match value.get("relayUrls") {
+        None => vec![DEFAULT_RELAY.to_owned()],
+        Some(serde_json::Value::Array(values)) => {
+            let mut relays = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(value) = value.as_str() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "settings relay list contains a non-string address",
+                    ));
+                };
+                relays.push(value.to_owned());
+            }
+            relay::validate_relay_list(&relays)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        }
+        Some(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "settings relay list is invalid",
+            ))
+        }
+    };
     Ok(AppSettings {
         tor_socks,
         notifications,
+        relays,
     })
 }
 
 fn save_settings(settings: &AppSettings) -> io::Result<()> {
-    let path = preferences_path()?;
+    save_settings_to_path(&preferences_path()?, settings)
+}
+
+fn save_settings_to_path(path: &std::path::Path, settings: &AppSettings) -> io::Result<()> {
+    let relays = relay::validate_relay_list(&settings.relays)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let directory = path
         .parent()
         .ok_or_else(|| io::Error::other("settings directory unavailable"))?;
@@ -4019,6 +4241,7 @@ fn save_settings(settings: &AppSettings) -> io::Result<()> {
     let contents = serde_json::to_vec(&serde_json::json!({
         "torSocks": settings.tor_socks.map(|address| address.to_string()),
         "notifications": settings.notifications,
+        "relayUrls": relays,
     }))?;
     let temporary = path.with_extension(format!("{}.tmp", random_token()?));
     let result = (|| {
@@ -4341,12 +4564,46 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         else {
             return reject(&mut stream, "400 Bad Request");
         };
-        if tor_socks != state.tor_socks && any_chat_active(&state) {
+        let Some(relay_values) = value.get("relayUrls").and_then(serde_json::Value::as_array)
+        else {
+            return respond(
+                &mut stream,
+                "400 Bad Request",
+                "text/plain; charset=utf-8",
+                b"relayUrls must be a non-empty array of wss URLs",
+            );
+        };
+        let mut relays = Vec::with_capacity(relay_values.len());
+        for relay_value in relay_values {
+            let Some(relay_value) = relay_value.as_str() else {
+                return respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    "text/plain; charset=utf-8",
+                    b"relayUrls must contain only strings",
+                );
+            };
+            relays.push(relay_value.to_owned());
+        }
+        let relays = match relay::validate_relay_list(&relays) {
+            Ok(relays) => relays,
+            Err(error) => {
+                return respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    "text/plain; charset=utf-8",
+                    error.as_bytes(),
+                )
+            }
+        };
+        let relay_changed = relays != state.settings.relays;
+        if (tor_socks != state.tor_socks || relay_changed) && any_chat_active(&state) {
             return reject(&mut stream, "409 Conflict");
         }
         let settings = AppSettings {
             tor_socks,
             notifications,
+            relays,
         };
         if save_settings(&settings).is_err() {
             return reject(&mut stream, "500 Internal Server Error");
@@ -4398,7 +4655,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         return Ok(());
     }
     if first == "POST /api/invite/create HTTP/1.1" {
-        if state.tor_socks != state.settings.tor_socks {
+        if state.tor_socks != state.settings.tor_socks
+            || state.active_relays != state.settings.relays
+        {
             return reject(&mut stream, "409 Conflict");
         }
         if state.identity.is_none() {
@@ -4418,7 +4677,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/chat/join HTTP/1.1"
             | "POST /api/chat/reconnect HTTP/1.1"
     ) {
-        if state.tor_socks != state.settings.tor_socks {
+        if state.tor_socks != state.settings.tor_socks
+            || state.active_relays != state.settings.relays
+        {
             return reject(&mut stream, "409 Conflict");
         }
         let Some(identity) = state.identity.as_ref().cloned() else {
@@ -4493,6 +4754,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         });
         let cancelled = Arc::clone(&operation.cancelled);
         let tor_socks = state.tor_socks;
+        let relay_url = first_active_relay(&state.active_relays).to_owned();
         let notifications_enabled = Arc::clone(&state.notifications_enabled);
         let last_notification = Arc::clone(&state.last_notification);
         let role = reconnect_role.unwrap_or(if first == "POST /api/chat/create HTTP/1.1" {
@@ -4514,6 +4776,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             identity,
             cancelled,
             tor_socks,
+            relay_url,
             notifications_enabled,
             last_notification,
         );
@@ -5510,6 +5773,7 @@ fn main() -> io::Result<()> {
     }
     let settings = load_settings()?;
     let tor_socks = settings.tor_socks;
+    let active_relays = settings.relays.clone();
     let notifications_enabled = Arc::new(AtomicBool::new(settings.notifications));
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
@@ -5523,6 +5787,7 @@ fn main() -> io::Result<()> {
         history_deletions: HashMap::new(),
         active_history_deletions: HashSet::new(),
         tor_socks,
+        active_relays,
         settings,
         notifications_enabled,
         last_notification: Arc::new(Mutex::new(None)),

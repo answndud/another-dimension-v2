@@ -17,7 +17,7 @@ use sha2::Sha256;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,6 +45,118 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(15);
 const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Validate a relay URL without resolving its host or making a network request.
+/// The returned value is a comparison key: scheme/host case and the default
+/// port are normalized so equivalent endpoints are detected as duplicates.
+pub fn validate_relay_endpoint(endpoint: &str) -> Result<String, RelayError> {
+    if endpoint.is_empty()
+        || endpoint
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        || endpoint.contains('@')
+        || endpoint.contains('#')
+    {
+        return Err(RelayError::InvalidEndpoint);
+    }
+    let request = endpoint
+        .into_client_request()
+        .map_err(|_| RelayError::InvalidEndpoint)?;
+    let uri = request.uri();
+    if uri.scheme_str() != Some("wss") {
+        return Err(RelayError::InvalidEndpoint);
+    }
+    let host = uri.host().ok_or(RelayError::InvalidEndpoint)?;
+    if host.is_empty() {
+        return Err(RelayError::InvalidEndpoint);
+    }
+    let authority = uri.authority().ok_or(RelayError::InvalidEndpoint)?.as_str();
+    let explicit_port = if authority.starts_with('[') {
+        let bracket_end = authority.find(']').ok_or(RelayError::InvalidEndpoint)?;
+        let suffix = &authority[bracket_end + 1..];
+        if suffix.is_empty() {
+            None
+        } else {
+            Some(
+                suffix
+                    .strip_prefix(':')
+                    .ok_or(RelayError::InvalidEndpoint)?,
+            )
+        }
+    } else if let Some((host_part, port_part)) = authority.rsplit_once(':') {
+        if host_part.contains(':') {
+            return Err(RelayError::InvalidEndpoint);
+        }
+        Some(port_part)
+    } else {
+        None
+    };
+    let port = match explicit_port {
+        Some(value) if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
+            value
+                .parse::<u16>()
+                .map_err(|_| RelayError::InvalidEndpoint)?
+        }
+        Some(_) => return Err(RelayError::InvalidEndpoint),
+        None => 443,
+    };
+    if port == 0 {
+        return Err(RelayError::InvalidEndpoint);
+    }
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        return Err(RelayError::InvalidEndpoint);
+    }
+    let host = if let Ok(address) = host.parse::<IpAddr>() {
+        address.to_string()
+    } else {
+        if host.len() > 253
+            || host.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+        {
+            return Err(RelayError::InvalidEndpoint);
+        }
+        host.to_owned()
+    };
+    let authority_host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let port_part = if port == 443 {
+        String::new()
+    } else {
+        format!(":{port}")
+    };
+    let path = uri.path_and_query().map_or("/", |value| value.as_str());
+    Ok(format!("wss://{authority_host}{port_part}{path}"))
+}
+
+pub fn validate_relay_list(relays: &[String]) -> Result<Vec<String>, String> {
+    if relays.is_empty() {
+        return Err("relay 목록은 비어 있을 수 없습니다.".to_owned());
+    }
+    let mut normalized = BTreeSet::new();
+    for (index, endpoint) in relays.iter().enumerate() {
+        let key = validate_relay_endpoint(endpoint)
+            .map_err(|_| format!("{}번째 relay 주소가 올바르지 않습니다.", index + 1))?;
+        if !normalized.insert(key) {
+            return Err(format!("{}번째 relay 주소가 중복됩니다.", index + 1));
+        }
+    }
+    Ok(relays.to_vec())
+}
 
 #[derive(Debug)]
 pub enum RelayError {
@@ -236,9 +348,7 @@ fn open_socket(
     endpoint: &str,
     tor_socks: Option<SocketAddr>,
 ) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, RelayError> {
-    if !endpoint.starts_with("wss://") || endpoint.contains('@') || endpoint.contains('#') {
-        return Err(RelayError::InvalidEndpoint);
-    }
+    validate_relay_endpoint(endpoint)?;
     ensure_tls_crypto_provider()?;
     let mut config = WebSocketConfig::default();
     config.max_message_size = Some(MAX_RELAY_MESSAGE);
@@ -929,6 +1039,43 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn relay_validation_is_local_and_normalizes_duplicate_endpoints() {
+        assert_eq!(
+            super::validate_relay_endpoint("wss://RELAY.Example").unwrap(),
+            "wss://relay.example/"
+        );
+        assert_eq!(
+            super::validate_relay_endpoint("wss://relay.example:443/").unwrap(),
+            "wss://relay.example/"
+        );
+        for endpoint in [
+            "",
+            "ws://relay.example",
+            "http://relay.example",
+            "wss://user@relay.example",
+            "wss://relay.example/#fragment",
+            "wss://relay.example/a b",
+            "wss://relay.example:0",
+            "wss://relay.example:65536",
+            "wss://relay.example:notaport",
+            "wss://-invalid.example",
+            "wss://bad_host.example",
+        ] {
+            assert!(
+                super::validate_relay_endpoint(endpoint).is_err(),
+                "accepted invalid endpoint: {endpoint}"
+            );
+        }
+        assert!(super::validate_relay_list(&[]).is_err());
+        assert!(super::validate_relay_list(&[
+            "wss://relay.example".to_owned(),
+            "wss://RELAY.EXAMPLE:443/".to_owned(),
+        ])
+        .is_err());
+        assert!(super::validate_relay_endpoint("wss://no-such-host.invalid").is_ok());
+    }
 
     #[test]
     fn tls_crypto_provider_is_initialized_before_network_use() {

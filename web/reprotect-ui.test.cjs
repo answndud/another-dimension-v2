@@ -568,6 +568,8 @@ test('actual UI: restore jobs reopen only for the identity that created them', a
   const settings = JSON.stringify({
     savedMode: 'general', socks: null, activeMode: 'general', activeSocks: null,
     restartRequired: false, notifications: false,
+    savedRelays: ['wss://relay.primal.net'], activeRelays: ['wss://relay.primal.net'],
+    activeRelay: 'wss://relay.primal.net',
   });
   await t.test('A to B to A keeps A reference private and reopens it for A', async () => {
     const h = createHarness();
@@ -646,10 +648,49 @@ test('actual UI: send rejected during restore merge preserves input and explains
   assert.equal(h.element('#chat-status').textContent, '기록 병합 중이라 메시지를 전송하지 않았습니다. 병합 완료 후 다시 보내세요.');
 });
 
+test('actual UI: relay settings display the active first relay and save edited lists', async (t) => {
+  const h = createHarness();
+  const settings = {
+    savedMode: 'general', socks: null, activeMode: 'general', activeSocks: null,
+    notifications: false, savedRelays: ['wss://relay.one', 'wss://relay.two'],
+    activeRelays: ['wss://relay.old'], activeRelay: 'wss://relay.old',
+    restartRequired: true, relayRestartRequired: true,
+  };
+  const refresh = h.evaluate('refreshNetworkSettings()');
+  h.requestFor('/api/settings/get').resolve(response(JSON.stringify(settings)));
+  await refresh;
+  assert.equal(h.element('#relay-list').value, 'wss://relay.one\nwss://relay.two');
+  assert.match(h.element('#active-relay').textContent, /wss:\/\/relay\.old/);
+  assert.match(h.element('#active-relay').textContent, /첫 주소만/);
+  assert.match(h.element('#settings-status').textContent, /다시 실행/);
+
+  await t.test('save sends the entered list and reports restart requirement', async () => {
+    h.element('#relay-list').value = 'wss://relay.new\nwss://relay.backup';
+    const saving = h.click('#save-settings');
+    const request = h.requestFor('/api/settings/save');
+    assert.deepEqual(JSON.parse(request.init.body).relayUrls, [
+      'wss://relay.new', 'wss://relay.backup',
+    ]);
+    request.resolve(response(JSON.stringify({ ...settings, savedRelays: ['wss://relay.new', 'wss://relay.backup'] })));
+    await saving;
+    assert.match(h.element('#settings-status').textContent, /다시 실행/);
+    assert.match(h.element('#active-relay').textContent, /wss:\/\/relay\.old/);
+  });
+
+  await t.test('invalid address detail is shown as text', async () => {
+    const saving = h.click('#save-settings');
+    h.requestFor('/api/settings/save').resolve(response('2번째 relay 주소가 올바르지 않습니다.', 400));
+    await saving;
+    assert.equal(h.element('#settings-status').textContent, '2번째 relay 주소가 올바르지 않습니다.');
+  });
+});
+
 test('actual UI: stale polls cannot change another identity after response or JSON awaits', async (t) => {
   const settings = JSON.stringify({
     savedMode: 'general', socks: null, activeMode: 'general', activeSocks: null,
     restartRequired: false, notifications: false,
+    savedRelays: ['wss://relay.primal.net'], activeRelays: ['wss://relay.primal.net'],
+    activeRelay: 'wss://relay.primal.net',
   });
   const switchIdentity = async (h, identity) => {
     const refresh = h.evaluate('refreshIdentity()');
