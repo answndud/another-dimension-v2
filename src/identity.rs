@@ -167,29 +167,6 @@ impl Identity {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))?;
             }
-            for peer_id in crate::history::History::known_peer_ids(self)? {
-                let (messages, recovered_partial) =
-                    crate::history::History::read_for_identity_copy(self, &peer_id)?;
-                if recovered_partial {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "source history has an incomplete record",
-                    ));
-                }
-                let (mut history, _, _) = crate::history::History::open(replacement, &peer_id)?;
-                history.replace(&messages)?;
-            }
-
-            let source_contacts = crate::contacts::list_known(
-                &crate::history::data_directory()?
-                    .join(self.public_id())
-                    .join("verified-contacts"),
-                self,
-            )?;
-            let contact_directory = destination.join("verified-contacts");
-            for contact in &source_contacts {
-                crate::contacts::save(&contact_directory, replacement, contact)?;
-            }
             let mut origins = previous_public_ids(self)?;
             origins.push(self.public_id());
             origins.sort();
@@ -210,11 +187,35 @@ impl Identity {
                 options.mode(0o600);
             }
             let mut file = options.open(&temporary)?;
-            for id in origins {
+            for id in &origins {
                 writeln!(file, "{id}")?;
             }
             file.sync_all()?;
             fs::rename(temporary, origin_path)?;
+            for peer_id in crate::history::History::known_peer_ids(self)? {
+                let (messages, recovered_partial) =
+                    crate::history::History::read_for_identity_copy(self, &peer_id)?;
+                if recovered_partial {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "source history has an incomplete record",
+                    ));
+                }
+                let (mut history, _, _) = crate::history::History::open(replacement, &peer_id)?;
+                history.replace(&messages)?;
+                crate::history::copy_linked_keys_to(self, replacement, &peer_id)?;
+            }
+
+            let source_contacts = crate::contacts::list_known(
+                &crate::history::data_directory()?
+                    .join(self.public_id())
+                    .join("verified-contacts"),
+                self,
+            )?;
+            let contact_directory = destination.join("verified-contacts");
+            for contact in &source_contacts {
+                crate::contacts::save(&contact_directory, replacement, contact)?;
+            }
             Ok(())
         })();
 

@@ -666,6 +666,65 @@ pub(crate) fn is_linked_peer_identity(
         .contains(&previous_id.to_ascii_lowercase()))
 }
 
+pub(crate) fn is_linked_local_identity(
+    identity: &Identity,
+    peer_id: &str,
+    previous_id: &str,
+) -> io::Result<bool> {
+    validate_peer_id(previous_id)?;
+    let in_lineage = crate::identity::previous_public_ids(identity)?
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(previous_id));
+    Ok(in_lineage
+        && read_linked_keys(identity, peer_id)?
+            .0
+            .contains(&previous_id.to_ascii_lowercase()))
+}
+
+pub(crate) fn pending_local_identity_links(
+    identity: &Identity,
+    peer_id: &str,
+    previous_ids: &[String],
+) -> io::Result<Vec<String>> {
+    let (locals, _) = read_linked_keys(identity, peer_id)?;
+    let lineage: HashSet<_> = crate::identity::previous_public_ids(identity)?
+        .into_iter()
+        .collect();
+    Ok(previous_ids
+        .iter()
+        .filter(|id| {
+            let id = id.to_ascii_lowercase();
+            lineage.contains(&id) && !locals.contains(&id)
+        })
+        .cloned()
+        .collect())
+}
+
+pub(crate) fn copy_linked_keys_to(
+    source: &Identity,
+    replacement: &Identity,
+    peer_id: &str,
+) -> io::Result<()> {
+    let links = read_linked_keys(source, peer_id)?;
+    let source_origins: HashSet<_> = crate::identity::previous_public_ids(source)?
+        .into_iter()
+        .collect();
+    if links.0.iter().any(|id| !source_origins.contains(id)) {
+        return Err(invalid_data(
+            "source local identity link is outside confirmed lineage",
+        ));
+    }
+    let target_origins: HashSet<_> = crate::identity::previous_public_ids(replacement)?
+        .into_iter()
+        .collect();
+    if links.0.iter().any(|id| !target_origins.contains(id)) {
+        return Err(invalid_data(
+            "replacement identity lineage does not contain a linked key",
+        ));
+    }
+    write_linked_keys(replacement, peer_id, &links)
+}
+
 fn encode_backup(
     identity: &Identity,
     peer_id: &str,
@@ -2115,6 +2174,7 @@ mod tests {
     use crate::identity::Identity;
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+    use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2471,10 +2531,16 @@ mod tests {
             .with(|directory| *directory.borrow_mut() = Some(store_c.clone()));
         let bundle_identity = Identity::from_code(&code).unwrap();
         History::import_backup_bundle(&bundle_identity, &bundle).unwrap();
-        let (bundle_messages, _) = History::read_for_identity_copy(&bundle_identity, &peer_id).unwrap();
+        let (bundle_messages, _) =
+            History::read_for_identity_copy(&bundle_identity, &peer_id).unwrap();
         let (bundle_local, _) = super::linked_identity_keys(
-            &bundle_identity, &bundle_messages, &bundle_identity.public_id(), &peer_id,
-            &crate::identity::previous_public_ids(&bundle_identity).unwrap()).unwrap();
+            &bundle_identity,
+            &bundle_messages,
+            &bundle_identity.public_id(),
+            &peer_id,
+            &crate::identity::previous_public_ids(&bundle_identity).unwrap(),
+        )
+        .unwrap();
         assert!(bundle_local.contains(&old_local.public_key()));
 
         let store_d = root.join("store-d");
@@ -2547,6 +2613,118 @@ mod tests {
         old_backup.extend_from_slice(&nonce);
         old_backup.extend_from_slice(&ciphertext);
         assert!(History::verify_backup(&failed_identity, &old_backup, None).is_err());
+    }
+
+    #[test]
+    fn pending_link_retries_marker_only_partial_failure_without_duplicate_marker() {
+        let _data = IsolatedData::new();
+        let (old, _) = Identity::create().unwrap();
+        let (current, _) = Identity::create().unwrap();
+        old.copy_local_data_to(&current).unwrap();
+        let peer = "4a".repeat(32);
+        let old_id = old.public_id();
+        let entry = StoredMessage {
+            unix_time: 22,
+            sender: MessageSender::Me,
+            text: format!(
+                "{}self:{old_id}:{}",
+                super::IDENTITY_EVENT_PREFIX,
+                current.public_id()
+            ),
+            proof: None,
+        };
+        let (mut history, _, _) = History::open(&current, &peer).unwrap();
+        assert!(history.append_system_once(&current, entry.clone()).unwrap());
+        super::TEST_FAILURES.with(|flags| flags.set(super::FAIL_LINKED_STORE));
+        assert!(super::record_linked_local_identity(&current, &peer, &old_id).is_err());
+        super::TEST_FAILURES.with(|flags| flags.set(0));
+        assert_eq!(
+            super::pending_local_identity_links(&current, &peer, &[old_id.clone()]).unwrap(),
+            vec![old_id.clone()]
+        );
+        assert!(!history.append_system_once(&current, entry).unwrap());
+        super::record_linked_local_identity(&current, &peer, &old_id).unwrap();
+        assert!(
+            super::pending_local_identity_links(&current, &peer, &[old_id])
+                .unwrap()
+                .is_empty()
+        );
+        let (messages, _) = History::read_for_identity_copy(&current, &peer).unwrap();
+        assert_eq!(messages.len(), 1);
+
+        let path = super::linked_key_path(&current, &peer).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(path, bytes).unwrap();
+        assert!(super::pending_local_identity_links(&current, &peer, &["ff".repeat(32)]).is_err());
+    }
+
+    #[test]
+    fn repeated_identity_replacement_preserves_authenticated_peer_links_and_proofs() {
+        let _data = IsolatedData::new();
+        let (local_a, _) = Identity::create().unwrap();
+        let (local_b, _) = Identity::create().unwrap();
+        let (local_c, _) = Identity::create().unwrap();
+        let (peer_old, _) = Identity::create().unwrap();
+        let (peer_current, _) = Identity::create().unwrap();
+        let current_peer_id = peer_current.public_id();
+        let old_peer_id = peer_old.public_id();
+        let mut proof =
+            super::sign_message(&peer_old, &local_a.public_id(), 91, "old peer proof".into())
+                .unwrap();
+        proof.sender = MessageSender::Other;
+        let (mut history, _, _) = History::open(&local_a, &current_peer_id).unwrap();
+        history.append(&proof).unwrap();
+        let mut links = (HashSet::new(), HashSet::new());
+        links.1.insert(old_peer_id.clone());
+        super::write_linked_keys(&local_a, &current_peer_id, &links).unwrap();
+
+        local_a.copy_local_data_to(&local_b).unwrap();
+        super::record_linked_local_identity(&local_b, &current_peer_id, &local_a.public_id())
+            .unwrap();
+        local_b.copy_local_data_to(&local_c).unwrap();
+        let (messages, _) = History::read_for_identity_copy(&local_c, &current_peer_id).unwrap();
+        let (local_aliases, peer_aliases) = super::linked_identity_keys(
+            &local_c,
+            &messages,
+            &local_c.public_id(),
+            &current_peer_id,
+            &crate::identity::previous_public_ids(&local_c).unwrap(),
+        )
+        .unwrap();
+        assert!(local_aliases.contains(&local_a.public_key()));
+        assert!(peer_aliases.contains(&peer_old.public_key()));
+        super::verify_stored_proof(
+            &local_c,
+            &current_peer_id,
+            &proof,
+            &local_aliases,
+            &peer_aliases,
+        )
+        .unwrap();
+
+        let source_path = super::linked_key_path(&local_c, &current_peer_id).unwrap();
+        let source_bytes = std::fs::read(&source_path).unwrap();
+        let (failed_replacement, _) = Identity::create().unwrap();
+        super::TEST_FAILURES.with(|flags| flags.set(super::FAIL_LINKED_STORE));
+        assert!(local_c.copy_local_data_to(&failed_replacement).is_err());
+        super::TEST_FAILURES.with(|flags| flags.set(0));
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+        assert!(!super::data_directory()
+            .unwrap()
+            .join(failed_replacement.public_id())
+            .exists());
+
+        let (corrupt_replacement, _) = Identity::create().unwrap();
+        let mut tampered = source_bytes;
+        *tampered.last_mut().unwrap() ^= 1;
+        std::fs::write(&source_path, tampered.clone()).unwrap();
+        assert!(local_c.copy_local_data_to(&corrupt_replacement).is_err());
+        assert_eq!(std::fs::read(&source_path).unwrap(), tampered);
+        assert!(!super::data_directory()
+            .unwrap()
+            .join(corrupt_replacement.public_id())
+            .exists());
     }
 
     #[test]
