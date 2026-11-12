@@ -1636,6 +1636,12 @@ mod tests {
                 .is_err()
         );
         assert!(super::decode_transfer(&bob, &local_peer_id, &[9; 32], &frame).is_err());
+        let mut wrong_sender = frame.clone();
+        wrong_sender[6] = 1;
+        assert!(
+            super::decode_transfer(&bob, &local_peer_id, &alice.public_key(), &wrong_sender)
+                .is_err()
+        );
 
         let mut collision = received.clone();
         collision.text = "different contents".into();
@@ -1656,6 +1662,50 @@ mod tests {
     }
 
     #[test]
+    fn legacy_adlog1_is_migrated_without_retroactive_signatures() {
+        let data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "43".repeat(32);
+        let identity_id = identity.public_id();
+        let directory = data.0.join(&identity_id);
+        std::fs::create_dir_all(&directory).unwrap();
+        let key = identity.storage_key();
+        let index_key = super::derive_index_key(&key);
+        let path = directory.join(format!(
+            "{}.adlog",
+            super::opaque_conversation_name(&index_key, &peer)
+        ));
+        let entry = message(77, "unsigned legacy");
+        let mut plain = Vec::new();
+        plain.extend_from_slice(&entry.unix_time.to_be_bytes());
+        plain.push(0);
+        plain.extend_from_slice(&(entry.text.len() as u32).to_be_bytes());
+        plain.extend_from_slice(entry.text.as_bytes());
+        let nonce = super::random_nonce().unwrap();
+        let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref()).unwrap();
+        let encrypted = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plain,
+                    aad: &super::associated_data(&identity_id, &peer, 0, true),
+                },
+            )
+            .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(super::LEGACY_MAGIC);
+        bytes.extend_from_slice(&((nonce.len() + encrypted.len()) as u32).to_be_bytes());
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&encrypted);
+        std::fs::write(&path, bytes).unwrap();
+
+        let (_, messages, _) = History::open(&identity, &peer).unwrap();
+        assert_eq!(messages, vec![entry]);
+        assert!(messages[0].proof.is_none());
+        assert_eq!(&std::fs::read(path).unwrap()[..8], super::MAGIC);
+    }
+
+    #[test]
     fn encrypted_bundle_exports_and_restores_multiple_conversations() {
         let _data = IsolatedData::new();
         let (identity, _) = Identity::create().unwrap();
@@ -1672,6 +1722,10 @@ mod tests {
             History::export_backup_bundle(&identity, &[first.clone(), second.clone()]).unwrap();
         History::delete_conversation(&identity, &first).unwrap();
         History::delete_conversation(&identity, &second).unwrap();
+        let mut corrupted = bundle.clone();
+        *corrupted.last_mut().unwrap() ^= 1;
+        assert!(History::import_backup_bundle(&identity, &corrupted).is_err());
+        assert!(History::known_peer_ids(&identity).unwrap().is_empty());
         let restored = History::import_backup_bundle(&identity, &bundle).unwrap();
         assert_eq!(restored, vec![(first.clone(), 1), (second.clone(), 1)]);
         assert_eq!(
@@ -1682,10 +1736,6 @@ mod tests {
             History::open(&identity, &second).unwrap().1[0].text,
             "second conversation"
         );
-
-        let mut corrupted = bundle.clone();
-        *corrupted.last_mut().unwrap() ^= 1;
-        assert!(History::import_backup_bundle(&identity, &corrupted).is_err());
     }
 
     #[test]
@@ -2033,6 +2083,82 @@ mod tests {
         backup
     }
 
+    fn legacy_identity_backup(
+        identity: &Identity,
+        peer: &str,
+        messages: &[StoredMessage],
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&super::decode_peer_id(peer).unwrap());
+        payload.extend_from_slice(&(messages.len() as u32).to_be_bytes());
+        for message in messages {
+            payload.extend_from_slice(&message.unix_time.to_be_bytes());
+            payload.push(match message.sender {
+                MessageSender::Me => 0,
+                MessageSender::Other => 1,
+            });
+            payload.extend_from_slice(&(message.text.len() as u32).to_be_bytes());
+            payload.extend_from_slice(message.text.as_bytes());
+        }
+        let nonce = [0x52; super::NONCE_BYTES];
+        let key = super::derive_backup_key(&identity.storage_key());
+        let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref()).unwrap();
+        let encrypted = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &payload,
+                    aad: &super::backup_aad(identity, super::BACKUP_MAGIC, None),
+                },
+            )
+            .unwrap();
+        let mut backup = Vec::new();
+        backup.extend_from_slice(super::BACKUP_MAGIC);
+        backup.extend_from_slice(&nonce);
+        backup.extend_from_slice(&encrypted);
+        backup
+    }
+
+    fn legacy_combined_backup(
+        identity: &Identity,
+        peer: &str,
+        messages: &[StoredMessage],
+        password: &str,
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&super::decode_peer_id(peer).unwrap());
+        payload.extend_from_slice(&(messages.len() as u32).to_be_bytes());
+        for message in messages {
+            payload.extend_from_slice(&message.unix_time.to_be_bytes());
+            payload.push(match message.sender {
+                MessageSender::Me => 0,
+                MessageSender::Other => 1,
+            });
+            payload.extend_from_slice(&(message.text.len() as u32).to_be_bytes());
+            payload.extend_from_slice(message.text.as_bytes());
+        }
+        let salt = [0x31; super::BACKUP_SALT_BYTES];
+        let nonce = [0x53; super::NONCE_BYTES];
+        let password_key = super::derive_password_backup_key(password, &salt).unwrap();
+        let key = super::derive_combined_backup_key(&identity.storage_key(), &password_key);
+        let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref()).unwrap();
+        let encrypted = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &payload,
+                    aad: &super::backup_aad(identity, super::BACKUP_COMBINED_MAGIC, Some(&salt)),
+                },
+            )
+            .unwrap();
+        let mut backup = Vec::new();
+        backup.extend_from_slice(super::BACKUP_COMBINED_MAGIC);
+        backup.extend_from_slice(&salt);
+        backup.extend_from_slice(&nonce);
+        backup.extend_from_slice(&encrypted);
+        backup
+    }
+
     #[test]
     fn backup_import_preserves_repeats_and_reads_existing_legacy_format() {
         let _data = IsolatedData::new();
@@ -2101,6 +2227,35 @@ mod tests {
             .unwrap()
             .1,
             3
+        );
+        let old_identity_backup = legacy_identity_backup(
+            &identity,
+            &peer,
+            &[message(1_700_000_002, "legacy identity backup")],
+        );
+        assert_eq!(&old_identity_backup[..8], b"ADBACK1\0");
+        assert_eq!(
+            History::import_backup(&identity, &old_identity_backup, None)
+                .unwrap()
+                .1,
+            4
+        );
+        let old_combined_backup = legacy_combined_backup(
+            &identity,
+            &peer,
+            &[message(1_700_000_003, "legacy combined backup")],
+            "correct horse battery",
+        );
+        assert_eq!(&old_combined_backup[..8], b"ADBACK3\0");
+        assert_eq!(
+            History::import_backup(
+                &identity,
+                &old_combined_backup,
+                Some("correct horse battery")
+            )
+            .unwrap()
+            .1,
+            5
         );
     }
 

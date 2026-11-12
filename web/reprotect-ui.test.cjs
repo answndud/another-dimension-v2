@@ -38,6 +38,7 @@ function createHarness() {
         value: '', textContent: '', hidden: false, disabled: false, checked: false,
         dataset: {}, style: {}, listeners: {}, children: [],
         addEventListener(type, callback) { this.listeners[type] = callback; },
+        querySelector(selector) { return element(`${selector} inside ${selector}`); },
         replaceChildren(...children) { this.children = children; },
         append(...children) { this.children.push(...children); },
         appendChild(child) { this.children.push(child); return child; },
@@ -359,4 +360,18 @@ test('actual UI: identity-link failure body reaches the user status unchanged', 
   h.requestFor('/api/chat/link-identity').resolve(response(detail, 500));
   await task;
   assert.equal(h.element('#message').textContent, detail);
+});
+
+test('actual UI: restore status and unsigned legacy preview reach the connected screen', () => {
+  const h = createHarness();
+  h.evaluate(`updateChatView({
+    phase: 'connected', messageEpoch: 0, messages: [], peerId: 'peer',
+    historyRestoreStatus: '복원 제안을 거부했습니다. 로컬 기록은 변경되지 않았습니다.',
+    historyRestoreOfferCount: 1, historyRestoreLegacyCount: 1,
+    historyRestoreOffer: [{ time: 1, sender: '상대방', text: 'legacy item', signed: false }],
+    historyRestoreInProgress: false, identityTransition: []
+  })`);
+  assert.match(h.element('#history-restore-status').textContent, /로컬 기록은 변경되지 않았습니다/);
+  assert.match(h.element('#history-restore-preview').children[0].children[0].textContent, /기존 서명 없음/);
+  assert.equal(h.element('#history-restore-accept').disabled, false);
 });
