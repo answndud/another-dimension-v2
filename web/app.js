@@ -30,6 +30,7 @@ const operationKey = 'local-chat-operation';
 let token = sessionStorage.getItem(sessionKey);
 let currentInvite = '';
 let operationId = null;
+let latestChatSnapshot = null;
 let messageCursor = 0;
 let messageEpoch = null;
 let pollTimer = null;
@@ -265,6 +266,7 @@ function appendMessages(items) {
 }
 
 function updateChatView(snapshot) {
+  latestChatSnapshot = snapshot;
   if (messageEpoch !== snapshot.messageEpoch) {
     conversation.replaceChildren();
     messageCursor = 0;
@@ -321,6 +323,7 @@ function updateChatView(snapshot) {
     document.querySelector('#identity-transition-dismiss').dataset.transitionKey = transitionKey;
   }
   const restoreOffer = snapshot.historyRestoreOffer || [];
+  const restoreState = snapshot.historyRestoreState || 'idle';
   const restorePanel = document.querySelector('#history-restore-panel');
   const restoreStatus = document.querySelector('#history-restore-status');
   const restorePreview = document.querySelector('#history-restore-preview');
@@ -330,11 +333,21 @@ function updateChatView(snapshot) {
   restoreStatus.textContent = snapshot.historyRestoreInProgress
     ? `상대 기록을 받는 중입니다: ${snapshot.historyRestoreReceived || 0} / ${snapshot.historyRestoreTotal || 0}. 동의 전에는 로컬 기록을 변경하지 않습니다.`
     : snapshot.historyRestoreStatus || '';
+  if (snapshot.historyRestoreCleanupError) {
+    restoreStatus.textContent += ` 임시 기록 정리 실패: ${snapshot.historyRestoreCleanupError}`;
+  }
   document.querySelector('#history-restore-request').disabled = snapshot.phase !== 'connected'
-    || snapshot.historyRestoreInProgress || (snapshot.historyRestoreOfferCount || 0) > 0;
-  document.querySelector('#history-restore-accept').disabled = (snapshot.historyRestoreOfferCount || 0) === 0;
-  document.querySelector('#history-restore-decline').disabled = (snapshot.historyRestoreOfferCount || 0) === 0 && !snapshot.historyRestoreInProgress;
-  document.querySelector('#history-restore-decline').textContent = snapshot.historyRestoreInProgress ? '전송 취소' : '복원 거부';
+    || snapshot.historyRestoreInProgress || (snapshot.historyRestoreOfferCount || 0) > 0
+    || !['idle', 'failed'].includes(restoreState);
+  document.querySelector('#history-restore-accept').disabled = snapshot.historyRestoreInProgress
+    || !['awaiting-transfer-consent', 'awaiting-merge-consent'].includes(restoreState)
+    || (snapshot.historyRestoreOfferCount || 0) === 0;
+  document.querySelector('#history-restore-accept').textContent = restoreState === 'awaiting-merge-consent'
+    ? '제안된 기록 병합' : '전송 동의';
+  document.querySelector('#history-restore-decline').disabled = ['idle', 'failed'].includes(restoreState);
+  document.querySelector('#history-restore-decline').textContent = snapshot.historyRestoreInProgress
+    ? (restoreState === 'estimating' ? '예상 확인 취소' : '전송 취소')
+    : (restoreState === 'awaiting-transfer-consent' ? '전송 거부' : '복원 거부');
   if (restorePreview.dataset.offerKey !== restoreKey) {
     restorePreview.replaceChildren();
     for (const item of restoreOffer) {
@@ -724,13 +737,15 @@ document.querySelector('#history-restore-request').addEventListener('click', asy
 
 async function resolveHistoryRestore(accept) {
   if (!operationId) return;
+  const restoreState = latestChatSnapshot?.historyRestoreState || 'idle';
+  const acceptingTransfer = accept && restoreState === 'awaiting-transfer-consent';
   const cancellingTransfer = !accept
     && document.querySelector('#history-restore-decline').textContent === '전송 취소';
   try {
     const response = await request('/api/chat/resolve-history-restore', JSON.stringify({ operationId, accept }));
     if (!response.ok) throw new Error((await response.text()) || 'restore failed');
     message.textContent = accept
-      ? '복원한 기록을 현재 대화에 추가했습니다.'
+      ? acceptingTransfer ? '전송을 시작했습니다. 완료 후 미리 보기에서 최종 병합을 확인하세요.' : '복원한 기록을 현재 대화에 추가했습니다.'
       : cancellingTransfer
         ? '기록 전송을 취소했습니다. 로컬 기록은 변경되지 않았습니다.'
         : '복원을 거부했습니다. 로컬 기록은 변경되지 않았습니다.';

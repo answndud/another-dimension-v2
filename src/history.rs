@@ -28,6 +28,7 @@ const BACKUP_LINKED_MAGIC: &[u8; 8] = b"ADBACK5\0";
 const BACKUP_LINKS_TRAILER: &[u8; 8] = b"ADLNK1\0\0";
 const BACKUP_BUNDLE_MAGIC: &[u8; 8] = b"ADPACK1\0";
 const LINKED_KEYS_MAGIC: &[u8; 8] = b"ADLKEY1\0";
+const RESTORE_STAGING_MAGIC: &[u8; 8] = b"ADRSTG1\0";
 const TRANSFER_MAGIC: &[u8; 6] = b"ADREC1";
 const TRANSFER_CHUNK_MAGIC: &[u8; 5] = b"ADCH1";
 const MESSAGE_MAGIC: &[u8; 6] = b"ADMSG1";
@@ -108,7 +109,344 @@ pub struct History {
     next_index: u64,
 }
 
+/// Sequential, non-repairing view of a history file. The captured file length
+/// prevents later appends from extending the offered snapshot; an atomic
+/// replacement leaves this reader on the original inode.
+pub(crate) struct HistoryReader {
+    file: File,
+    key: Zeroizing<[u8; 32]>,
+    identity_id: String,
+    peer_id: String,
+    index: u64,
+    end: u64,
+    legacy: bool,
+}
+
+pub(crate) struct RestoreStaging {
+    directory: PathBuf,
+    file: File,
+    _lock: File,
+    identity_id: String,
+    peer_id: String,
+    request_id: String,
+    key: Zeroizing<[u8; 32]>,
+    count: u64,
+    read_index: u64,
+    read_end: u64,
+    finished: bool,
+    cleaned: bool,
+}
+
+impl RestoreStaging {
+    pub(crate) fn create(identity: &Identity, peer_id: &str, request_id: &str) -> io::Result<Self> {
+        validate_peer_id(peer_id)?;
+        if request_id.len() != 64 || !request_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(invalid_data("invalid history restore request ID"));
+        }
+        let identity_id = identity.public_id();
+        let root = data_directory()?
+            .join(&identity_id)
+            .join(".history-restore");
+        create_dir_all(&root)?;
+        set_private_directory(&root)?;
+        cleanup_stale_restore_staging(&root)?;
+        let directory = root.join(hex_encode(&random_nonce()?));
+        std::fs::create_dir(&directory)?;
+        set_private_directory(&directory)?;
+        let result = (|| {
+            let lock = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(directory.join("owner.lock"))?;
+            set_private_file(&lock)?;
+            lock_restore_directory(&lock)?;
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(directory.join("records.enc"))?;
+            set_private_file(&file)?;
+            file.write_all(RESTORE_STAGING_MAGIC)?;
+            file.sync_data()?;
+            let mut key = Zeroizing::new([0; 32]);
+            Hkdf::<Sha256>::new(Some(request_id.as_bytes()), identity.storage_key().as_ref())
+                .expand(
+                    b"another-dimension-v2/history-restore-staging/v1",
+                    key.as_mut(),
+                )
+                .map_err(|_| io::Error::other("restore staging key derivation failed"))?;
+            Ok(Self {
+                directory: directory.clone(),
+                file,
+                _lock: lock,
+                identity_id,
+                peer_id: peer_id.to_ascii_lowercase(),
+                request_id: request_id.to_ascii_lowercase(),
+                key,
+                count: 0,
+                read_index: 0,
+                read_end: 0,
+                finished: false,
+                cleaned: false,
+            })
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+        result
+    }
+
+    pub(crate) fn append_verified(&mut self, message: &StoredMessage) -> io::Result<()> {
+        if self.finished {
+            return Err(invalid_data("restore staging is already finished"));
+        }
+        let plaintext = encode_history_plain(message)?;
+        let nonce = random_nonce()?;
+        let cipher = ChaCha20Poly1305::new_from_slice(self.key.as_ref())
+            .map_err(|_| io::Error::other("restore staging key unavailable"))?;
+        let encrypted = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad: &restore_staging_aad(
+                        &self.identity_id,
+                        &self.peer_id,
+                        &self.request_id,
+                        self.count,
+                    ),
+                },
+            )
+            .map_err(|_| io::Error::other("restore staging encryption failed"))?;
+        let length = u32::try_from(encrypted.len())
+            .map_err(|_| invalid_data("restore staging record is too large"))?;
+        self.file.write_all(&length.to_be_bytes())?;
+        self.file.write_all(&nonce)?;
+        self.file.write_all(&encrypted)?;
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("restore staging record count overflow"))?;
+        Ok(())
+    }
+
+    pub(crate) fn finish(&mut self) -> io::Result<()> {
+        self.file.flush()?;
+        self.file.sync_all()?;
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut magic = [0; RESTORE_STAGING_MAGIC.len()];
+        self.file.read_exact(&mut magic)?;
+        if &magic != RESTORE_STAGING_MAGIC {
+            return Err(invalid_data("invalid restore staging header"));
+        }
+        self.read_end = self.file.metadata()?.len();
+        self.file
+            .seek(SeekFrom::Start(RESTORE_STAGING_MAGIC.len() as u64))?;
+        self.finished = true;
+        Ok(())
+    }
+
+    pub(crate) fn next_record(&mut self) -> io::Result<Option<StoredMessage>> {
+        if !self.finished {
+            return Err(invalid_data("restore staging is not complete"));
+        }
+        let position = self.file.stream_position()?;
+        if position == self.read_end {
+            if self.read_index != self.count {
+                return Err(invalid_data("restore staging record count mismatch"));
+            }
+            return Ok(None);
+        }
+        if position > self.read_end || self.read_end - position < (4 + NONCE_BYTES + 16) as u64 {
+            return Err(invalid_data("restore staging is truncated"));
+        }
+        let mut length = [0; 4];
+        self.file.read_exact(&mut length)?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length < 13 + 1 + 16
+            || length > 13 + MAX_MESSAGE_BYTES + 145
+            || self.read_end - position < 4 + NONCE_BYTES as u64 + length as u64
+        {
+            return Err(invalid_data("invalid restore staging record length"));
+        }
+        let mut nonce = [0; NONCE_BYTES];
+        self.file.read_exact(&mut nonce)?;
+        let mut encrypted = vec![0; length];
+        self.file.read_exact(&mut encrypted)?;
+        let cipher = ChaCha20Poly1305::new_from_slice(self.key.as_ref())
+            .map_err(|_| invalid_data("restore staging key unavailable"))?;
+        let plain = Zeroizing::new(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: &encrypted,
+                        aad: &restore_staging_aad(
+                            &self.identity_id,
+                            &self.peer_id,
+                            &self.request_id,
+                            self.read_index,
+                        ),
+                    },
+                )
+                .map_err(|_| invalid_data("restore staging authentication failed"))?,
+        );
+        let message = decode_history_plain(&plain, false)?;
+        self.read_index += 1;
+        Ok(Some(message))
+    }
+
+    pub(crate) fn rewind(&mut self) -> io::Result<()> {
+        if !self.finished {
+            return Err(invalid_data("restore staging is not complete"));
+        }
+        self.file
+            .seek(SeekFrom::Start(RESTORE_STAGING_MAGIC.len() as u64))?;
+        self.read_index = 0;
+        Ok(())
+    }
+
+    pub(crate) fn count(&self) -> u64 {
+        self.count
+    }
+
+    pub(crate) fn cleanup(mut self) -> io::Result<()> {
+        std::fs::remove_dir_all(&self.directory)?;
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+impl Drop for RestoreStaging {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+}
+
+impl HistoryReader {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test(file: File) -> Self {
+        Self {
+            file,
+            key: Zeroizing::new([0; 32]),
+            identity_id: "00".repeat(32),
+            peer_id: "11".repeat(32),
+            index: 0,
+            end: 0,
+            legacy: false,
+        }
+    }
+
+    pub(crate) fn rewind(&mut self) -> io::Result<()> {
+        self.file.seek(SeekFrom::Start(MAGIC.len() as u64))?;
+        self.index = 0;
+        Ok(())
+    }
+
+    pub(crate) fn next_record(&mut self) -> io::Result<Option<StoredMessage>> {
+        let position = self.file.stream_position()?;
+        if position == self.end {
+            return Ok(None);
+        }
+        if position > self.end || self.end - position < 4 {
+            return Err(invalid_data("history snapshot ends in a partial record"));
+        }
+        let mut length = [0; 4];
+        self.file.read_exact(&mut length)?;
+        let length = u32::from_be_bytes(length) as usize;
+        if !(NONCE_BYTES + 16 + 13..=NONCE_BYTES + 16 + 16 + MAX_MESSAGE_BYTES + 144)
+            .contains(&length)
+            || self.end - position < 4 + length as u64
+        {
+            return Err(invalid_data("invalid record in history snapshot"));
+        }
+        let mut record = vec![0; length];
+        self.file.read_exact(&mut record)?;
+        let (nonce, encrypted) = record.split_at(NONCE_BYTES);
+        let cipher = ChaCha20Poly1305::new_from_slice(self.key.as_ref())
+            .map_err(|_| invalid_data("invalid history key"))?;
+        let plain = Zeroizing::new(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(nonce),
+                    Payload {
+                        msg: encrypted,
+                        aad: &associated_data(
+                            &self.identity_id,
+                            &self.peer_id,
+                            self.index,
+                            self.legacy,
+                        ),
+                    },
+                )
+                .map_err(|_| invalid_data("history authentication failed"))?,
+        );
+        let message = decode_history_plain(&plain, self.legacy)?;
+        self.index = self
+            .index
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("history record index overflow"))?;
+        Ok(Some(message))
+    }
+}
+
 impl History {
+    pub(crate) fn reader_for_identity_copy(
+        identity: &Identity,
+        peer_id: &str,
+    ) -> io::Result<HistoryReader> {
+        validate_peer_id(peer_id)?;
+        let identity_id = identity.public_id();
+        let peer_id = peer_id.to_ascii_lowercase();
+        let key = identity.storage_key();
+        let path = data_directory()?.join(&identity_id).join(format!(
+            "{}.adlog",
+            opaque_conversation_name(&derive_index_key(&key), &peer_id)
+        ));
+        let mut file = File::open(path)?;
+        let end = file.metadata()?.len();
+        if end < MAGIC.len() as u64 {
+            return Err(invalid_data("history snapshot header is incomplete"));
+        }
+        let mut magic = [0; 8];
+        file.read_exact(&mut magic)?;
+        let legacy = &magic == LEGACY_MAGIC;
+        if &magic != MAGIC && !legacy {
+            return Err(invalid_data("unsupported history format"));
+        }
+        Ok(HistoryReader {
+            file,
+            key,
+            identity_id,
+            peer_id,
+            index: 0,
+            end,
+            legacy,
+        })
+    }
+
+    pub(crate) fn estimate_transfer(
+        identity: &Identity,
+        peer_id: &str,
+        request_id: &str,
+    ) -> io::Result<(HistoryReader, usize, u64)> {
+        let mut reader = Self::reader_for_identity_copy(identity, peer_id)?;
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        while let Some(message) = reader.next_record()? {
+            let frame = encode_transfer_chunk(&message, request_id, 0)?;
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("history record count overflow"))?;
+            bytes = bytes.saturating_add(frame.len() as u64);
+        }
+        reader.rewind()?;
+        Ok((reader, count, bytes))
+    }
+
     /// Read the existing encrypted index without opening or creating histories.
     pub(crate) fn known_peer_ids(identity: &Identity) -> io::Result<Vec<String>> {
         let identity_id = identity.public_id();
@@ -2141,6 +2479,139 @@ fn read_records(
     Ok((messages, index, recovered_partial))
 }
 
+fn decode_history_plain(plain: &[u8], legacy_format: bool) -> io::Result<StoredMessage> {
+    if plain.len() < 13 {
+        return Err(invalid_data("invalid history payload"));
+    }
+    let unix_time = u64::from_be_bytes(plain[..8].try_into().expect("fixed slice"));
+    let sender = match plain[8] {
+        0 => MessageSender::Me,
+        1 => MessageSender::Other,
+        _ => return Err(invalid_data("invalid history sender")),
+    };
+    let text_len = u32::from_be_bytes(plain[9..13].try_into().expect("fixed slice")) as usize;
+    if text_len == 0 || text_len > MAX_MESSAGE_BYTES || plain.len() < 13 + text_len {
+        return Err(invalid_data("invalid history text length"));
+    }
+    let text = std::str::from_utf8(&plain[13..13 + text_len])
+        .map_err(|_| invalid_data("history text is not UTF-8"))?
+        .to_owned();
+    let proof = if legacy_format {
+        if plain.len() != 13 + text_len {
+            return Err(invalid_data("invalid legacy history record"));
+        }
+        None
+    } else {
+        let proof_pos = 13 + text_len;
+        match plain.get(proof_pos).copied() {
+            Some(0) if plain.len() == proof_pos + 1 => None,
+            Some(1) if plain.len() == proof_pos + 1 + 144 => {
+                let mut cursor = proof_pos + 1;
+                let id = plain[cursor..cursor + 16].try_into().expect("fixed slice");
+                cursor += 16;
+                let signer = plain[cursor..cursor + 32].try_into().expect("fixed slice");
+                cursor += 32;
+                let recipient = plain[cursor..cursor + 32].try_into().expect("fixed slice");
+                cursor += 32;
+                let signature = plain[cursor..cursor + 64].try_into().expect("fixed slice");
+                Some(MessageProof {
+                    id,
+                    signer,
+                    recipient,
+                    signature,
+                })
+            }
+            _ => return Err(invalid_data("invalid history proof")),
+        }
+    };
+    Ok(StoredMessage {
+        unix_time,
+        sender,
+        text,
+        proof,
+    })
+}
+
+fn encode_history_plain(message: &StoredMessage) -> io::Result<Zeroizing<Vec<u8>>> {
+    let text = message.text.as_bytes();
+    if text.is_empty() || text.len() > MAX_MESSAGE_BYTES {
+        return Err(invalid_data("invalid history message size"));
+    }
+    let mut plain = Zeroizing::new(Vec::with_capacity(14 + text.len() + 144));
+    plain.extend_from_slice(&message.unix_time.to_be_bytes());
+    plain.push(match message.sender {
+        MessageSender::Me => 0,
+        MessageSender::Other => 1,
+    });
+    plain.extend_from_slice(&(text.len() as u32).to_be_bytes());
+    plain.extend_from_slice(text);
+    match &message.proof {
+        Some(proof) => {
+            plain.push(1);
+            plain.extend_from_slice(&proof.id);
+            plain.extend_from_slice(&proof.signer);
+            plain.extend_from_slice(&proof.recipient);
+            plain.extend_from_slice(&proof.signature);
+        }
+        None => plain.push(0),
+    }
+    Ok(plain)
+}
+
+fn restore_staging_aad(identity_id: &str, peer_id: &str, request_id: &str, index: u64) -> Vec<u8> {
+    [
+        RESTORE_STAGING_MAGIC.as_slice(),
+        identity_id.as_bytes(),
+        peer_id.as_bytes(),
+        request_id.as_bytes(),
+        &index.to_be_bytes(),
+    ]
+    .concat()
+}
+
+fn lock_restore_directory(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock only operates on the live descriptor owned by `file`.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_stale_restore_staging(root: &std::path::Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let lock_path = entry.path().join("owner.lock");
+        let lock = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: flock only operates on the live descriptor owned by `lock`.
+            let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+        std::fs::remove_dir_all(entry.path())?;
+    }
+    Ok(())
+}
+
 fn associated_data(identity_id: &str, peer_id: &str, index: u64, legacy: bool) -> Vec<u8> {
     let mut aad = Vec::with_capacity(6 + 64 + 64 + 8);
     aad.extend_from_slice(if legacy { b"ADLOG1" } else { b"ADLOG2" });
@@ -2224,6 +2695,8 @@ mod tests {
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
     use std::collections::HashSet;
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2259,6 +2732,117 @@ mod tests {
             text: text.to_owned(),
             proof: None,
         }
+    }
+
+    #[test]
+    fn sequential_history_reader_holds_file_length_snapshot_without_repairing() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "39".repeat(32);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history.append(&message(1, "snapshot one")).unwrap();
+        let mut reader = History::reader_for_identity_copy(&identity, &peer).unwrap();
+        history.append(&message(2, "appended later")).unwrap();
+        assert_eq!(
+            reader.next_record().unwrap(),
+            Some(message(1, "snapshot one"))
+        );
+        assert_eq!(reader.next_record().unwrap(), None);
+    }
+
+    #[test]
+    fn restore_staging_encrypts_records_and_removes_only_its_owned_directory() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "3a".repeat(32);
+        let request = "3b".repeat(32);
+        let root = super::data_directory()
+            .unwrap()
+            .join(identity.public_id())
+            .join(".history-restore");
+        std::fs::create_dir_all(&root).unwrap();
+        let unrelated = root.join("unrelated.keep");
+        std::fs::write(&unrelated, b"preserve").unwrap();
+        let staged = message(9, "secret staged proposal");
+        {
+            let mut writer = super::RestoreStaging::create(&identity, &peer, &request).unwrap();
+            writer.append_verified(&staged).unwrap();
+            writer.finish().unwrap();
+            assert_eq!(writer.count(), 1);
+            let file = std::fs::read(writer.directory.join("records.enc")).unwrap();
+            assert!(!file
+                .windows(b"secret staged proposal".len())
+                .any(|window| window == b"secret staged proposal"));
+            assert_eq!(writer.next_record().unwrap(), Some(staged.clone()));
+            assert_eq!(writer.next_record().unwrap(), None);
+            let path = writer.directory.join("records.enc");
+            let mut tampered = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            let end = tampered.seek(SeekFrom::End(-1)).unwrap();
+            let mut byte = [0];
+            tampered.read_exact(&mut byte).unwrap();
+            tampered.seek(SeekFrom::Start(end)).unwrap();
+            byte[0] ^= 1;
+            tampered.write_all(&byte).unwrap();
+            writer.rewind().unwrap();
+            assert!(writer.next_record().is_err());
+        }
+        assert!(unrelated.exists());
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"preserve");
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn transfer_estimate_scans_over_legacy_count_and_byte_thresholds_sequentially() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer_count = "3c".repeat(32);
+        let (mut count_history, _, _) = History::open(&identity, &peer_count).unwrap();
+        for index in 0..100_001u64 {
+            let item = message(index, "x");
+            let record = super::encode_record(
+                &count_history.key,
+                &count_history.identity_id,
+                &count_history.peer_id,
+                index,
+                &item,
+            )
+            .unwrap();
+            count_history.file.write_all(&record).unwrap();
+        }
+        count_history.file.sync_all().unwrap();
+        let (mut reader, count, estimate) =
+            History::estimate_transfer(&identity, &peer_count, &"3d".repeat(32)).unwrap();
+        assert_eq!(count, 100_001);
+        assert!(estimate > count as u64);
+        let mut streamed = 0;
+        while reader.next_record().unwrap().is_some() {
+            streamed += 1;
+        }
+        assert_eq!(streamed, count);
+
+        let peer_bytes = "3e".repeat(32);
+        let (mut byte_history, _, _) = History::open(&identity, &peer_bytes).unwrap();
+        for index in 0..17_000u64 {
+            let item = message(index, &"y".repeat(4096));
+            let record = super::encode_record(
+                &byte_history.key,
+                &byte_history.identity_id,
+                &byte_history.peer_id,
+                index,
+                &item,
+            )
+            .unwrap();
+            byte_history.file.write_all(&record).unwrap();
+        }
+        byte_history.file.sync_all().unwrap();
+        let (_, byte_count, byte_estimate) =
+            History::estimate_transfer(&identity, &peer_bytes, &"3f".repeat(32)).unwrap();
+        assert_eq!(byte_count, 17_000);
+        assert!(byte_estimate > 64 * 1024 * 1024);
     }
 
     #[test]

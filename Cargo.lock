@@ -22,6 +22,7 @@ dependencies = [
  "ed25519-dalek",
  "hkdf",
  "hmac",
+ "libc",
  "nostr",
  "rustls",
  "serde_json",

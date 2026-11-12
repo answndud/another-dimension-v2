@@ -378,6 +378,7 @@ test('actual UI: restore progress, cancel, and unsigned legacy preview reach the
   h.evaluate(`updateChatView({
     phase: 'connected', messageEpoch: 0, messages: [], peerId: 'peer',
     historyRestoreStatus: '복원 제안을 거부했습니다. 로컬 기록은 변경되지 않았습니다.',
+    historyRestoreState: 'awaiting-merge-consent',
     historyRestoreOfferCount: 1, historyRestoreLegacyCount: 1,
     historyRestoreOffer: [{ time: 1, sender: '상대방', text: 'legacy item', signed: false }],
     historyRestoreInProgress: false, identityTransition: []
@@ -389,6 +390,7 @@ test('actual UI: restore progress, cancel, and unsigned legacy preview reach the
   h.evaluate(`updateChatView({
     phase: 'connected', messageEpoch: 0, messages: [], peerId: 'peer',
     historyRestoreStatus: '받는 중', historyRestoreOfferCount: 0,
+    historyRestoreState: 'receiving',
     historyRestoreOffer: [], historyRestoreInProgress: true,
     historyRestoreReceived: 4096, historyRestoreTotal: 4097, identityTransition: []
   })`);
@@ -403,4 +405,25 @@ test('actual UI: restore progress, cancel, and unsigned legacy preview reach the
   request.resolve(response('ok'));
   await cancel;
   assert.match(h.element('#message').textContent, /전송을 취소했습니다/);
+});
+
+test('actual UI: transfer consent and final merge consent are separate states', async () => {
+  const h = createHarness();
+  h.evaluate(`updateChatView({
+    phase: 'connected', messageEpoch: 0, messages: [], peerId: 'peer', identityTransition: [],
+    historyRestoreState: 'awaiting-transfer-consent', historyRestoreInProgress: false,
+    historyRestoreTotal: 120000, historyRestoreEstimateBytes: 80000000,
+    historyRestoreOfferCount: 0, historyRestoreOffer: [],
+    historyRestoreStatus: 'estimate only'
+  })`);
+  assert.equal(h.element('#history-restore-accept').textContent, '전송 동의');
+  assert.equal(h.element('#history-restore-accept').disabled, true);
+  h.evaluate(`updateChatView({
+    phase: 'connected', messageEpoch: 0, messages: [], peerId: 'peer', identityTransition: [],
+    historyRestoreState: 'awaiting-merge-consent', historyRestoreInProgress: false,
+    historyRestoreTotal: 120000, historyRestoreOfferCount: 120000,
+    historyRestoreOffer: [], historyRestoreStatus: 'preview'
+  })`);
+  assert.equal(h.element('#history-restore-accept').textContent, '제안된 기록 병합');
+  assert.equal(h.element('#history-restore-accept').disabled, false);
 });

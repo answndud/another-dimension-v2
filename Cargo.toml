@@ -10,6 +10,7 @@ chacha20poly1305 = { version = "=0.10.1", features = ["std"] }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "zeroize"] }
 hkdf = "=0.12.4"
 hmac = "=0.12.1"
+libc = "=0.2.191"
 nostr = { version = "=0.45.7", default-features = false, features = ["std", "os-rng"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 serde_json = "=1.0.154"
