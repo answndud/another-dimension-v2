@@ -183,6 +183,17 @@
           <button id="identity-transition-dismiss" type="button">별도 대화로 유지</button>
         </div>
       </div>
+      <div id="history-restore-panel" class="panel" hidden>
+        <h3>상대 기록 복원</h3>
+        <p id="history-restore-status" class="meta"></p>
+        <p class="meta">서명은 해당 키가 기록에 서명했다는 것만 확인합니다. 실제 인물이나 기록의 완전성은 증명하지 않습니다. 서명 없는 기존 기록은 검증되지 않습니다. 삭제 표식이 없어 의도적 삭제와 단순 누락을 구분할 수 없습니다.</p>
+        <div id="history-restore-preview" class="conversation"></div>
+        <div class="actions">
+          <button id="history-restore-accept" type="button" class="primary">제안된 기록 복원</button>
+          <button id="history-restore-decline" type="button">복원 거부</button>
+        </div>
+      </div>
+      <div class="actions"><button id="history-restore-request" type="button">상대 기록 확인</button></div>
       <div id="conversation" class="conversation" aria-live="polite"></div>
       <form id="send-form" hidden>
         <label for="chat-text">메시지</label>

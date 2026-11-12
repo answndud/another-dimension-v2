@@ -17,7 +17,7 @@ const PROLOGUE: &[u8] = b"another-dimension-v2/noise-handshake/v2";
 const SIGN_DOMAIN: &[u8] = b"another-dimension-v2/identity-proof/v2";
 const CONFIRM_DOMAIN: &[u8] = b"another-dimension-v2/user-confirmation/v2";
 const MAX_HANDSHAKE_MESSAGE: usize = 128;
-const MAX_FRAME: usize = 4096;
+const MAX_FRAME: usize = 8192;
 const FRAME_TAG: usize = 16;
 const ENVELOPE_HEADER: usize = 4 + 16 + 8;
 const MAX_REORDER: u64 = 32;
@@ -755,7 +755,7 @@ mod tests {
     fn messages_are_bounded_and_tampering_is_rejected() {
         let (a, b) = exchange();
         let (mut a, mut b) = confirm_pair(a, b);
-        assert!(a.write_message(&vec![0; 4096]).is_err());
+        assert!(a.write_message(&vec![0; 8192]).is_err());
         let mut frame = a.write_message(b"test").unwrap();
         frame[0] ^= 1;
         assert!(b.read_message(&frame).is_err());

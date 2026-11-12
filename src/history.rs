@@ -4,23 +4,28 @@ use crate::identity::Identity;
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use ed25519_dalek::{Signature, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, rename, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use zeroize::Zeroizing;
 
-const MAGIC: &[u8; 8] = b"ADLOG1\0\0";
+const MAGIC: &[u8; 8] = b"ADLOG2\0\0";
+const LEGACY_MAGIC: &[u8; 8] = b"ADLOG1\0\0";
 const MAX_MESSAGE_BYTES: usize = 4096;
 const NONCE_BYTES: usize = 12;
 const INDEX_MAGIC: &[u8; 8] = b"ADIDX1\0\0";
 const BACKUP_MAGIC: &[u8; 8] = b"ADBACK1\0";
 const BACKUP_PASSWORD_MAGIC: &[u8; 8] = b"ADBACK2\0";
 const BACKUP_COMBINED_MAGIC: &[u8; 8] = b"ADBACK3\0";
+const BACKUP_SIGNED_MAGIC: &[u8; 8] = b"ADBACK4\0";
+const TRANSFER_MAGIC: &[u8; 6] = b"ADREC1";
+const MESSAGE_MAGIC: &[u8; 6] = b"ADMSG1";
 const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
 const BACKUP_SALT_BYTES: usize = 16;
 pub(crate) const IDENTITY_EVENT_PREFIX: &str = "[AD2-IDENTITY-EVENT/1] ";
@@ -48,6 +53,15 @@ pub struct StoredMessage {
     pub unix_time: u64,
     pub sender: MessageSender,
     pub text: String,
+    pub proof: Option<MessageProof>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MessageProof {
+    pub id: [u8; 16],
+    pub signer: [u8; 32],
+    pub recipient: [u8; 32],
+    pub signature: [u8; 64],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -131,6 +145,13 @@ impl History {
             file.sync_data()?;
         }
         file.seek(SeekFrom::Start(0))?;
+        let mut file_magic = [0; MAGIC.len()];
+        file.read_exact(&mut file_magic)?;
+        let migrate_legacy = &file_magic == LEGACY_MAGIC;
+        if &file_magic != MAGIC && !migrate_legacy {
+            return Err(invalid_data("unsupported history format"));
+        }
+        file.seek(SeekFrom::Start(0))?;
         let (messages, next_index, recovered_partial) = read_records(
             &mut file,
             Zeroizing::new(*key),
@@ -140,19 +161,18 @@ impl History {
         )?;
         file.seek(SeekFrom::End(0))?;
         register_conversation(identity, &identity_id, &peer_id, &directory)?;
-
-        Ok((
-            Self {
-                file,
-                path,
-                key,
-                identity_id,
-                peer_id,
-                next_index,
-            },
-            messages,
-            recovered_header || recovered_partial,
-        ))
+        let mut history = Self {
+            file,
+            path,
+            key,
+            identity_id,
+            peer_id,
+            next_index,
+        };
+        if migrate_legacy {
+            history.replace(&messages)?;
+        }
+        Ok((history, messages, recovered_header || recovered_partial))
     }
 
     pub fn append(&mut self, message: &StoredMessage) -> io::Result<()> {
@@ -435,7 +455,7 @@ impl History {
         let (peer_id, imported) = decode_backup(identity, backup, password)?;
 
         let (mut history, existing, _) = Self::open(identity, &peer_id)?;
-        let merged = merge_snapshot(existing, imported);
+        let merged = merge_snapshot(existing, imported)?;
         let count = merged.len();
         history.replace(&merged)?;
         Ok((peer_id, count))
@@ -457,12 +477,7 @@ fn encode_backup(
     } else {
         0
     };
-    let header_len = if password.is_some() {
-        BACKUP_COMBINED_MAGIC.len()
-    } else {
-        BACKUP_MAGIC.len()
-    } + salt_len
-        + NONCE_BYTES;
+    let header_len = BACKUP_SIGNED_MAGIC.len() + salt_len + NONCE_BYTES;
     let peer = decode_peer_id(peer_id)?;
     payload.extend_from_slice(&peer);
     let count = u32::try_from(messages.len())
@@ -477,6 +492,16 @@ fn encode_backup(
         });
         payload.extend_from_slice(&(text.len() as u32).to_be_bytes());
         payload.extend_from_slice(text);
+        match &message.proof {
+            Some(proof) => {
+                payload.push(1);
+                payload.extend_from_slice(&proof.id);
+                payload.extend_from_slice(&proof.signer);
+                payload.extend_from_slice(&proof.recipient);
+                payload.extend_from_slice(&proof.signature);
+            }
+            None => payload.push(0),
+        }
         if payload.len().saturating_add(header_len + 16) > MAX_BACKUP_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -491,11 +516,14 @@ fn encode_backup(
         Some(password) => {
             let password_key = derive_password_backup_key(password, &salt)?;
             (
-                BACKUP_COMBINED_MAGIC,
+                BACKUP_SIGNED_MAGIC,
                 derive_combined_backup_key(&identity.storage_key(), &password_key),
             )
         }
-        None => (BACKUP_MAGIC, derive_backup_key(&identity.storage_key())),
+        None => (
+            BACKUP_SIGNED_MAGIC,
+            derive_backup_key(&identity.storage_key()),
+        ),
     };
     let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
         .map_err(|_| io::Error::other("backup key unavailable"))?;
@@ -527,6 +555,7 @@ fn decode_backup(
         return Err(invalid_data("invalid backup file"));
     }
     let magic = &backup[..BACKUP_MAGIC.len()];
+    let signed_version = magic == BACKUP_SIGNED_MAGIC;
     let (salt, nonce_start, key) = if magic == BACKUP_MAGIC {
         if password.is_some() {
             return Err(invalid_data("legacy backup does not use a password"));
@@ -535,6 +564,12 @@ fn decode_backup(
         (
             None,
             nonce_start,
+            derive_backup_key(&identity.storage_key()),
+        )
+    } else if magic == BACKUP_SIGNED_MAGIC && password.is_none() {
+        (
+            None,
+            BACKUP_SIGNED_MAGIC.len(),
             derive_backup_key(&identity.storage_key()),
         )
     } else if magic == BACKUP_PASSWORD_MAGIC {
@@ -555,7 +590,7 @@ fn decode_backup(
             nonce_start,
             derive_password_backup_key(password, &salt)?,
         )
-    } else if magic == BACKUP_COMBINED_MAGIC {
+    } else if magic == BACKUP_COMBINED_MAGIC || magic == BACKUP_SIGNED_MAGIC {
         let password = password.ok_or_else(|| invalid_data("backup password required"))?;
         validate_backup_password(password)?;
         let salt_start = BACKUP_MAGIC.len();
@@ -625,10 +660,56 @@ fn decode_backup(
             .map_err(|_| invalid_data("backup text is not UTF-8"))?
             .to_owned();
         cursor += text_len;
-        imported.push(StoredMessage {
+        let proof = if signed_version {
+            match payload.get(cursor).copied() {
+                Some(0) => {
+                    cursor += 1;
+                    None
+                }
+                Some(1) if payload.len().saturating_sub(cursor + 1) >= 144 => {
+                    cursor += 1;
+                    let id = payload[cursor..cursor + 16]
+                        .try_into()
+                        .expect("fixed slice");
+                    cursor += 16;
+                    let signer = payload[cursor..cursor + 32]
+                        .try_into()
+                        .expect("fixed slice");
+                    cursor += 32;
+                    let recipient = payload[cursor..cursor + 32]
+                        .try_into()
+                        .expect("fixed slice");
+                    cursor += 32;
+                    let signature = payload[cursor..cursor + 64]
+                        .try_into()
+                        .expect("fixed slice");
+                    cursor += 64;
+                    Some(MessageProof {
+                        id,
+                        signer,
+                        recipient,
+                        signature,
+                    })
+                }
+                _ => return Err(invalid_data("invalid backup message proof")),
+            }
+        } else {
+            None
+        };
+        let message = StoredMessage {
             unix_time,
             sender,
             text,
+            proof,
+        };
+        if message.proof.is_some() {
+            verify_stored_proof(identity, &peer_id, &message)?;
+        }
+        imported.push(StoredMessage {
+            unix_time: message.unix_time,
+            sender: message.sender,
+            text: message.text,
+            proof: message.proof,
         });
     }
     if cursor != payload.len() {
@@ -643,22 +724,8 @@ fn decode_backup(
 fn merge_snapshot(
     existing: Vec<StoredMessage>,
     imported: Vec<StoredMessage>,
-) -> Vec<StoredMessage> {
-    let mut existing_counts = HashMap::<StoredMessage, usize>::new();
-    let mut imported_counts = HashMap::<StoredMessage, usize>::new();
-    let mut merged = existing;
-    for message in &merged {
-        *existing_counts.entry(message.clone()).or_default() += 1;
-    }
-    for message in imported {
-        let count = imported_counts.entry(message.clone()).or_default();
-        *count += 1;
-        if *count > existing_counts.get(&message).copied().unwrap_or(0) {
-            merged.push(message);
-        }
-    }
-    merged.sort_by_key(|message| message.unix_time);
-    merged
+) -> io::Result<Vec<StoredMessage>> {
+    merge_restored(&existing, &imported)
 }
 
 fn validate_peer_id(peer_id: &str) -> io::Result<()> {
@@ -678,6 +745,282 @@ pub(crate) fn decode_peer_id(peer_id: &str) -> io::Result<[u8; 32]> {
         bytes[index] = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
     }
     Ok(bytes)
+}
+
+pub(crate) fn sign_message(
+    identity: &Identity,
+    peer_id: &str,
+    unix_time: u64,
+    text: String,
+) -> io::Result<StoredMessage> {
+    if text.is_empty() || text.len() > MAX_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid message size",
+        ));
+    }
+    let mut id = [0; 16];
+    File::open("/dev/urandom")?.read_exact(&mut id)?;
+    let mut proof = MessageProof {
+        id,
+        signer: identity.public_key(),
+        recipient: decode_peer_id(peer_id)?,
+        signature: [0; 64],
+    };
+    proof.signature = identity.sign(&message_signing_payload(unix_time, &text, &proof));
+    Ok(StoredMessage {
+        unix_time,
+        sender: MessageSender::Me,
+        text,
+        proof: Some(proof),
+    })
+}
+
+pub(crate) fn encode_transfer(message: &StoredMessage) -> io::Result<Vec<u8>> {
+    encode_wire_message(message, TRANSFER_MAGIC)
+}
+
+pub(crate) fn encode_signed_message(message: &StoredMessage) -> io::Result<Vec<u8>> {
+    if message.proof.is_none() || message.sender != MessageSender::Me {
+        return Err(invalid_data("outgoing message is not signed"));
+    }
+    encode_wire_message(message, MESSAGE_MAGIC)
+}
+
+fn encode_wire_message(message: &StoredMessage, magic: &[u8; 6]) -> io::Result<Vec<u8>> {
+    let text = message.text.as_bytes();
+    if text.is_empty() || text.len() > MAX_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid message size",
+        ));
+    }
+    let mut frame = Vec::with_capacity(6 + 1 + 8 + 4 + text.len() + 1 + 144);
+    frame.extend_from_slice(magic);
+    frame.push(match message.sender {
+        MessageSender::Me => 0,
+        MessageSender::Other => 1,
+    });
+    frame.extend_from_slice(&message.unix_time.to_be_bytes());
+    frame.extend_from_slice(&(text.len() as u32).to_be_bytes());
+    frame.extend_from_slice(text);
+    match &message.proof {
+        Some(proof) => {
+            frame.push(1);
+            frame.extend_from_slice(&proof.id);
+            frame.extend_from_slice(&proof.signer);
+            frame.extend_from_slice(&proof.recipient);
+            frame.extend_from_slice(&proof.signature);
+        }
+        None => frame.push(0),
+    }
+    Ok(frame)
+}
+
+pub(crate) fn decode_transfer(
+    identity: &Identity,
+    peer_id: &str,
+    peer_key: &[u8; 32],
+    frame: &[u8],
+) -> io::Result<StoredMessage> {
+    decode_wire_message(identity, peer_id, peer_key, frame, TRANSFER_MAGIC)
+}
+
+pub(crate) fn decode_signed_message(
+    identity: &Identity,
+    peer_id: &str,
+    peer_key: &[u8; 32],
+    frame: &[u8],
+) -> io::Result<StoredMessage> {
+    decode_wire_message(identity, peer_id, peer_key, frame, MESSAGE_MAGIC)
+}
+
+fn decode_wire_message(
+    identity: &Identity,
+    peer_id: &str,
+    peer_key: &[u8; 32],
+    frame: &[u8],
+    magic: &[u8; 6],
+) -> io::Result<StoredMessage> {
+    if frame.len() < magic.len() + 14 || !frame.starts_with(magic) {
+        return Err(invalid_data("invalid history transfer frame"));
+    }
+    let mut cursor = TRANSFER_MAGIC.len();
+    let sender = match frame[cursor] {
+        0 => MessageSender::Other,
+        1 => MessageSender::Me,
+        _ => return Err(invalid_data("invalid transferred sender")),
+    };
+    cursor += 1;
+    let unix_time = u64::from_be_bytes(frame[cursor..cursor + 8].try_into().expect("fixed slice"));
+    cursor += 8;
+    let text_len =
+        u32::from_be_bytes(frame[cursor..cursor + 4].try_into().expect("fixed slice")) as usize;
+    cursor += 4;
+    if text_len == 0 || text_len > MAX_MESSAGE_BYTES || frame.len() < cursor + text_len + 1 {
+        return Err(invalid_data("invalid transferred message length"));
+    }
+    let text = std::str::from_utf8(&frame[cursor..cursor + text_len])
+        .map_err(|_| invalid_data("transferred message is not UTF-8"))?
+        .to_owned();
+    cursor += text_len;
+    let proof = match frame[cursor] {
+        0 if frame.len() == cursor + 1 => None,
+        1 if frame.len() == cursor + 1 + 144 => {
+            cursor += 1;
+            let id = frame[cursor..cursor + 16].try_into().expect("fixed slice");
+            cursor += 16;
+            let signer = frame[cursor..cursor + 32].try_into().expect("fixed slice");
+            cursor += 32;
+            let recipient = frame[cursor..cursor + 32].try_into().expect("fixed slice");
+            cursor += 32;
+            let signature = frame[cursor..cursor + 64].try_into().expect("fixed slice");
+            Some(MessageProof {
+                id,
+                signer,
+                recipient,
+                signature,
+            })
+        }
+        _ => return Err(invalid_data("invalid transferred message proof")),
+    };
+    if let Some(proof) = &proof {
+        let (expected_signer, expected_recipient) = match sender {
+            MessageSender::Other => (*peer_key, identity.public_key()),
+            MessageSender::Me => (identity.public_key(), decode_peer_id(peer_id)?),
+        };
+        if proof.signer != expected_signer || proof.recipient != expected_recipient {
+            return Err(invalid_data("transferred message has the wrong signer"));
+        }
+        let key = VerifyingKey::from_bytes(&proof.signer)
+            .map_err(|_| invalid_data("invalid transferred signing key"))?;
+        let signature = Signature::from_bytes(&proof.signature);
+        key.verify_strict(
+            &message_signing_payload(unix_time, &text, proof),
+            &signature,
+        )
+        .map_err(|_| invalid_data("transferred message signature failed"))?;
+    }
+    Ok(StoredMessage {
+        unix_time,
+        sender,
+        text,
+        proof,
+    })
+}
+
+pub(crate) fn is_transfer_frame(frame: &[u8]) -> bool {
+    frame.starts_with(TRANSFER_MAGIC)
+}
+
+pub(crate) fn is_signed_message_frame(frame: &[u8]) -> bool {
+    frame.starts_with(MESSAGE_MAGIC)
+}
+
+pub(crate) fn merge_restored(
+    existing: &[StoredMessage],
+    offered: &[StoredMessage],
+) -> io::Result<Vec<StoredMessage>> {
+    let mut by_id = HashMap::<[u8; 16], StoredMessage>::new();
+    for message in existing.iter().chain(offered) {
+        if let Some(proof) = &message.proof {
+            if let Some(previous) = by_id.insert(proof.id, message.clone()) {
+                if previous != *message {
+                    return Err(invalid_data("message ID collision"));
+                }
+            }
+        }
+    }
+    let mut merged = existing.to_vec();
+    let mut legacy_counts = HashMap::<(u64, MessageSender, String), usize>::new();
+    for message in existing.iter().filter(|message| message.proof.is_none()) {
+        *legacy_counts
+            .entry((message.unix_time, message.sender, message.text.clone()))
+            .or_default() += 1;
+    }
+    let mut offered_legacy_counts = HashMap::<(u64, MessageSender, String), usize>::new();
+    let mut seen_ids = HashSet::new();
+    for message in offered {
+        if let Some(proof) = &message.proof {
+            if !seen_ids.insert(proof.id) {
+                continue;
+            }
+            if existing
+                .iter()
+                .any(|old| old.proof.as_ref().is_some_and(|prior| prior.id == proof.id))
+            {
+                continue;
+            }
+            merged.push(message.clone());
+        } else {
+            let key = (message.unix_time, message.sender, message.text.clone());
+            let count = offered_legacy_counts.entry(key.clone()).or_default();
+            *count += 1;
+            if *count > legacy_counts.get(&key).copied().unwrap_or(0) {
+                merged.push(message.clone());
+            }
+        }
+    }
+    merged.sort_by_key(|message| message.unix_time);
+    Ok(merged)
+}
+
+pub(crate) fn missing_restored(
+    existing: &[StoredMessage],
+    offered: &[StoredMessage],
+) -> io::Result<Vec<StoredMessage>> {
+    let merged = merge_restored(existing, offered)?;
+    let mut counts = HashMap::<StoredMessage, usize>::new();
+    for message in existing {
+        *counts.entry(message.clone()).or_default() += 1;
+    }
+    let mut missing = Vec::new();
+    for message in merged {
+        let count = counts.entry(message.clone()).or_default();
+        if *count > 0 {
+            *count -= 1;
+        } else {
+            missing.push(message);
+        }
+    }
+    Ok(missing)
+}
+
+fn message_signing_payload(unix_time: u64, text: &str, proof: &MessageProof) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(43 + 16 + 32 + 32 + text.len());
+    payload.extend_from_slice(b"another-dimension-v2/chat-message/v1");
+    payload.extend_from_slice(&proof.id);
+    payload.extend_from_slice(&proof.signer);
+    payload.extend_from_slice(&proof.recipient);
+    payload.extend_from_slice(&unix_time.to_be_bytes());
+    payload.extend_from_slice(&(text.len() as u32).to_be_bytes());
+    payload.extend_from_slice(text.as_bytes());
+    payload
+}
+
+fn verify_stored_proof(
+    identity: &Identity,
+    peer_id: &str,
+    message: &StoredMessage,
+) -> io::Result<()> {
+    let proof = message
+        .proof
+        .as_ref()
+        .ok_or_else(|| invalid_data("message has no signature"))?;
+    let (signer, recipient) = match message.sender {
+        MessageSender::Me => (identity.public_key(), decode_peer_id(peer_id)?),
+        MessageSender::Other => (decode_peer_id(peer_id)?, identity.public_key()),
+    };
+    if proof.signer != signer || proof.recipient != recipient {
+        return Err(invalid_data("backup message has the wrong signer"));
+    }
+    let key = VerifyingKey::from_bytes(&proof.signer)
+        .map_err(|_| invalid_data("invalid backup message signer"))?;
+    key.verify_strict(
+        &message_signing_payload(message.unix_time, &message.text, proof),
+        &Signature::from_bytes(&proof.signature),
+    )
+    .map_err(|_| invalid_data("backup message signature failed"))
 }
 
 fn derive_backup_key(key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
@@ -757,7 +1100,7 @@ fn encode_record(
             "invalid message size",
         ));
     }
-    let mut plain = Zeroizing::new(Vec::with_capacity(13 + text.len()));
+    let mut plain = Zeroizing::new(Vec::with_capacity(14 + text.len() + 144));
     plain.extend_from_slice(&message.unix_time.to_be_bytes());
     plain.push(match message.sender {
         MessageSender::Me => 0,
@@ -765,6 +1108,16 @@ fn encode_record(
     });
     plain.extend_from_slice(&(text.len() as u32).to_be_bytes());
     plain.extend_from_slice(text);
+    match &message.proof {
+        Some(proof) => {
+            plain.push(1);
+            plain.extend_from_slice(&proof.id);
+            plain.extend_from_slice(&proof.signer);
+            plain.extend_from_slice(&proof.recipient);
+            plain.extend_from_slice(&proof.signature);
+        }
+        None => plain.push(0),
+    }
     let nonce_bytes = random_nonce()?;
     let cipher = ChaCha20Poly1305::new_from_slice(key)
         .map_err(|_| io::Error::other("history key unavailable"))?;
@@ -773,7 +1126,7 @@ fn encode_record(
             Nonce::from_slice(&nonce_bytes),
             Payload {
                 msg: &plain,
-                aad: &associated_data(identity_id, peer_id, index),
+                aad: &associated_data(identity_id, peer_id, index, false),
             },
         )
         .map_err(|_| io::Error::other("history encryption failed"))?;
@@ -919,7 +1272,8 @@ fn read_records(
 ) -> io::Result<(Vec<StoredMessage>, u64, bool)> {
     let mut magic = [0; MAGIC.len()];
     file.read_exact(&mut magic)?;
-    if &magic != MAGIC {
+    let legacy_format = &magic == LEGACY_MAGIC;
+    if &magic != MAGIC && !legacy_format {
         return Err(invalid_data("unsupported history format"));
     }
     let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
@@ -944,7 +1298,9 @@ fn read_records(
         let mut length = [0; 4];
         file.read_exact(&mut length)?;
         let length = u32::from_be_bytes(length) as usize;
-        if !(NONCE_BYTES + 16 + 13..=NONCE_BYTES + 16 + 13 + MAX_MESSAGE_BYTES).contains(&length) {
+        if !(NONCE_BYTES + 16 + 13..=NONCE_BYTES + 16 + 16 + MAX_MESSAGE_BYTES + 144)
+            .contains(&length)
+        {
             return Err(invalid_data("invalid history record length"));
         }
         if remaining < 4 + length as u64 {
@@ -963,7 +1319,7 @@ fn read_records(
                     Nonce::from_slice(nonce_bytes),
                     Payload {
                         msg: encrypted,
-                        aad: &associated_data(identity_id, peer_id, index),
+                        aad: &associated_data(identity_id, peer_id, index, legacy_format),
                     },
                 )
                 .map_err(|_| invalid_data("history authentication failed"))?,
@@ -978,16 +1334,45 @@ fn read_records(
             _ => return Err(invalid_data("invalid history sender")),
         };
         let text_len = u32::from_be_bytes(plain[9..13].try_into().expect("fixed slice")) as usize;
-        if text_len == 0 || text_len > MAX_MESSAGE_BYTES || plain.len() != 13 + text_len {
+        if text_len == 0 || text_len > MAX_MESSAGE_BYTES || plain.len() < 13 + text_len {
             return Err(invalid_data("invalid history text length"));
         }
-        let text = std::str::from_utf8(&plain[13..])
+        let text = std::str::from_utf8(&plain[13..13 + text_len])
             .map_err(|_| invalid_data("history text is not UTF-8"))?
             .to_owned();
+        let proof = if legacy_format {
+            if plain.len() != 13 + text_len {
+                return Err(invalid_data("invalid legacy history record"));
+            }
+            None
+        } else {
+            let proof_pos = 13 + text_len;
+            match plain.get(proof_pos).copied() {
+                Some(0) if plain.len() == proof_pos + 1 => None,
+                Some(1) if plain.len() == proof_pos + 1 + 144 => {
+                    let mut cursor = proof_pos + 1;
+                    let id = plain[cursor..cursor + 16].try_into().expect("fixed slice");
+                    cursor += 16;
+                    let signer = plain[cursor..cursor + 32].try_into().expect("fixed slice");
+                    cursor += 32;
+                    let recipient = plain[cursor..cursor + 32].try_into().expect("fixed slice");
+                    cursor += 32;
+                    let signature = plain[cursor..cursor + 64].try_into().expect("fixed slice");
+                    Some(MessageProof {
+                        id,
+                        signer,
+                        recipient,
+                        signature,
+                    })
+                }
+                _ => return Err(invalid_data("invalid history proof")),
+            }
+        };
         messages.push(StoredMessage {
             unix_time,
             sender,
             text,
+            proof,
         });
         index = index
             .checked_add(1)
@@ -996,9 +1381,9 @@ fn read_records(
     Ok((messages, index, recovered_partial))
 }
 
-fn associated_data(identity_id: &str, peer_id: &str, index: u64) -> Vec<u8> {
+fn associated_data(identity_id: &str, peer_id: &str, index: u64, legacy: bool) -> Vec<u8> {
     let mut aad = Vec::with_capacity(6 + 64 + 64 + 8);
-    aad.extend_from_slice(b"ADLOG1");
+    aad.extend_from_slice(if legacy { b"ADLOG1" } else { b"ADLOG2" });
     aad.extend_from_slice(identity_id.as_bytes());
     aad.extend_from_slice(peer_id.as_bytes());
     aad.extend_from_slice(&index.to_be_bytes());
@@ -1111,7 +1496,57 @@ mod tests {
             unix_time: time,
             sender: MessageSender::Me,
             text: text.to_owned(),
+            proof: None,
         }
+    }
+
+    #[test]
+    fn restores_only_verified_missing_messages_and_rejects_tampering_and_id_collisions() {
+        let _data = IsolatedData::new();
+        let (alice, _) = Identity::create().unwrap();
+        let (bob, _) = Identity::create().unwrap();
+        let peer_id = super::hex_encode(&bob.public_key());
+        let local_peer_id = super::hex_encode(&alice.public_key());
+        let signed = super::sign_message(&alice, &peer_id, 123, "signed record".into()).unwrap();
+        let frame = super::encode_transfer(&signed).unwrap();
+        let received =
+            super::decode_transfer(&bob, &local_peer_id, &alice.public_key(), &frame).unwrap();
+        assert_eq!(received.sender, MessageSender::Other);
+        assert_eq!(
+            super::missing_restored(&[], &[received.clone()]).unwrap(),
+            vec![received.clone()]
+        );
+        assert!(
+            super::missing_restored(&[received.clone()], &[received.clone()])
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut changed_text = frame.clone();
+        let text_at = 6 + 1 + 8 + 4;
+        changed_text[text_at] ^= 1;
+        assert!(
+            super::decode_transfer(&bob, &local_peer_id, &alice.public_key(), &changed_text)
+                .is_err()
+        );
+        assert!(super::decode_transfer(&bob, &local_peer_id, &[9; 32], &frame).is_err());
+
+        let mut collision = received.clone();
+        collision.text = "different contents".into();
+        assert!(super::merge_restored(&[received], &[collision]).is_err());
+    }
+
+    #[test]
+    fn legacy_messages_remain_unsigned_and_are_not_claimed_as_verified() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "41".repeat(32);
+        let legacy = message(10, "legacy record");
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history.append(&legacy).unwrap();
+        let (_, messages, _) = History::open(&identity, &peer).unwrap();
+        assert_eq!(messages, vec![legacy]);
+        assert!(messages[0].proof.is_none());
     }
 
     #[test]
@@ -1157,6 +1592,7 @@ mod tests {
             unix_time: 123,
             sender: MessageSender::Other,
             text: "same message".to_owned(),
+            proof: None,
         };
         old_history.append(&repeated).unwrap();
         old_history.append(&repeated).unwrap();
@@ -1223,6 +1659,7 @@ mod tests {
             unix_time: 10,
             sender: MessageSender::Other,
             text: "repeated before transition".to_owned(),
+            proof: None,
         };
         let current = message(20, "new identity session");
         let (mut old_history, _, _) = History::open(&identity, &previous_peer).unwrap();
@@ -1237,6 +1674,7 @@ mod tests {
                 "{}peer:{previous_peer}:{current_peer}",
                 super::IDENTITY_EVENT_PREFIX
             ),
+            proof: None,
         };
 
         let merged = new_history
@@ -1377,6 +1815,7 @@ mod tests {
                 unix_time: 456,
                 sender: MessageSender::Me,
                 text: "keep original".to_owned(),
+                proof: None,
             })
             .unwrap();
         let source_path = history.path.clone();
@@ -1447,9 +1886,9 @@ mod tests {
             .replace(&[repeated.clone(), repeated.clone()])
             .unwrap();
 
-        // The original ADBACK1 envelope is unchanged and can be imported twice.
+        // New exports use ADBACK4 and remain idempotent on repeated imports.
         let backup = History::export_backup(&identity, &peer, None).unwrap();
-        assert_eq!(&backup[..8], b"ADBACK1\0");
+        assert_eq!(&backup[..8], b"ADBACK4\0");
         assert_eq!(
             History::import_backup(&identity, &backup, None).unwrap().1,
             2
@@ -1463,7 +1902,7 @@ mod tests {
 
         let password_backup =
             History::export_backup(&identity, &peer, Some("correct horse battery")).unwrap();
-        assert_eq!(&password_backup[..8], b"ADBACK3\0");
+        assert_eq!(&password_backup[..8], b"ADBACK4\0");
         let other_identity = Identity::create().unwrap().0;
         assert!(History::import_backup(
             &other_identity,
@@ -1564,16 +2003,17 @@ mod tests {
     }
 
     fn messages_with_payload_len(payload_len: usize) -> Vec<StoredMessage> {
+        // ADBACK4 adds one proof-presence byte to each legacy record.
         let record_bytes = payload_len - 36;
-        let count = record_bytes.div_ceil(MAX_MESSAGE_BYTES + 13);
+        let count = record_bytes.div_ceil(MAX_MESSAGE_BYTES + 14);
         let mut remaining = record_bytes;
         let mut messages = Vec::with_capacity(count);
         for index in 0..count {
             let slots_left = count - index - 1;
-            let size = remaining.saturating_sub(slots_left * (MAX_MESSAGE_BYTES + 13));
-            let text_len = (size - 13).clamp(1, MAX_MESSAGE_BYTES);
+            let size = remaining.saturating_sub(slots_left * (MAX_MESSAGE_BYTES + 14));
+            let text_len = (size - 14).clamp(1, MAX_MESSAGE_BYTES);
             messages.push(message(index as u64, &"x".repeat(text_len)));
-            remaining -= text_len + 13;
+            remaining -= text_len + 14;
         }
         assert_eq!(remaining, 0);
         messages

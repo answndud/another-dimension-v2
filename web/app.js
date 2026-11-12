@@ -310,6 +310,40 @@ function updateChatView(snapshot) {
     document.querySelector('#identity-transition-accept').disabled = eligibleHistories.length === 0;
     document.querySelector('#identity-transition-dismiss').dataset.transitionKey = transitionKey;
   }
+  const restoreOffer = snapshot.historyRestoreOffer || [];
+  const restorePanel = document.querySelector('#history-restore-panel');
+  const restoreStatus = document.querySelector('#history-restore-status');
+  const restorePreview = document.querySelector('#history-restore-preview');
+  const restoreKey = `${snapshot.historyRestoreStatus || ''}:${snapshot.historyRestoreOfferCount || 0}:${snapshot.historyRestoreLegacyCount || 0}:${restoreOffer.map(item => `${item.time}:${item.sender}:${item.text}`).join('|')}`;
+  restorePanel.hidden = snapshot.phase !== 'connected'
+    || (!snapshot.historyRestoreInProgress && !restoreOffer.length && !snapshot.historyRestoreStatus);
+  restoreStatus.textContent = snapshot.historyRestoreInProgress
+    ? '상대 기록을 확인하고 있습니다. 동의 전에는 로컬 기록을 변경하지 않습니다.'
+    : snapshot.historyRestoreStatus || '';
+  document.querySelector('#history-restore-request').disabled = snapshot.phase !== 'connected'
+    || snapshot.historyRestoreInProgress || (snapshot.historyRestoreOfferCount || 0) > 0;
+  document.querySelector('#history-restore-accept').disabled = (snapshot.historyRestoreOfferCount || 0) === 0;
+  document.querySelector('#history-restore-decline').disabled = (snapshot.historyRestoreOfferCount || 0) === 0;
+  if (restorePreview.dataset.offerKey !== restoreKey) {
+    restorePreview.replaceChildren();
+    for (const item of restoreOffer) {
+      const row = document.createElement('article');
+      row.className = 'entry';
+      const header = document.createElement('small');
+      header.textContent = `${formatTime(item.time)} · ${item.sender} · ${item.signed ? '서명 확인됨' : '기존 서명 없음'}`;
+      const text = document.createElement('div');
+      text.textContent = item.text;
+      row.append(header, text);
+      restorePreview.append(row);
+    }
+    if ((snapshot.historyRestoreOfferCount || 0) > restoreOffer.length) {
+      const more = document.createElement('p');
+      more.className = 'meta';
+      more.textContent = `미리 보기는 ${restoreOffer.length}개입니다. 동의하면 총 ${snapshot.historyRestoreOfferCount}개를 모두 가져옵니다.`;
+      restorePreview.append(more);
+    }
+    restorePreview.dataset.offerKey = restoreKey;
+  }
   verification.hidden = snapshot.phase !== 'verification';
   sendForm.hidden = snapshot.phase !== 'connected' && !chatText.value;
   sendForm.querySelector('button').disabled = snapshot.phase !== 'connected' || sendingMessage;
@@ -664,6 +698,34 @@ document.querySelector('#identity-transition-accept').addEventListener('click', 
     button.disabled = false;
   }
 });
+
+document.querySelector('#history-restore-request').addEventListener('click', async () => {
+  if (!operationId) return;
+  try {
+    const response = await request('/api/chat/request-history-restore', operationId);
+    if (!response.ok) throw new Error((await response.text()) || 'request failed');
+  } catch (error) {
+    message.textContent = error instanceof Error && error.message !== 'request failed'
+      ? error.message
+      : '상대 기록을 요청하지 못했습니다.';
+  }
+});
+
+async function resolveHistoryRestore(accept) {
+  if (!operationId) return;
+  try {
+    const response = await request('/api/chat/resolve-history-restore', JSON.stringify({ operationId, accept }));
+    if (!response.ok) throw new Error((await response.text()) || 'restore failed');
+    message.textContent = accept ? '복원한 기록을 현재 대화에 추가했습니다.' : '복원을 거부했습니다. 로컬 기록은 변경되지 않았습니다.';
+  } catch (error) {
+    message.textContent = error instanceof Error && error.message !== 'restore failed'
+      ? error.message
+      : '기록 복원을 처리하지 못했습니다. 로컬 기록은 변경되지 않았습니다.';
+  }
+}
+
+document.querySelector('#history-restore-accept').addEventListener('click', () => resolveHistoryRestore(true));
+document.querySelector('#history-restore-decline').addEventListener('click', () => resolveHistoryRestore(false));
 
 sendForm.addEventListener('submit', async (event) => {
   event.preventDefault();
