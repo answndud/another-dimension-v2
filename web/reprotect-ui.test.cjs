@@ -487,18 +487,38 @@ test('actual UI: restore jobs reopen only for the identity that created them', a
     savedMode: 'general', socks: null, activeMode: 'general', activeSocks: null,
     restartRequired: false, notifications: false,
   });
-  await t.test('different identity does not request the old operation', async () => {
+  await t.test('A to B to A keeps A reference private and reopens it for A', async () => {
     const h = createHarness();
     h.evaluate(`sessionStorage.setItem('local-history-restore-job', ${JSON.stringify(restoreJob)})`);
-    const refresh = h.evaluate('refreshIdentity()');
-    await new Promise((resolve) => setImmediate(resolve));
-    h.requestFor('/api/identity/status').resolve(response('identity-B'));
-    await new Promise((resolve) => setImmediate(resolve));
-    h.requestFor('/api/settings/get').resolve(response(settings));
-    await new Promise((resolve) => setImmediate(resolve));
-    h.requestFor('/api/history/list').resolve(response('[]'));
-    await refresh;
+    const refreshAs = async (identity, statusBody = null) => {
+      const refresh = h.evaluate('refreshIdentity()');
+      await new Promise((resolve) => setImmediate(resolve));
+      h.requests.filter((item) => item.path === '/api/identity/status').at(-1).resolve(response(identity));
+      await new Promise((resolve) => setImmediate(resolve));
+      h.requests.filter((item) => item.path === '/api/settings/get').at(-1).resolve(response(settings));
+      await new Promise((resolve) => setImmediate(resolve));
+      h.requests.filter((item) => item.path === '/api/history/list').at(-1).resolve(response('[]'));
+      if (statusBody) {
+        await new Promise((resolve) => setImmediate(resolve));
+        h.requests.filter((item) => item.path === '/api/chat/status').at(-1).resolve(response(statusBody));
+      }
+      await refresh;
+    };
+    await refreshAs('identity-B');
     assert.equal(h.requests.some((item) => item.path === '/api/chat/status'), false);
+    assert.deepEqual(JSON.parse(h.evaluate("sessionStorage.getItem('local-history-restore-job')")), {
+      jobs: { 'identity-A': 'private-operation' },
+    });
+    const completed = JSON.stringify({
+      phase: 'closed', messageEpoch: 0, messages: [], messageCount: 0,
+      historyRestoreState: 'completed', historyRestoreInProgress: false,
+      historyRestoreStatus: 'merge done', historyRestoreOfferCount: 0,
+      historyRestoreLegacyCount: 0, historyRestoreReceived: 0,
+      historyRestoreTotal: 0, historyRestoreOffer: [], identityTransition: [],
+    });
+    await refreshAs('identity-A', completed);
+    assert.equal(h.requests.filter((item) => item.path === '/api/chat/status').at(-1).init.body, 'private-operation');
+    assert.equal(h.element('#history-restore-status').textContent, 'merge done');
     assert.equal(h.evaluate("sessionStorage.getItem('local-history-restore-job')"), null);
   });
 
@@ -524,6 +544,36 @@ test('actual UI: restore jobs reopen only for the identity that created them', a
     })));
     await refresh;
     assert.equal(h.evaluate('operationId'), 'private-operation');
+  });
+
+  await t.test('temporary query failures keep the reference, missing jobs clear it, and unknown legacy owner is never opened', async () => {
+    const h = createHarness();
+    h.evaluate(`sessionStorage.setItem('local-history-restore-job', ${JSON.stringify(restoreJob)})`);
+    h.evaluate("identityId.textContent = 'identity-A'; operationId = 'private-operation'");
+    const temporaryPoll = h.evaluate('pollChat()');
+    h.requestFor('/api/chat/status').resolve(response('', 503));
+    await temporaryPoll;
+    assert.deepEqual(JSON.parse(h.evaluate("sessionStorage.getItem('local-history-restore-job')")), {
+      operationId: 'private-operation', identityId: 'identity-A',
+    });
+
+    const missingPoll = h.evaluate('pollChat()');
+    h.requestFor('/api/chat/status').resolve(response('', 404));
+    await missingPoll;
+    assert.equal(h.evaluate("sessionStorage.getItem('local-history-restore-job')"), null);
+    assert.match(h.element('#chat-status').textContent, /찾을 수 없습니다/);
+
+    const unknown = createHarness();
+    unknown.evaluate("sessionStorage.setItem('local-history-restore-job', JSON.stringify({operationId:'unsafe-operation'}))");
+    const refresh = unknown.evaluate('refreshIdentity()');
+    await new Promise((resolve) => setImmediate(resolve));
+    unknown.requestFor('/api/identity/status').resolve(response('identity-A'));
+    await new Promise((resolve) => setImmediate(resolve));
+    unknown.requestFor('/api/settings/get').resolve(response(settings));
+    await new Promise((resolve) => setImmediate(resolve));
+    unknown.requestFor('/api/history/list').resolve(response('[]'));
+    await refresh;
+    assert.equal(unknown.requests.some((item) => item.path === '/api/chat/status'), false);
   });
 });
 

@@ -102,25 +102,48 @@ async function refreshIdentity() {
   await refreshNetworkSettings();
   show('active');
   await refreshHistoryList();
-  const restoreJob = sessionStorage.getItem(restoreJobKey);
-  if (restoreJob) {
-    sessionStorage.removeItem(restoreJobKey);
-    try {
-      const savedJob = JSON.parse(restoreJob);
-      if (savedJob.identityId === currentIdentityId && typeof savedJob.operationId === 'string') {
-        if (sessionStorage.getItem(operationKey) !== savedJob.operationId) {
-          await attachChat(savedJob.operationId);
-        }
-      }
-    } catch (_) {}
+  const savedJob = getRestoreJob(currentIdentityId);
+  if (savedJob && typeof savedJob.operationId === 'string') {
+    if (sessionStorage.getItem(operationKey) !== savedJob.operationId) {
+      await attachChat(savedJob.operationId);
+    }
   }
   return true;
+}
+
+function readRestoreJobs() {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(restoreJobKey) || '{}');
+    if (value && value.jobs && typeof value.jobs === 'object') return value.jobs;
+    if (value && typeof value.operationId === 'string' && typeof value.identityId === 'string') {
+      const jobs = { [value.identityId]: value.operationId };
+      sessionStorage.setItem(restoreJobKey, JSON.stringify({ jobs }));
+      return jobs;
+    }
+  } catch (_) {}
+  return {};
+}
+
+function getRestoreJob(ownerIdentityId) {
+  const operationId = readRestoreJobs()[ownerIdentityId];
+  return typeof operationId === 'string' ? { operationId, identityId: ownerIdentityId } : null;
 }
 
 function rememberRestoreJob(operationId) {
   const ownerIdentityId = identityId.textContent.trim();
   if (!operationId || !ownerIdentityId) return;
-  sessionStorage.setItem(restoreJobKey, JSON.stringify({ operationId, identityId: ownerIdentityId }));
+  const jobs = readRestoreJobs();
+  jobs[ownerIdentityId] = operationId;
+  sessionStorage.setItem(restoreJobKey, JSON.stringify({ jobs }));
+}
+
+function forgetRestoreJob(ownerIdentityId, expectedOperationId = null) {
+  if (!ownerIdentityId) return;
+  const jobs = readRestoreJobs();
+  if (expectedOperationId && jobs[ownerIdentityId] !== expectedOperationId) return;
+  delete jobs[ownerIdentityId];
+  if (Object.keys(jobs).length) sessionStorage.setItem(restoreJobKey, JSON.stringify({ jobs }));
+  else sessionStorage.removeItem(restoreJobKey);
 }
 
 async function refreshNetworkSettings() {
@@ -377,7 +400,8 @@ function updateChatView(snapshot) {
   const restorePreview = document.querySelector('#history-restore-preview');
   const restoreKey = `${snapshot.historyRestoreStatus || ''}:${snapshot.historyRestoreOfferCount || 0}:${snapshot.historyRestoreLegacyCount || 0}:${restoreOffer.map(item => `${item.time}:${item.sender}:${item.text}`).join('|')}`;
   const merging = ['merge-queued', 'merging'].includes(restoreState);
-  restorePanel.hidden = (snapshot.phase !== 'connected' && !snapshot.historyRestoreCleanupError && !merging)
+  const restoreTerminal = ['completed', 'failed'].includes(restoreState);
+  restorePanel.hidden = (snapshot.phase !== 'connected' && !snapshot.historyRestoreCleanupError && !merging && !restoreTerminal)
     || (!snapshot.historyRestoreInProgress && !restoreOffer.length && !snapshot.historyRestoreStatus);
   restoreStatus.textContent = merging
     ? (snapshot.historyRestoreStatus || '최종 병합 중입니다. 대화 기록 저장은 잠금 때문에 잠시 대기할 수 있습니다. 연결 종료 후에도 계속됩니다.')
@@ -437,23 +461,35 @@ function updateChatView(snapshot) {
 
 async function pollChat() {
   if (!operationId) return;
+  const polledOperationId = operationId;
+  const polledIdentityId = identityId.textContent.trim();
+  let missingRestoreJob = false;
   try {
-    const response = await request('/api/chat/status', operationId);
-    if (!response.ok) throw new Error('status unavailable');
+    const response = await request('/api/chat/status', polledOperationId);
+    if (!response.ok) {
+      if (response.status === 404) {
+        forgetRestoreJob(polledIdentityId, polledOperationId);
+        chatStatus.textContent = '복원 작업을 찾을 수 없습니다. 프로그램이 재시작됐거나 작업이 만료됐을 수 있습니다.';
+        missingRestoreJob = true;
+      }
+      throw new Error('status unavailable');
+    }
+    if (operationId !== polledOperationId || identityId.textContent.trim() !== polledIdentityId) return;
     const snapshot = await response.json();
     updateChatView(snapshot);
     if (['merge-queued', 'merging'].includes(snapshot.historyRestoreState)) {
-      rememberRestoreJob(operationId);
+      rememberRestoreJob(polledOperationId);
     } else if (snapshot.historyRestoreState === 'completed' || snapshot.historyRestoreState === 'failed') {
-      sessionStorage.removeItem(restoreJobKey);
+      forgetRestoreJob(polledIdentityId, polledOperationId);
     }
     if (snapshot.messageCount > messageCursor) {
-      const messages = await request('/api/chat/messages', `${operationId}\n${messageCursor}`);
+      const messages = await request('/api/chat/messages', `${polledOperationId}\n${messageCursor}`);
       if (!messages.ok) throw new Error('messages unavailable');
+      if (operationId !== polledOperationId || identityId.textContent.trim() !== polledIdentityId) return;
       appendMessages(await messages.json());
     }
   } catch (_) {
-    chatStatus.textContent = '로컬 프로그램에서 연결 상태를 읽지 못했습니다.';
+    if (!missingRestoreJob) chatStatus.textContent = '로컬 프로그램에서 연결 상태를 읽지 못했습니다.';
   }
   if (operationId && (!['failed', 'disconnected', 'closed'].includes(lastPhase)
     || ['merge-queued', 'merging'].includes(latestChatSnapshot?.historyRestoreState))) {
@@ -672,6 +708,7 @@ document.querySelector('#logout').addEventListener('click', async () => {
     stopPolling();
     operationId = null;
     sessionStorage.removeItem(operationKey);
+    latestChatSnapshot = null;
     identityId.textContent = '';
     selectedHistoryPeer = '';
     selectedHistoryMessages = [];
@@ -855,6 +892,7 @@ document.querySelector('#close-chat').addEventListener('click', async () => {
   stopPolling();
   operationId = null;
   sessionStorage.removeItem(operationKey);
+  latestChatSnapshot = null;
   conversation.replaceChildren();
   show('active');
   refreshHistoryList().catch(() => {});
