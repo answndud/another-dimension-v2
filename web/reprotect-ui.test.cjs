@@ -20,6 +20,22 @@ function response(body = '', status = 200) {
   };
 }
 
+function deferredJsonResponse(status = 200) {
+  const json = deferred();
+  let jsonStartedResolve;
+  const jsonStarted = new Promise((resolve) => { jsonStartedResolve = resolve; });
+  return {
+    json,
+    jsonStarted,
+    response: {
+      ok: status >= 200 && status < 300,
+      status,
+      text: async () => '',
+      json: () => { jsonStartedResolve(); return json.promise; },
+    },
+  };
+}
+
 function file(name, contents) {
   return {
     name,
@@ -586,6 +602,111 @@ test('actual UI: send rejected during restore merge preserves input and explains
   await pending;
   assert.equal(h.element('#chat-text').value, 'keep this message');
   assert.equal(h.element('#chat-status').textContent, '기록 병합 중이라 메시지를 전송하지 않았습니다. 병합 완료 후 다시 보내세요.');
+});
+
+test('actual UI: stale polls cannot change another identity after response or JSON awaits', async (t) => {
+  const settings = JSON.stringify({
+    savedMode: 'general', socks: null, activeMode: 'general', activeSocks: null,
+    restartRequired: false, notifications: false,
+  });
+  const switchIdentity = async (h, identity) => {
+    const refresh = h.evaluate('refreshIdentity()');
+    await new Promise((resolve) => setImmediate(resolve));
+    h.requests.filter((item) => item.path === '/api/identity/status').at(-1).resolve(response(identity));
+    await new Promise((resolve) => setImmediate(resolve));
+    h.requests.filter((item) => item.path === '/api/settings/get').at(-1).resolve(response(settings));
+    await new Promise((resolve) => setImmediate(resolve));
+    h.requests.filter((item) => item.path === '/api/history/list').at(-1).resolve(response('[]'));
+    await refresh;
+  };
+  const seedA = (h) => h.evaluate(`identityId.textContent='identity-A'; operationId='operation-A'; sessionStorage.setItem('local-history-restore-job', JSON.stringify({jobs:{'identity-A':'operation-A'}}))`);
+
+  await t.test('A status request completing 404 after switch to B preserves A reference; B logout then A reconnect resumes', async () => {
+    const h = createHarness();
+    seedA(h);
+    const poll = h.evaluate('pollChat()');
+    const oldStatus = h.requestFor('/api/chat/status');
+    await switchIdentity(h, 'identity-B');
+    const bState = { chat: h.element('#chat-status').textContent, operation: h.evaluate('operationId') };
+    oldStatus.resolve(response('', 404));
+    await poll;
+    assert.deepEqual(JSON.parse(h.evaluate("sessionStorage.getItem('local-history-restore-job')")), {
+      jobs: { 'identity-A': 'operation-A' },
+    });
+    assert.equal(h.element('#chat-status').textContent, bState.chat);
+    assert.equal(h.evaluate('operationId'), bState.operation);
+
+    await h.click('#logout');
+    const reconnect = h.evaluate('refreshIdentity()');
+    await new Promise((resolve) => setImmediate(resolve));
+    h.requests.filter((item) => item.path === '/api/identity/status').at(-1).resolve(response('identity-A'));
+    await new Promise((resolve) => setImmediate(resolve));
+    h.requests.filter((item) => item.path === '/api/settings/get').at(-1).resolve(response(settings));
+    await new Promise((resolve) => setImmediate(resolve));
+    h.requests.filter((item) => item.path === '/api/history/list').at(-1).resolve(response('[]'));
+    await new Promise((resolve) => setImmediate(resolve));
+    const resumed = h.requests.filter((item) => item.path === '/api/chat/status').at(-1);
+    assert.equal(resumed.init.body, 'operation-A');
+    resumed.resolve(response(JSON.stringify({
+      phase: 'connected', messageEpoch: 0, messages: [], messageCount: 0,
+      historyRestoreState: 'merging', historyRestoreInProgress: true,
+      historyRestoreStatus: 'A still merging', historyRestoreOfferCount: 0,
+      historyRestoreLegacyCount: 0, historyRestoreReceived: 0,
+      historyRestoreTotal: 0, historyRestoreOffer: [], identityTransition: [],
+    })));
+    await reconnect;
+    assert.equal(h.element('#history-restore-status').textContent, 'A still merging');
+  });
+
+  await t.test('delayed status JSON is discarded after identity change', async () => {
+    const h = createHarness();
+    seedA(h);
+    const poll = h.evaluate('pollChat()');
+    const delayed = deferredJsonResponse();
+    h.requestFor('/api/chat/status').resolve(delayed.response);
+    await delayed.jsonStarted;
+    await switchIdentity(h, 'identity-B');
+    h.element('#chat-status').textContent = 'B screen';
+    delayed.json.resolve({
+      phase: 'connected', messageEpoch: 0, messages: [], messageCount: 0,
+      historyRestoreState: 'merging', historyRestoreInProgress: true,
+      historyRestoreStatus: 'A secret restore status', historyRestoreOfferCount: 0,
+      historyRestoreLegacyCount: 0, historyRestoreReceived: 0,
+      historyRestoreTotal: 0, historyRestoreOffer: [], identityTransition: [],
+    });
+    await poll;
+    assert.equal(h.element('#chat-status').textContent, 'B screen');
+    assert.equal(h.element('#history-restore-status').textContent.includes('A secret restore status'), false);
+    assert.deepEqual(JSON.parse(h.evaluate("sessionStorage.getItem('local-history-restore-job')")), {
+      jobs: { 'identity-A': 'operation-A' },
+    });
+  });
+
+  await t.test('delayed messages JSON is discarded after identity change', async () => {
+    const h = createHarness();
+    seedA(h);
+    const poll = h.evaluate('pollChat()');
+    h.requestFor('/api/chat/status').resolve(response(JSON.stringify({
+      phase: 'connected', messageEpoch: 0, messages: [], messageCount: 1,
+      historyRestoreState: 'idle', historyRestoreInProgress: false,
+      historyRestoreStatus: '', historyRestoreOfferCount: 0,
+      historyRestoreLegacyCount: 0, historyRestoreReceived: 0,
+      historyRestoreTotal: 0, historyRestoreOffer: [], identityTransition: [],
+    })));
+    await new Promise((resolve) => setImmediate(resolve));
+    const messageRequest = h.requestFor('/api/chat/messages');
+    const delayed = deferredJsonResponse();
+    messageRequest.resolve(delayed.response);
+    await delayed.jsonStarted;
+    await switchIdentity(h, 'identity-B');
+    delayed.json.resolve([{ unixTime: 1, sender: '상대방', text: 'A private message' }]);
+    await poll;
+    assert.equal(h.element('#conversation').children.some((item) => item.textContent === 'A private message'), false);
+    assert.equal(h.evaluate('messageCursor'), 0);
+    assert.deepEqual(JSON.parse(h.evaluate("sessionStorage.getItem('local-history-restore-job')")), {
+      jobs: { 'identity-A': 'operation-A' },
+    });
+  });
 });
 
 test('actual UI: staging cleanup failure remains visible after disconnect', () => {

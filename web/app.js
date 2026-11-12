@@ -35,6 +35,7 @@ let latestChatSnapshot = null;
 let messageCursor = 0;
 let messageEpoch = null;
 let pollTimer = null;
+let pollGeneration = 0;
 let lastPhase = '';
 let sendingMessage = false;
 let selectedHistoryPeer = '';
@@ -98,6 +99,19 @@ async function refreshIdentity() {
   if (response.status === 401) { show('entry'); return false; }
   if (!response.ok) throw new Error('status failed');
   const currentIdentityId = await response.text();
+  const previousIdentityId = identityId.textContent.trim();
+  if (previousIdentityId && previousIdentityId !== currentIdentityId) {
+    if (latestChatSnapshot && ['merge-queued', 'merging'].includes(latestChatSnapshot.historyRestoreState) && operationId) {
+      rememberRestoreJob(operationId);
+    }
+    stopPolling();
+    operationId = null;
+    latestChatSnapshot = null;
+    sessionStorage.removeItem(operationKey);
+    conversation.replaceChildren();
+    chatStatus.textContent = '';
+    document.querySelector('#history-restore-panel').hidden = true;
+  }
   identityId.textContent = currentIdentityId;
   await refreshNetworkSettings();
   show('active');
@@ -310,6 +324,7 @@ async function loadHistoryPage(cursor) {
 }
 
 function stopPolling() {
+  pollGeneration += 1;
   if (pollTimer) clearTimeout(pollTimer);
   pollTimer = null;
 }
@@ -463,19 +478,25 @@ async function pollChat() {
   if (!operationId) return;
   const polledOperationId = operationId;
   const polledIdentityId = identityId.textContent.trim();
+  const polledGeneration = pollGeneration;
+  const isCurrentPoll = () => pollGeneration === polledGeneration
+    && operationId === polledOperationId
+    && identityId.textContent.trim() === polledIdentityId;
   let missingRestoreJob = false;
   try {
     const response = await request('/api/chat/status', polledOperationId);
+    if (!isCurrentPoll()) return;
     if (!response.ok) {
       if (response.status === 404) {
+        if (!isCurrentPoll()) return;
         forgetRestoreJob(polledIdentityId, polledOperationId);
         chatStatus.textContent = '복원 작업을 찾을 수 없습니다. 프로그램이 재시작됐거나 작업이 만료됐을 수 있습니다.';
         missingRestoreJob = true;
       }
       throw new Error('status unavailable');
     }
-    if (operationId !== polledOperationId || identityId.textContent.trim() !== polledIdentityId) return;
     const snapshot = await response.json();
+    if (!isCurrentPoll()) return;
     updateChatView(snapshot);
     if (['merge-queued', 'merging'].includes(snapshot.historyRestoreState)) {
       rememberRestoreJob(polledOperationId);
@@ -484,16 +505,21 @@ async function pollChat() {
     }
     if (snapshot.messageCount > messageCursor) {
       const messages = await request('/api/chat/messages', `${polledOperationId}\n${messageCursor}`);
+      if (!isCurrentPoll()) return;
       if (!messages.ok) throw new Error('messages unavailable');
-      if (operationId !== polledOperationId || identityId.textContent.trim() !== polledIdentityId) return;
-      appendMessages(await messages.json());
+      const entries = await messages.json();
+      if (!isCurrentPoll()) return;
+      appendMessages(entries);
     }
   } catch (_) {
-    if (!missingRestoreJob) chatStatus.textContent = '로컬 프로그램에서 연결 상태를 읽지 못했습니다.';
+    if (isCurrentPoll() && !missingRestoreJob) chatStatus.textContent = '로컬 프로그램에서 연결 상태를 읽지 못했습니다.';
   }
-  if (operationId && (!['failed', 'disconnected', 'closed'].includes(lastPhase)
+  if (isCurrentPoll() && operationId && (!['failed', 'disconnected', 'closed'].includes(lastPhase)
     || ['merge-queued', 'merging'].includes(latestChatSnapshot?.historyRestoreState))) {
-    pollTimer = setTimeout(pollChat, 350);
+    const timerGeneration = polledGeneration;
+    pollTimer = setTimeout(() => {
+      if (pollGeneration === timerGeneration) pollChat();
+    }, 350);
   }
 }
 
@@ -704,8 +730,8 @@ document.querySelector('#logout').addEventListener('click', async () => {
     if (latestChatSnapshot && ['merge-queued', 'merging'].includes(latestChatSnapshot.historyRestoreState) && operationId) {
       rememberRestoreJob(operationId);
     }
-    if (!(await request('/api/identity/logout')).ok) throw new Error('logout failed');
     stopPolling();
+    if (!(await request('/api/identity/logout')).ok) throw new Error('logout failed');
     operationId = null;
     sessionStorage.removeItem(operationKey);
     latestChatSnapshot = null;
@@ -719,7 +745,10 @@ document.querySelector('#logout').addEventListener('click', async () => {
     historyList.replaceChildren();
     show('entry');
     message.textContent = '';
-  } catch (_) { message.textContent = '로그아웃하지 못했습니다. 로컬 프로그램을 종료하세요.'; }
+  } catch (_) {
+    message.textContent = '로그아웃하지 못했습니다. 로컬 프로그램을 종료하세요.';
+    if (operationId) pollChat();
+  }
 });
 
 document.querySelectorAll('.disconnect').forEach((button) => button.addEventListener('click', async () => {
@@ -895,8 +924,9 @@ document.querySelector('#close-chat').addEventListener('click', async () => {
   if (latestChatSnapshot && ['merge-queued', 'merging'].includes(latestChatSnapshot.historyRestoreState) && operationId) {
     rememberRestoreJob(operationId);
   }
-  if (operationId) await request('/api/chat/cancel', operationId).catch(() => {});
+  const closingOperationId = operationId;
   stopPolling();
+  if (closingOperationId) await request('/api/chat/cancel', closingOperationId).catch(() => {});
   operationId = null;
   sessionStorage.removeItem(operationKey);
   latestChatSnapshot = null;
