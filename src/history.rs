@@ -3085,18 +3085,6 @@ pub(crate) fn missing_restored(
     Ok(missing)
 }
 
-pub(crate) fn outside_time_range(
-    messages: &[StoredMessage],
-    start: u64,
-    end: u64,
-) -> Vec<StoredMessage> {
-    messages
-        .iter()
-        .filter(|item| item.unix_time < start || item.unix_time > end)
-        .cloned()
-        .collect()
-}
-
 fn message_signing_payload(unix_time: u64, text: &str, proof: &MessageProof) -> Vec<u8> {
     let mut payload = Vec::with_capacity(43 + 16 + 32 + 32 + text.len());
     payload.extend_from_slice(b"another-dimension-v2/chat-message/v1");
@@ -5533,25 +5521,6 @@ mod tests {
                 .0[0]
                 .text,
             "first"
-        );
-    }
-
-    #[test]
-    fn date_range_and_recent_retention_keep_their_boundary_messages() {
-        let messages = vec![
-            message(9, "before"),
-            message(10, "start"),
-            message(20, "end"),
-            message(21, "after"),
-        ];
-        assert_eq!(
-            super::outside_time_range(&messages, 10, 20),
-            vec![messages[0].clone(), messages[3].clone()]
-        );
-        // Recent retention removes the inclusive range 0..=cutoff.
-        assert_eq!(
-            super::outside_time_range(&messages, 0, 20),
-            vec![messages[3].clone()]
         );
     }
 

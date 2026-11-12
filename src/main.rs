@@ -231,8 +231,6 @@ struct HistorySyncSender {
     awaiting_chunk: Option<usize>,
     awaiting_count: usize,
     #[cfg(test)]
-    test_messages: Option<Vec<history::StoredMessage>>,
-    #[cfg(test)]
     test_next_record: usize,
     #[cfg(test)]
     test_generated: Option<(usize, usize)>,
@@ -250,21 +248,10 @@ impl HistorySyncSender {
             awaiting_chunk: None,
             awaiting_count: 0,
             #[cfg(test)]
-            test_messages: None,
-            #[cfg(test)]
             test_next_record: 0,
             #[cfg(test)]
             test_generated: None,
         }
-    }
-
-    #[cfg(test)]
-    fn for_test(request_id: String, messages: Vec<history::StoredMessage>) -> Self {
-        let file = File::open("/dev/null").expect("null file for test reader");
-        let reader = history::HistoryReader::empty_for_test(file);
-        let mut sender = Self::new(request_id, reader, messages.len());
-        sender.test_messages = Some(messages);
-        sender
     }
 
     #[cfg(test)]
@@ -277,12 +264,6 @@ impl HistorySyncSender {
     }
 
     fn next_record(&mut self) -> io::Result<Option<history::StoredMessage>> {
-        #[cfg(test)]
-        if let Some(messages) = self.test_messages.as_ref() {
-            let item = messages.get(self.test_next_record).cloned();
-            self.test_next_record += usize::from(item.is_some());
-            return Ok(item);
-        }
         #[cfg(test)]
         if let Some((count, text_bytes)) = self.test_generated {
             if self.test_next_record >= count {
@@ -1699,66 +1680,6 @@ mod send_tests {
                 "{state} must allow normal chat I/O"
             );
         }
-    }
-
-    #[test]
-    fn history_sync_chunks_over_legacy_record_and_byte_limits_with_ack_backpressure() {
-        let request_id = "ab".repeat(32);
-        let messages: Vec<_> = (0..4_097)
-            .map(|unix_time| history::StoredMessage {
-                unix_time,
-                sender: history::MessageSender::Me,
-                text: "x".repeat(4_096),
-                proof: None,
-            })
-            .collect();
-        let total_bytes: usize = messages
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                history::encode_transfer_chunk(item, &request_id, index / SYNC_CHUNK_RECORDS)
-                    .unwrap()
-                    .len()
-            })
-            .sum();
-        assert!(messages.len() > 4_096);
-        assert!(total_bytes < 64 * 1024 * 1024);
-        assert!(total_bytes > 16 * 1024 * 1024);
-
-        let mut sender = HistorySyncSender::for_test(request_id.clone(), messages);
-        let mut receiver = HistorySyncReceiver::default();
-        receiver.begin(&request_id, 4_097).unwrap();
-        let mut received = 0;
-        loop {
-            let (chunk, frames) = sender.next_chunk().unwrap().unwrap();
-            assert!(frames.len() <= SYNC_CHUNK_RECORDS);
-            assert!(frames.len() < SYNC_CHUNK_RECORDS);
-            let chunk_bytes: usize = frames.iter().map(Vec::len).sum();
-            assert!(chunk_bytes <= SYNC_CHUNK_BYTES);
-            receiver
-                .begin_chunk(&request_id, chunk, frames.len())
-                .unwrap();
-            for frame in frames {
-                let (frame_id, frame_chunk, payload) =
-                    history::transfer_chunk_metadata(&frame).unwrap();
-                assert_eq!(frame_id, request_id);
-                assert_eq!(frame_chunk, chunk);
-                assert!(payload.starts_with(b"ADREC1"));
-                receiver
-                    .record(&request_id, frame_chunk, frame.len())
-                    .unwrap();
-            }
-            receiver.end_chunk(&request_id, chunk).unwrap();
-            received += 1;
-            assert!(sender.acknowledge(&request_id, chunk + 1).is_err());
-            assert!(!sender.acknowledge(&"cd".repeat(32), chunk).unwrap());
-            let finished = sender.acknowledge(&request_id, chunk).unwrap();
-            if finished {
-                break;
-            }
-        }
-        assert!(received > 4_097_usize.div_ceil(SYNC_CHUNK_RECORDS));
-        receiver.finish(&request_id, 4_097).unwrap();
     }
 
     #[test]

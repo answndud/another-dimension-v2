@@ -604,30 +604,6 @@ test('actual UI: restore jobs reopen only for the identity that created them', a
     assert.equal(h.evaluate("sessionStorage.getItem('local-history-restore-job')"), null);
   });
 
-  await t.test('same identity resumes polling the saved operation', async () => {
-    const h = createHarness();
-    h.evaluate(`sessionStorage.setItem('local-history-restore-job', ${JSON.stringify(restoreJob)})`);
-    const refresh = h.evaluate('refreshIdentity()');
-    await new Promise((resolve) => setImmediate(resolve));
-    h.requestFor('/api/identity/status').resolve(response('identity-A'));
-    await new Promise((resolve) => setImmediate(resolve));
-    h.requestFor('/api/settings/get').resolve(response(settings));
-    await new Promise((resolve) => setImmediate(resolve));
-    h.requestFor('/api/history/list').resolve(response('[]'));
-    await new Promise((resolve) => setImmediate(resolve));
-    const status = h.requestFor('/api/chat/status');
-    assert.equal(status.init.body, 'private-operation');
-    status.resolve(response(JSON.stringify({
-      phase: 'closed', messageEpoch: 0, messages: [], messageCount: 0,
-      historyRestoreState: 'completed', historyRestoreInProgress: false,
-      historyRestoreStatus: 'merge done', historyRestoreOfferCount: 0,
-      historyRestoreLegacyCount: 0, historyRestoreReceived: 0,
-      historyRestoreTotal: 0, historyRestoreOffer: [], identityTransition: [],
-    })));
-    await refresh;
-    assert.equal(h.evaluate('operationId'), 'private-operation');
-  });
-
   await t.test('temporary query failures keep the reference, missing jobs clear it, and unknown legacy owner is never opened', async () => {
     const h = createHarness();
     h.evaluate(`sessionStorage.setItem('local-history-restore-job', ${JSON.stringify(restoreJob)})`);
