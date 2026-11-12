@@ -45,6 +45,7 @@ const RESTORE_MERGE_FAN_IN: usize = 16;
 thread_local! {
     static TEST_DATA_DIRECTORY: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static TEST_FAILURES: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+    static TEST_DECRYPTED_RECORDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -131,7 +132,38 @@ pub struct History {
     identity_id: String,
     peer_id: String,
     next_index: u64,
+    file_version: HistoryFileVersion,
     operation_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HistoryFileVersion {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_nanos: u128,
+}
+
+fn history_file_version(file: &File) -> io::Result<HistoryFileVersion> {
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
+    let (device, inode) = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let (device, inode) = (0, 0);
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    Ok(HistoryFileVersion {
+        device,
+        inode,
+        length: metadata.len(),
+        modified_nanos,
+    })
 }
 
 /// Sequential, non-repairing view of a history file. The captured file length
@@ -441,6 +473,8 @@ impl HistoryReader {
                 .map_err(|_| invalid_data("history authentication failed"))?,
         );
         let message = decode_history_plain(&plain, self.legacy)?;
+        #[cfg(test)]
+        TEST_DECRYPTED_RECORDS.with(|count| count.set(count.get() + 1));
         self.index = self
             .index
             .checked_add(1)
@@ -478,6 +512,24 @@ fn open_history_reader(
         truncated: false,
         legacy,
     })
+}
+
+fn open_history_reader_from(
+    path: PathBuf,
+    key: Zeroizing<[u8; 32]>,
+    identity_id: String,
+    peer_id: String,
+    offset: u64,
+    index: u64,
+) -> io::Result<HistoryReader> {
+    let mut reader = open_history_reader(path, key, identity_id, peer_id)?;
+    if reader.legacy || offset < MAGIC.len() as u64 || offset > reader.end {
+        return Err(invalid_data("invalid append refresh offset"));
+    }
+    reader.file.seek(SeekFrom::Start(offset))?;
+    reader.index = index;
+    reader.valid_end = offset;
+    Ok(reader)
 }
 
 fn migrate_legacy_history_streaming(
@@ -706,6 +758,7 @@ impl History {
         }
         let file = OpenOptions::new().read(true).append(true).open(&path)?;
         set_private_file(&file)?;
+        let file_version = history_file_version(&file)?;
         register_conversation(identity, &identity_id, &peer_id, &directory)?;
         let history = Self {
             file,
@@ -714,6 +767,7 @@ impl History {
             identity_id,
             peer_id,
             next_index: count as u64,
+            file_version,
             operation_lock: Arc::clone(&operation_lock),
         };
         unlock_conversation_file(file_lock);
@@ -841,6 +895,7 @@ impl History {
             true,
         )?;
         file.seek(SeekFrom::End(0))?;
+        let file_version = history_file_version(&file)?;
         register_conversation(identity, &identity_id, &peer_id, &directory)?;
         let mut history = Self {
             file,
@@ -849,6 +904,7 @@ impl History {
             identity_id,
             peer_id,
             next_index,
+            file_version,
             operation_lock: Arc::clone(&operation_lock),
         };
         unlock_conversation_file(file_lock);
@@ -884,6 +940,7 @@ impl History {
             .next_index
             .checked_add(1)
             .ok_or_else(|| io::Error::other("history record limit reached"))?;
+        self.file_version = history_file_version(&self.file)?;
         unlock_conversation_file(file_lock);
         Ok(())
     }
@@ -932,8 +989,10 @@ impl History {
             }
             file.sync_all()?;
             rename(&temporary, &self.path)?;
+            let file_version = history_file_version(&file)?;
             self.file = file;
             self.next_index = messages.len() as u64;
+            self.file_version = file_version;
             Ok(())
         })();
         if result.is_err() {
@@ -943,17 +1002,41 @@ impl History {
     }
 
     fn refresh_for_append(&mut self) -> io::Result<()> {
-        let mut reader = open_history_reader(
-            self.path.clone(),
-            Zeroizing::new(*self.key),
-            self.identity_id.clone(),
-            self.peer_id.clone(),
-        )?;
-        let mut next_index = 0u64;
-        while reader.next_record()?.is_some() {
-            next_index = next_index
-                .checked_add(1)
-                .ok_or_else(|| invalid_data("history record index overflow"))?;
+        let current = File::open(&self.path)?;
+        let current_version = history_file_version(&current)?;
+        let same_file = current_version.device == self.file_version.device
+            && current_version.inode == self.file_version.inode;
+        if same_file && current_version == self.file_version {
+            return Ok(());
+        }
+        let mut next_index = self.next_index;
+        if same_file && current_version.length > self.file_version.length {
+            let mut reader = open_history_reader_from(
+                self.path.clone(),
+                Zeroizing::new(*self.key),
+                self.identity_id.clone(),
+                self.peer_id.clone(),
+                self.file_version.length,
+                self.next_index,
+            )?;
+            while reader.next_record()?.is_some() {
+                next_index = next_index
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("history record index overflow"))?;
+            }
+        } else {
+            let mut reader = open_history_reader(
+                self.path.clone(),
+                Zeroizing::new(*self.key),
+                self.identity_id.clone(),
+                self.peer_id.clone(),
+            )?;
+            next_index = 0;
+            while reader.next_record()?.is_some() {
+                next_index = next_index
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("history record index overflow"))?;
+            }
         }
         let file = OpenOptions::new()
             .read(true)
@@ -962,6 +1045,7 @@ impl History {
         set_private_file(&file)?;
         self.file = file;
         self.next_index = next_index;
+        self.file_version = history_file_version(&self.file)?;
         Ok(())
     }
 
@@ -1131,8 +1215,10 @@ impl History {
             }
             rename(&temporary, &self.path)?;
             final_temp = None;
+            let file_version = history_file_version(&append_file)?;
             self.file = append_file;
             self.next_index = total_count;
+            self.file_version = file_version;
             Ok(RestoreMergeSummary {
                 total_count,
                 imported_count,
@@ -3006,6 +3092,8 @@ fn read_records(
                 )
                 .map_err(|_| invalid_data("history authentication failed"))?,
         );
+        #[cfg(test)]
+        TEST_DECRYPTED_RECORDS.with(|count| count.set(count.get() + 1));
         if plain.len() < 13 {
             return Err(invalid_data("invalid history payload"));
         }
@@ -3740,6 +3828,99 @@ mod tests {
             Some(message(1, "snapshot one"))
         );
         assert_eq!(reader.next_record().unwrap(), None);
+    }
+
+    #[test]
+    fn append_uses_cached_index_and_refreshes_stale_handles_safely() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "3f".repeat(32);
+        let (mut first, _, _) = History::open(&identity, &peer).unwrap();
+        for index in 0..256 {
+            first.append(&message(index, "cached append")).unwrap();
+        }
+        let (mut second, _, _) = History::open(&identity, &peer).unwrap();
+
+        super::TEST_DECRYPTED_RECORDS.with(|count| count.set(0));
+        first.append(&message(257, "fast path")).unwrap();
+        super::TEST_DECRYPTED_RECORDS.with(|count| assert_eq!(count.get(), 0));
+
+        super::TEST_DECRYPTED_RECORDS.with(|count| count.set(0));
+        second
+            .append(&message(258, "external append refresh"))
+            .unwrap();
+        super::TEST_DECRYPTED_RECORDS.with(|count| assert_eq!(count.get(), 1));
+
+        first
+            .replace(&[
+                message(300, "replacement one"),
+                message(301, "replacement two"),
+            ])
+            .unwrap();
+        super::TEST_DECRYPTED_RECORDS.with(|count| count.set(0));
+        second.append(&message(302, "after replacement")).unwrap();
+        super::TEST_DECRYPTED_RECORDS.with(|count| assert_eq!(count.get(), 2));
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&second.path)
+            .unwrap();
+        file.seek(SeekFrom::Start(8 + 4 + 12 + 2)).unwrap();
+        let mut byte = [0];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Current(-1)).unwrap();
+        file.write_all(&[byte[0] ^ 0x80]).unwrap();
+        file.sync_all().unwrap();
+        let length = file.metadata().unwrap().len();
+        drop(file);
+        assert!(second.append(&message(303, "must fail")).is_err());
+        assert_eq!(std::fs::metadata(&second.path).unwrap().len(), length);
+        let result = History::open(&identity, &peer);
+        assert!(result.is_err());
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn simultaneous_history_handles_append_without_duplicate_indices() {
+        let data = IsolatedData::new();
+        let (identity, access_code) = Identity::create().unwrap();
+        let code = access_code.to_string();
+        let peer = "40".repeat(32);
+        let _ = History::open(&identity, &peer).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for (index, text) in [(1u64, "concurrent one"), (2, "concurrent two")] {
+            let directory = data.0.clone();
+            let peer = peer.clone();
+            let code = code.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                super::TEST_DATA_DIRECTORY.with(|slot| *slot.borrow_mut() = Some(directory));
+                let identity = Identity::from_code(&code).unwrap();
+                let (mut history, _, _) = History::open_for_chat(&identity, &peer).unwrap();
+                barrier.wait();
+                history.append(&message(index, text)).unwrap();
+                super::TEST_DATA_DIRECTORY.with(|slot| *slot.borrow_mut() = None);
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let (mut history, messages, _) = History::open(&identity, &peer).unwrap();
+        assert_eq!(messages.len(), 2);
+        history
+            .append(&message(3, "after concurrent append"))
+            .unwrap();
+        let (_, messages, _) = History::open(&identity, &peer).unwrap();
+        assert_eq!(messages.len(), 3);
+        let texts: HashSet<_> = messages.iter().map(|item| item.text.as_str()).collect();
+        assert!(texts.contains("concurrent one"));
+        assert!(texts.contains("concurrent two"));
     }
 
     #[test]
