@@ -185,13 +185,23 @@ fn identity_event_exists_for_previous(
     messages: &[history::StoredMessage],
     kind: &str,
     previous_id: &str,
+    current_id: &str,
 ) -> bool {
     messages.iter().any(|message| {
+        if message.sender != history::MessageSender::Me {
+            return false;
+        }
         let Some(marker) = message.text.strip_prefix(history::IDENTITY_EVENT_PREFIX) else {
             return false;
         };
         let mut fields = marker.split(':');
-        fields.next() == Some(kind) && fields.next() == Some(previous_id)
+        fields.next() == Some(kind)
+            && fields
+                .next()
+                .is_some_and(|id| id.eq_ignore_ascii_case(previous_id))
+            && fields
+                .next()
+                .is_some_and(|id| id.eq_ignore_ascii_case(current_id))
     })
 }
 
@@ -221,7 +231,22 @@ mod send_tests {
         assert!(identity_event_exists_for_previous(
             std::slice::from_ref(&event),
             "peer",
-            &"ab".repeat(32)
+            &"ab".repeat(32),
+            &current
+        ));
+        assert!(!identity_event_exists_for_previous(
+            std::slice::from_ref(&event),
+            "peer",
+            &"ab".repeat(32),
+            &"ef".repeat(32)
+        ));
+        let mut remote_marker = event.clone();
+        remote_marker.sender = history::MessageSender::Other;
+        assert!(!identity_event_exists_for_previous(
+            std::slice::from_ref(&remote_marker),
+            "peer",
+            &"ab".repeat(32),
+            &current
         ));
         let displayed = chat_entry(event);
         assert_eq!(displayed.sender, "신원 변경");
@@ -430,7 +455,12 @@ fn spawn_chat_worker(
                     let pending = previous_identity_ids
                         .iter()
                         .filter(|old_id| {
-                            !identity_event_exists_for_previous(&stored, "self", old_id)
+                            !identity_event_exists_for_previous(
+                                &stored,
+                                "self",
+                                old_id,
+                                &identity.public_id(),
+                            )
                         })
                         .cloned()
                         .collect();
@@ -480,6 +510,8 @@ fn spawn_chat_worker(
         let mut pending_restore = Vec::<history::StoredMessage>::new();
         let mut restore_expected = None::<usize>;
         let mut restore_bytes = 0usize;
+        let mut restore_local_aliases = Vec::<[u8; 32]>::new();
+        let mut restore_peer_aliases = Vec::<[u8; 32]>::new();
         let mut restore_started_at = None::<Instant>;
         let mut last_peer_activity = Instant::now();
         let mut last_heartbeat = Instant::now();
@@ -791,15 +823,21 @@ fn spawn_chat_worker(
                                 });
                                 continue;
                             }
-                            match history::decode_transfer(&identity, &peer_id, &peer_key, &message)
-                            {
+                            match history::decode_transfer_with_linked_keys(
+                                &identity,
+                                &peer_id,
+                                &peer_key,
+                                &message,
+                                &restore_local_aliases,
+                                &restore_peer_aliases,
+                            ) {
                                 Ok(entry) => pending_restore.push(entry),
-                                Err(_) => {
+                                Err(error) => {
                                     restore_expected = None;
                                     pending_restore.clear();
                                     chat_update(&operation, |snapshot| {
                                         snapshot.history_restore_in_progress = false;
-                                        snapshot.history_restore_status = Some("상대 기록의 서명, 발신자 또는 형식 검증에 실패했습니다. 로컬 기록은 변경하지 않았습니다.".to_owned());
+                                        snapshot.history_restore_status = Some(format!("상대 기록 검증에 실패했습니다: {error}. 확인 후 명시적으로 연결한 이전 신원만 허용됩니다. 로컬 기록은 변경하지 않았습니다."));
                                     });
                                 }
                             }
@@ -874,6 +912,7 @@ fn spawn_chat_worker(
                                             &current_messages,
                                             "peer",
                                             &old_id,
+                                            &current_peer_id,
                                         ) {
                                             let ack = chat_control(serde_json::json!({
                                                 "type": "identity-linked",
@@ -1000,6 +1039,33 @@ fn spawn_chat_worker(
                                             snapshot.history_restore_status = Some("상대 기록 제안의 크기 또는 순서가 잘못되었습니다. 로컬 기록은 변경하지 않았습니다.".to_owned());
                                         });
                                     } else {
+                                        let aliases = history::History::read_for_identity_copy(
+                                            &identity, &peer_id,
+                                        )
+                                        .and_then(|(messages, incomplete)| {
+                                            if incomplete {
+                                                return Err(io::Error::other(
+                                                    "current history has an incomplete record",
+                                                ));
+                                            }
+                                            history::linked_identity_keys(
+                                                &messages,
+                                                &identity.public_id(),
+                                                &peer_id,
+                                                &previous_identity_ids,
+                                            )
+                                        });
+                                        let Ok((local_aliases, peer_aliases)) = aliases else {
+                                            restore_expected = None;
+                                            pending_restore.clear();
+                                            chat_update(&operation, |snapshot| {
+                                                snapshot.history_restore_in_progress = false;
+                                                snapshot.history_restore_status = Some("이전 신원 연결 기록을 검증하지 못해 복원 제안을 거부했습니다. 로컬 기록은 변경하지 않았습니다.".to_owned());
+                                            });
+                                            continue;
+                                        };
+                                        restore_local_aliases = local_aliases;
+                                        restore_peer_aliases = peer_aliases;
                                         restore_expected = count;
                                         pending_restore.clear();
                                         restore_bytes = 0;

@@ -796,9 +796,6 @@ fn decode_backup(
             text,
             proof,
         };
-        if message.proof.is_some() {
-            verify_stored_proof(identity, &peer_id, &message)?;
-        }
         imported.push(StoredMessage {
             unix_time: message.unix_time,
             sender: message.sender,
@@ -808,6 +805,16 @@ fn decode_backup(
     }
     if cursor != payload.len() {
         return Err(invalid_data("unexpected backup data"));
+    }
+    let previous_local_ids = crate::identity::previous_public_ids(identity)?;
+    let (local_aliases, peer_aliases) = linked_identity_keys(
+        &imported,
+        &identity.public_id(),
+        &peer_id,
+        &previous_local_ids,
+    )?;
+    for message in imported.iter().filter(|message| message.proof.is_some()) {
+        verify_stored_proof(identity, &peer_id, message, &local_aliases, &peer_aliases)?;
     }
     Ok((peer_id, imported))
 }
@@ -917,7 +924,26 @@ pub(crate) fn decode_transfer(
     peer_key: &[u8; 32],
     frame: &[u8],
 ) -> io::Result<StoredMessage> {
-    decode_wire_message(identity, peer_id, peer_key, frame, TRANSFER_MAGIC)
+    decode_transfer_with_linked_keys(identity, peer_id, peer_key, frame, &[], &[])
+}
+
+pub(crate) fn decode_transfer_with_linked_keys(
+    identity: &Identity,
+    peer_id: &str,
+    peer_key: &[u8; 32],
+    frame: &[u8],
+    local_aliases: &[[u8; 32]],
+    peer_aliases: &[[u8; 32]],
+) -> io::Result<StoredMessage> {
+    decode_wire_message(
+        identity,
+        peer_id,
+        peer_key,
+        frame,
+        TRANSFER_MAGIC,
+        local_aliases,
+        peer_aliases,
+    )
 }
 
 pub(crate) fn decode_signed_message(
@@ -926,7 +952,7 @@ pub(crate) fn decode_signed_message(
     peer_key: &[u8; 32],
     frame: &[u8],
 ) -> io::Result<StoredMessage> {
-    let message = decode_wire_message(identity, peer_id, peer_key, frame, MESSAGE_MAGIC)?;
+    let message = decode_wire_message(identity, peer_id, peer_key, frame, MESSAGE_MAGIC, &[], &[])?;
     if message.proof.is_none() {
         return Err(invalid_data("new message has no signature"));
     }
@@ -942,6 +968,8 @@ fn decode_wire_message(
     peer_key: &[u8; 32],
     frame: &[u8],
     magic: &[u8; 6],
+    local_aliases: &[[u8; 32]],
+    peer_aliases: &[[u8; 32]],
 ) -> io::Result<StoredMessage> {
     if frame.len() < magic.len() + 14 || !frame.starts_with(magic) {
         return Err(invalid_data("invalid history transfer frame"));
@@ -990,9 +1018,10 @@ fn decode_wire_message(
             MessageSender::Other => (*peer_key, identity.public_key()),
             MessageSender::Me => (identity.public_key(), decode_peer_id(peer_id)?),
         };
-        if proof.signer != expected_signer || proof.recipient != expected_recipient {
-            return Err(invalid_data("transferred message has the wrong signer"));
-        }
+        let (signer_aliases, recipient_aliases) = match sender {
+            MessageSender::Other => (peer_aliases, local_aliases),
+            MessageSender::Me => (local_aliases, peer_aliases),
+        };
         let key = VerifyingKey::from_bytes(&proof.signer)
             .map_err(|_| invalid_data("invalid transferred signing key"))?;
         let signature = Signature::from_bytes(&proof.signature);
@@ -1001,6 +1030,14 @@ fn decode_wire_message(
             &signature,
         )
         .map_err(|_| invalid_data("transferred message signature failed"))?;
+        if (proof.signer != expected_signer && !signer_aliases.contains(&proof.signer))
+            || (proof.recipient != expected_recipient
+                && !recipient_aliases.contains(&proof.recipient))
+        {
+            return Err(invalid_data(
+                "transferred message uses an unlinked identity key or recipient",
+            ));
+        }
     }
     Ok(StoredMessage {
         unix_time,
@@ -1008,6 +1045,63 @@ fn decode_wire_message(
         text,
         proof,
     })
+}
+
+/// Return only aliases whose explicit link marker is in the current local
+/// conversation. Remote transition announcements alone are never sufficient.
+pub(crate) fn linked_identity_keys(
+    messages: &[StoredMessage],
+    identity_id: &str,
+    peer_id: &str,
+    previous_local_ids: &[String],
+) -> io::Result<(Vec<[u8; 32]>, Vec<[u8; 32]>)> {
+    let identity_id = identity_id.to_ascii_lowercase();
+    let peer_id = peer_id.to_ascii_lowercase();
+    validate_peer_id(&identity_id)?;
+    validate_peer_id(&peer_id)?;
+    let local_origins: HashSet<_> = previous_local_ids
+        .iter()
+        .map(|id| id.to_ascii_lowercase())
+        .collect();
+    let mut local_aliases = HashSet::new();
+    let mut peer_aliases = HashSet::new();
+    for message in messages {
+        if message.sender != MessageSender::Me {
+            continue;
+        }
+        let Some(marker) = message.text.strip_prefix(IDENTITY_EVENT_PREFIX) else {
+            continue;
+        };
+        let fields: Vec<_> = marker.split(':').collect();
+        if fields.len() != 3 || fields[1..].iter().any(|id| id.len() != 64) {
+            continue;
+        }
+        let (role, current_id) = match fields[0] {
+            "self" => ("self", identity_id.as_str()),
+            "peer" => ("peer", peer_id.as_str()),
+            _ => continue,
+        };
+        let previous_id = fields[1].to_ascii_lowercase();
+        if !fields[2].eq_ignore_ascii_case(current_id)
+            || previous_id == current_id
+            || !previous_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        if role == "self" && !local_origins.contains(&previous_id) {
+            continue;
+        }
+        let key = decode_peer_id(&previous_id)?;
+        if role == "self" {
+            local_aliases.insert(key);
+        } else {
+            peer_aliases.insert(key);
+        }
+    }
+    Ok((
+        local_aliases.into_iter().collect(),
+        peer_aliases.into_iter().collect(),
+    ))
 }
 
 pub(crate) fn is_transfer_frame(frame: &[u8]) -> bool {
@@ -1115,6 +1209,8 @@ fn verify_stored_proof(
     identity: &Identity,
     peer_id: &str,
     message: &StoredMessage,
+    local_aliases: &[[u8; 32]],
+    peer_aliases: &[[u8; 32]],
 ) -> io::Result<()> {
     let proof = message
         .proof
@@ -1124,9 +1220,10 @@ fn verify_stored_proof(
         MessageSender::Me => (identity.public_key(), decode_peer_id(peer_id)?),
         MessageSender::Other => (decode_peer_id(peer_id)?, identity.public_key()),
     };
-    if proof.signer != signer || proof.recipient != recipient {
-        return Err(invalid_data("backup message has the wrong signer"));
-    }
+    let (signer_aliases, recipient_aliases) = match message.sender {
+        MessageSender::Me => (local_aliases, peer_aliases),
+        MessageSender::Other => (peer_aliases, local_aliases),
+    };
     let key = VerifyingKey::from_bytes(&proof.signer)
         .map_err(|_| invalid_data("invalid backup message signer"))?;
     key.verify_strict(
@@ -1134,6 +1231,17 @@ fn verify_stored_proof(
         &Signature::from_bytes(&proof.signature),
     )
     .map_err(|_| invalid_data("backup message signature failed"))
+    .and_then(|()| {
+        if (proof.signer != signer && !signer_aliases.contains(&proof.signer))
+            || (proof.recipient != recipient && !recipient_aliases.contains(&proof.recipient))
+        {
+            Err(invalid_data(
+                "backup message uses an unlinked identity key or recipient",
+            ))
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn derive_backup_key(key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
@@ -1703,6 +1811,147 @@ mod tests {
         let restored =
             super::decode_transfer(&bob, &alice_id, &alice.public_key(), &legacy_frame).unwrap();
         assert!(restored.proof.is_none());
+    }
+
+    #[test]
+    fn explicitly_linked_identity_keys_validate_original_signatures_only_after_link() {
+        let _data = IsolatedData::new();
+        let (alice_old, _) = Identity::create().unwrap();
+        let (bob, _) = Identity::create().unwrap();
+        let alice_old_id = alice_old.public_id();
+        let bob_id = bob.public_id();
+        let alice_to_bob =
+            super::sign_message(&alice_old, &bob_id, 100, "old Alice proof".into()).unwrap();
+        let a_frame = super::encode_signed_message(&alice_to_bob).unwrap();
+        let received_a =
+            super::decode_signed_message(&bob, &alice_old_id, &alice_old.public_key(), &a_frame)
+                .unwrap();
+        let bob_to_alice =
+            super::sign_message(&bob, &alice_old_id, 101, "old Bob proof".into()).unwrap();
+        let b_frame = super::encode_signed_message(&bob_to_alice).unwrap();
+        let received_b =
+            super::decode_signed_message(&alice_old, &bob_id, &bob.public_key(), &b_frame).unwrap();
+
+        let (mut bob_old_history, _, _) = History::open(&bob, &alice_old_id).unwrap();
+        bob_old_history.append(&received_a).unwrap();
+        bob_old_history.append(&bob_to_alice).unwrap();
+        let (mut alice_old_history, _, _) = History::open(&alice_old, &bob_id).unwrap();
+        alice_old_history.append(&received_b).unwrap();
+
+        let (alice_new, _) = Identity::create().unwrap();
+        alice_old.copy_local_data_to(&alice_new).unwrap();
+        let alice_new_id = alice_new.public_id();
+        let (mut bob_current, _, _) = History::open(&bob, &alice_new_id).unwrap();
+        let peer_marker = StoredMessage {
+            unix_time: 102,
+            sender: MessageSender::Me,
+            text: format!(
+                "{}peer:{alice_old_id}:{alice_new_id}",
+                super::IDENTITY_EVENT_PREFIX
+            ),
+            proof: None,
+        };
+        bob_current
+            .link_prior_identity(&bob, &alice_old_id, peer_marker)
+            .unwrap();
+
+        let (mut alice_current, _, _) = History::open(&alice_new, &bob_id).unwrap();
+        let self_marker = StoredMessage {
+            unix_time: 103,
+            sender: MessageSender::Me,
+            text: format!(
+                "{}self:{alice_old_id}:{alice_new_id}",
+                super::IDENTITY_EVENT_PREFIX
+            ),
+            proof: None,
+        };
+        alice_current
+            .append_system_once(&alice_new, self_marker)
+            .unwrap();
+
+        let (alice_messages, incomplete) =
+            History::read_for_identity_copy(&alice_new, &bob_id).unwrap();
+        assert!(!incomplete);
+        let local_origins = crate::identity::previous_public_ids(&alice_new).unwrap();
+        let (local_aliases, peer_aliases) =
+            super::linked_identity_keys(&alice_messages, &alice_new_id, &bob_id, &local_origins)
+                .unwrap();
+        assert!(local_aliases.contains(&super::decode_peer_id(&alice_old_id).unwrap()));
+        assert!(peer_aliases.is_empty());
+        let alice_backup = History::export_backup(&alice_new, &bob_id, None).unwrap();
+        assert_eq!(
+            History::verify_backup(&alice_new, &alice_backup, None)
+                .unwrap()
+                .0,
+            bob_id
+        );
+
+        let (bob_messages, incomplete) =
+            History::read_for_identity_copy(&bob, &alice_new_id).unwrap();
+        assert!(!incomplete);
+        let (bob_local_aliases, bob_peer_aliases) =
+            super::linked_identity_keys(&bob_messages, &bob.public_id(), &alice_new_id, &[])
+                .unwrap();
+        assert!(bob_local_aliases.is_empty());
+        assert!(bob_peer_aliases.contains(&super::decode_peer_id(&alice_old_id).unwrap()));
+        let bob_backup = History::export_backup(&bob, &alice_new_id, None).unwrap();
+        assert_eq!(
+            History::verify_backup(&bob, &bob_backup, None).unwrap().0,
+            alice_new_id
+        );
+
+        for entry in bob_messages.iter().filter(|entry| entry.proof.is_some()) {
+            let frame = super::encode_transfer(entry).unwrap();
+            assert!(super::decode_transfer_with_linked_keys(
+                &alice_new,
+                &bob_id,
+                &bob.public_key(),
+                &frame,
+                &[],
+                &[]
+            )
+            .is_err());
+            let restored = super::decode_transfer_with_linked_keys(
+                &alice_new,
+                &bob_id,
+                &bob.public_key(),
+                &frame,
+                &local_aliases,
+                &peer_aliases,
+            )
+            .unwrap();
+            assert!(restored.proof.is_some());
+        }
+
+        let alice_local_entry = alice_messages
+            .iter()
+            .find(|entry| entry.proof.is_some())
+            .unwrap();
+        let frame = super::encode_transfer(alice_local_entry).unwrap();
+        let restored = super::decode_transfer_with_linked_keys(
+            &bob,
+            &alice_new_id,
+            &alice_new.public_key(),
+            &frame,
+            &bob_local_aliases,
+            &bob_peer_aliases,
+        )
+        .unwrap();
+        assert!(restored.proof.is_some());
+
+        let mut wrong_recipient = frame.clone();
+        let text_len = u32::from_be_bytes(wrong_recipient[15..19].try_into().unwrap()) as usize;
+        let proof = 19 + text_len + 1;
+        wrong_recipient[proof + 16 + 32] ^= 1;
+        assert!(super::decode_transfer_with_linked_keys(
+            &bob,
+            &alice_new_id,
+            &alice_new.public_key(),
+            &wrong_recipient,
+            &bob_local_aliases,
+            &bob_peer_aliases
+        )
+        .is_err());
     }
 
     #[test]
