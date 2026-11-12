@@ -328,7 +328,7 @@ function updateChatView(snapshot) {
   const restoreStatus = document.querySelector('#history-restore-status');
   const restorePreview = document.querySelector('#history-restore-preview');
   const restoreKey = `${snapshot.historyRestoreStatus || ''}:${snapshot.historyRestoreOfferCount || 0}:${snapshot.historyRestoreLegacyCount || 0}:${restoreOffer.map(item => `${item.time}:${item.sender}:${item.text}`).join('|')}`;
-  restorePanel.hidden = snapshot.phase !== 'connected'
+  restorePanel.hidden = (snapshot.phase !== 'connected' && !snapshot.historyRestoreCleanupError)
     || (!snapshot.historyRestoreInProgress && !restoreOffer.length && !snapshot.historyRestoreStatus);
   restoreStatus.textContent = snapshot.historyRestoreInProgress
     ? `상대 기록을 받는 중입니다: ${snapshot.historyRestoreReceived || 0} / ${snapshot.historyRestoreTotal || 0}. 동의 전에는 로컬 기록을 변경하지 않습니다.`

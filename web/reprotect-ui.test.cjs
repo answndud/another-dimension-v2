@@ -427,3 +427,16 @@ test('actual UI: transfer consent and final merge consent are separate states', 
   assert.equal(h.element('#history-restore-accept').textContent, '제안된 기록 병합');
   assert.equal(h.element('#history-restore-accept').disabled, false);
 });
+
+test('actual UI: staging cleanup failure remains visible after disconnect', () => {
+  const h = createHarness();
+  h.evaluate(`updateChatView({
+    phase: 'disconnected', messageEpoch: 0, messages: [], peerId: 'peer',
+    historyRestoreState: 'failed', historyRestoreInProgress: false,
+    historyRestoreOfferCount: 0, historyRestoreOffer: [],
+    historyRestoreStatus: '연결이 종료되었습니다.',
+    historyRestoreCleanupError: '복구 임시 파일 제거 실패: /isolated/staging'
+  })`);
+  assert.equal(h.element('#history-restore-panel').hidden, false);
+  assert.match(h.element('#history-restore-status').textContent, /복구 임시 파일 제거 실패/);
+});
