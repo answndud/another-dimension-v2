@@ -118,6 +118,26 @@ pub struct Summary {
     pub last_message: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HistoryPageCursor {
+    pub(crate) version: String,
+    pub(crate) offset: u64,
+    pub(crate) index: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct HistoryPageEntry {
+    pub(crate) index: u64,
+    pub(crate) message: StoredMessage,
+}
+
+#[derive(Debug)]
+pub(crate) struct HistoryPage {
+    pub(crate) entries: Vec<HistoryPageEntry>,
+    pub(crate) version: String,
+    pub(crate) next: Option<HistoryPageCursor>,
+}
+
 #[derive(Debug)]
 pub(crate) struct RestoreMergeSummary {
     pub(crate) total_count: u64,
@@ -399,6 +419,18 @@ impl Drop for RestoreStaging {
 }
 
 impl HistoryReader {
+    pub(crate) fn position(&mut self) -> io::Result<u64> {
+        self.file.stream_position()
+    }
+
+    pub(crate) fn index(&self) -> u64 {
+        self.index
+    }
+
+    pub(crate) fn has_remaining(&mut self) -> io::Result<bool> {
+        Ok(self.file.stream_position()? < self.end)
+    }
+
     #[cfg(test)]
     pub(crate) fn empty_for_test(file: File) -> Self {
         Self {
@@ -523,7 +555,7 @@ fn open_history_reader_from(
     index: u64,
 ) -> io::Result<HistoryReader> {
     let mut reader = open_history_reader(path, key, identity_id, peer_id)?;
-    if reader.legacy || offset < MAGIC.len() as u64 || offset > reader.end {
+    if offset < MAGIC.len() as u64 || offset > reader.end {
         return Err(invalid_data("invalid append refresh offset"));
     }
     reader.file.seek(SeekFrom::Start(offset))?;
@@ -1258,15 +1290,164 @@ impl History {
         let peers = read_index(identity, &identity_id, &directory)?;
         let mut summaries = Vec::with_capacity(peers.len());
         for peer_id in peers {
-            let (_, messages, _) = Self::open(identity, &peer_id)?;
+            let mut reader = Self::reader_for_identity_copy(identity, &peer_id)?;
+            let mut message_count = 0usize;
+            let mut last_message = None;
+            while let Some(message) = reader.next_record()? {
+                message_count = message_count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("history record count overflow"))?;
+                last_message = Some(message.unix_time);
+            }
             summaries.push(Summary {
                 peer_id,
-                message_count: messages.len(),
-                last_message: messages.last().map(|item| item.unix_time),
+                message_count,
+                last_message,
             });
         }
         summaries.sort_by(|left, right| right.last_message.cmp(&left.last_message));
         Ok(summaries)
+    }
+
+    pub(crate) fn read_page(
+        identity: &Identity,
+        peer_id: &str,
+        cursor: Option<&HistoryPageCursor>,
+        limit: usize,
+    ) -> io::Result<HistoryPage> {
+        validate_peer_id(peer_id)?;
+        if limit == 0 || limit > 100 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid history page size",
+            ));
+        }
+        let identity_id = identity.public_id();
+        let peer_id = peer_id.to_ascii_lowercase();
+        let key = identity.storage_key();
+        let path = data_directory()?.join(&identity_id).join(format!(
+            "{}.adlog",
+            opaque_conversation_name(&derive_index_key(&key), &peer_id)
+        ));
+        let operation_lock = conversation_operation_lock(&identity_id, &peer_id)?;
+        let operation_guard = operation_lock
+            .lock()
+            .map_err(|_| io::Error::other("conversation lock unavailable"))?;
+        let file_lock = acquire_conversation_file_lock(identity, &peer_id)?;
+        let file = File::open(&path)?;
+        let version = history_file_version(&file)?;
+        let token = format!(
+            "{:x}-{:x}-{:x}-{:x}",
+            version.device, version.inode, version.length, version.modified_nanos
+        );
+        if cursor.is_some_and(|cursor| cursor.version != token) {
+            unlock_conversation_file(file_lock);
+            drop(operation_guard);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "history changed; reload required",
+            ));
+        }
+        let mut reader = if let Some(cursor) = cursor {
+            open_history_reader_from(
+                path,
+                Zeroizing::new(*key),
+                identity_id,
+                peer_id,
+                cursor.offset,
+                cursor.index,
+            )?
+        } else {
+            open_history_reader(path, Zeroizing::new(*key), identity_id, peer_id)?
+        };
+        unlock_conversation_file(file_lock);
+        drop(operation_guard);
+        let mut entries = Vec::with_capacity(limit);
+        while entries.len() < limit {
+            let index = reader.index();
+            let Some(message) = reader.next_record()? else {
+                break;
+            };
+            entries.push(HistoryPageEntry { index, message });
+        }
+        let next = if reader.has_remaining()? {
+            Some(HistoryPageCursor {
+                version: token.clone(),
+                offset: reader.position()?,
+                index: reader.index(),
+            })
+        } else {
+            None
+        };
+        Ok(HistoryPage {
+            entries,
+            version: token,
+            next,
+        })
+    }
+
+    pub(crate) fn delete_indices_if_version(
+        identity: &Identity,
+        peer_id: &str,
+        expected_version: &str,
+        selected: &HashSet<usize>,
+    ) -> io::Result<Vec<StoredMessage>> {
+        validate_peer_id(peer_id)?;
+        let identity_id = identity.public_id();
+        let peer_id = peer_id.to_ascii_lowercase();
+        let key = identity.storage_key();
+        let directory = data_directory()?.join(&identity_id);
+        let path = directory.join(format!(
+            "{}.adlog",
+            opaque_conversation_name(&derive_index_key(&key), &peer_id)
+        ));
+        let operation_lock = conversation_operation_lock(&identity_id, &peer_id)?;
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| io::Error::other("conversation lock unavailable"))?;
+        let file_lock = acquire_conversation_file_lock(identity, &peer_id)?;
+        let result = (|| {
+            let mut file = File::open(&path)?;
+            let version = history_file_version(&file)?;
+            let token = format!(
+                "{:x}-{:x}-{:x}-{:x}",
+                version.device, version.inode, version.length, version.modified_nanos
+            );
+            if token != expected_version {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "history changed; reload required",
+                ));
+            }
+            let (messages, next_index, _) = read_records(
+                &mut file,
+                Zeroizing::new(*key),
+                &identity_id,
+                &peer_id,
+                false,
+            )?;
+            let kept: Vec<_> = messages
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, item)| (!selected.contains(&index)).then_some(item))
+                .collect();
+            let append_file = OpenOptions::new().read(true).append(true).open(&path)?;
+            let file_version = history_file_version(&append_file)?;
+            let mut history = History {
+                file: append_file,
+                path,
+                key,
+                identity_id,
+                peer_id,
+                next_index,
+                file_version,
+                operation_lock: Arc::clone(&operation_lock),
+            };
+            history.replace_unlocked(&kept)?;
+            Ok(kept)
+        })();
+        unlock_conversation_file(file_lock);
+        result
     }
 
     /// Read a source history for identity migration without repairing or
@@ -3885,6 +4066,46 @@ mod tests {
     }
 
     #[test]
+    fn history_pages_are_bounded_and_stale_selection_is_rejected() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "41".repeat(32);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        for index in 0..237 {
+            history.append(&message(index, "page item")).unwrap();
+        }
+        let first = History::read_page(&identity, &peer, None, 50).unwrap();
+        assert_eq!(first.entries.len(), 50);
+        let cursor = first.next.clone().unwrap();
+        assert_eq!(cursor.index, 50);
+        let second = History::read_page(&identity, &peer, Some(&cursor), 50).unwrap();
+        assert_eq!(second.entries.len(), 50);
+        assert_eq!(second.entries[0].index, 50);
+
+        history
+            .append(&message(238, "concurrent update invalidates selection"))
+            .unwrap();
+        let selected = HashSet::from([0usize]);
+        let stale = History::delete_indices_if_version(&identity, &peer, &first.version, &selected);
+        assert_eq!(stale.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            History::read_page(&identity, &peer, None, 100)
+                .unwrap()
+                .entries
+                .len(),
+            100
+        );
+
+        let fresh = History::read_page(&identity, &peer, None, 100).unwrap();
+        let kept = History::delete_indices_if_version(&identity, &peer, &fresh.version, &selected)
+            .unwrap();
+        assert_eq!(kept.len(), 237);
+        let after = History::read_page(&identity, &peer, None, 100).unwrap();
+        assert_eq!(after.entries[0].message.text, "page item");
+        assert_eq!(History::list(&identity).unwrap()[0].message_count, 237);
+    }
+
+    #[test]
     fn simultaneous_history_handles_append_without_duplicate_indices() {
         let data = IsolatedData::new();
         let (identity, access_code) = Identity::create().unwrap();
@@ -4262,6 +4483,14 @@ mod tests {
             History::estimate_transfer(&identity, &peer_count, &"3d".repeat(32)).unwrap();
         assert_eq!(count, 100_001);
         assert!(estimate > count as u64);
+        let summaries = History::list(&identity).unwrap();
+        assert_eq!(summaries[0].message_count, 100_001);
+        let first_page = History::read_page(&identity, &peer_count, None, 100).unwrap();
+        assert_eq!(first_page.entries.len(), 100);
+        let next_page =
+            History::read_page(&identity, &peer_count, first_page.next.as_ref(), 100).unwrap();
+        assert_eq!(next_page.entries.len(), 100);
+        assert_eq!(next_page.entries[0].index, 100);
         let mut streamed = 0;
         while reader.next_record().unwrap().is_some() {
             streamed += 1;

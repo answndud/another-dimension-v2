@@ -213,7 +213,7 @@
       <button id="contact-export" type="button">상대 확인 백업 저장</button>
       <div class="actions">
         <button id="history-back" type="button">대화 목록</button>
-        <button id="history-export" type="button">TXT 저장</button>
+        <button id="history-export" type="button">현재 페이지 TXT 저장</button>
         <button id="history-backup-export" type="button">암호화 백업 저장</button>
       </div>
       <label for="history-backup-export-password">백업 비밀번호 (선택, 12자 이상)</label>
@@ -226,6 +226,14 @@
       <label for="history-backup-import-password">백업 비밀번호</label>
       <input id="history-backup-import-password" type="password" autocomplete="current-password" maxlength="1024">
       <button id="history-backup-import" type="button">파일 가져오기</button>
+      <label for="message-filter">현재 페이지 검색</label>
+      <input id="message-filter" type="search" autocomplete="off">
+      <div class="actions">
+        <button id="history-page-prev" type="button" disabled>이전 페이지</button>
+        <button id="history-page-next" type="button" disabled>다음 페이지</button>
+        <button id="history-page-reload" type="button">기록 다시 불러오기</button>
+      </div>
+      <p id="history-page-status" class="meta" role="status"></p>
       <div class="panel">
         <h3>이전 신원 백업 재보호</h3>
         <p class="meta">이전 신원 코드와 필요한 백업 비밀번호로 파일을 복호화해 현재 신원용 새 파일을 만듭니다. 새 파일을 저장 위치에서 다시 읽어 확인하기 전까지 원본은 보존됩니다. 확인 후 원본 삭제는 사용자가 직접 선택하고 Finder에서 처리합니다.</p>

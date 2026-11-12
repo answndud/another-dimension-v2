@@ -40,6 +40,10 @@ let sendingMessage = false;
 let selectedHistoryPeer = '';
 let selectedHistoryMessages = [];
 let selectedHistoryIndices = new Set();
+let historyCursorStack = [null];
+let historyNextCursor = null;
+let historyPageVersion = null;
+const historyPageSize = 50;
 let verifiedPeers = new Set();
 let reprotectSourceHandle = null;
 let reprotectSourceName = '';
@@ -230,18 +234,42 @@ function updateSelectionCount() {
 }
 
 async function openHistory(peerId) {
-  const response = await request('/api/history/messages', peerId);
-  if (!response.ok) { message.textContent = '대화 기록을 열지 못했습니다.'; return; }
   selectedHistoryPeer = peerId;
-  selectedHistoryMessages = await response.json();
   selectedHistoryIndices.clear();
+  historyCursorStack = [null];
+  historyNextCursor = null;
+  historyPageVersion = null;
   document.querySelector('#history-peer').textContent = peerId;
   document.querySelector('#contact-reconnect').hidden = !verifiedPeers.has(peerId);
   document.querySelector('#contact-export').hidden = !verifiedPeers.has(peerId);
   messageFilter.value = '';
+  await loadHistoryPage(null);
+  show('history');
+}
+
+async function loadHistoryPage(cursor) {
+  const response = await request('/api/history/messages', JSON.stringify({
+    peerId: selectedHistoryPeer,
+    cursor,
+    limit: historyPageSize,
+  }));
+  if (response.status === 409) {
+    message.textContent = '기록이 바뀌어 선택을 적용할 수 없습니다. 다시 불러와 선택을 갱신하세요.';
+    document.querySelector('#history-page-reload').disabled = false;
+    return false;
+  }
+  if (!response.ok) { message.textContent = '대화 기록을 열지 못했습니다.'; return false; }
+  const page = await response.json();
+  selectedHistoryMessages = page.messages;
+  historyPageVersion = page.version;
+  historyNextCursor = page.nextCursor;
+  const index = historyCursorStack.length - 1;
+  document.querySelector('#history-page-prev').disabled = index === 0;
+  document.querySelector('#history-page-next').disabled = !historyNextCursor;
+  document.querySelector('#history-page-status').textContent = `현재 페이지 ${selectedHistoryMessages.length}개 메시지 · 검색은 현재 페이지에만 적용됩니다.`;
   updateSelectionCount();
   renderHistoryMessages();
-  show('history');
+  return true;
 }
 
 function stopPolling() {
@@ -347,7 +375,7 @@ function updateChatView(snapshot) {
   }
   document.querySelector('#history-restore-request').disabled = snapshot.phase !== 'connected'
     || snapshot.historyRestoreInProgress || (snapshot.historyRestoreOfferCount || 0) > 0
-    || !['idle', 'failed'].includes(restoreState);
+    || !['idle', 'failed', 'completed'].includes(restoreState);
   document.querySelector('#history-restore-accept').disabled = snapshot.historyRestoreInProgress
     || !['awaiting-transfer-consent', 'awaiting-merge-consent'].includes(restoreState)
     || (snapshot.historyRestoreOfferCount || 0) === 0;
@@ -820,6 +848,19 @@ document.querySelector('#close-chat').addEventListener('click', async () => {
 
 historyFilter.addEventListener('input', filterHistoryList);
 messageFilter.addEventListener('input', renderHistoryMessages);
+document.querySelector('#history-page-next').addEventListener('click', async () => {
+  if (!historyNextCursor) return;
+  historyCursorStack.push(historyNextCursor);
+  if (!(await loadHistoryPage(historyNextCursor))) historyCursorStack.pop();
+});
+document.querySelector('#history-page-prev').addEventListener('click', async () => {
+  if (historyCursorStack.length <= 1) return;
+  historyCursorStack.pop();
+  await loadHistoryPage(historyCursorStack[historyCursorStack.length - 1]);
+});
+document.querySelector('#history-page-reload').addEventListener('click', () => {
+  if (selectedHistoryPeer) openHistory(selectedHistoryPeer).catch(() => {});
+});
 document.querySelector('#history-back').addEventListener('click', () => show('active'));
 document.querySelector('#contact-reconnect').addEventListener('click', () => startChat('/api/chat/reconnect', selectedHistoryPeer));
 document.querySelector('#contact-export').addEventListener('click', async () => {
@@ -1185,10 +1226,11 @@ document.querySelector('#delete-selected').addEventListener('click', async () =>
   if (!window.confirm(`선택한 메시지 ${count}개를 이 기기에서 삭제할까요?`)) return;
   const response = await request('/api/history/delete-messages', JSON.stringify({
     peerId: selectedHistoryPeer,
+    version: historyPageVersion,
     indices: [...selectedHistoryIndices]
   }));
   if (response.status === 409) {
-    message.textContent = '먼저 해당 대화의 연결을 종료한 뒤 다시 시도하세요.';
+    message.textContent = (await response.text()) || '기록이 바뀌어 선택을 적용하지 않았습니다. 다시 불러와 선택을 갱신하세요.';
     return;
   }
   if (!response.ok) { message.textContent = '기록을 삭제하지 못했습니다.'; return; }

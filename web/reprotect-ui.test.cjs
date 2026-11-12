@@ -428,6 +428,58 @@ test('actual UI: transfer consent and final merge consent are separate states', 
   assert.equal(h.element('#history-restore-accept').disabled, false);
 });
 
+test('actual UI: history detail loads bounded pages and searches only the current page', async () => {
+  const h = createHarness();
+  const opening = h.evaluate("openHistory('peer-for-pagination')");
+  await new Promise((resolve) => setImmediate(resolve));
+  const firstRequest = h.requestFor('/api/history/messages');
+  assert.deepEqual(JSON.parse(firstRequest.init.body), {
+    peerId: 'peer-for-pagination', cursor: null, limit: 50,
+  });
+  const firstMessages = Array.from({ length: 50 }, (_, index) => ({
+    index, time: index, sender: '상대방', text: `page one ${index}`,
+  }));
+  firstRequest.resolve(response(JSON.stringify({
+    version: 'file-version-1',
+    hasMore: true,
+    nextCursor: { version: 'file-version-1', offset: 500, index: 50 },
+    messages: firstMessages,
+  })));
+  await opening;
+  assert.equal(h.evaluate('selectedHistoryMessages.length'), 50);
+  assert.equal(h.element('#history-page-next').disabled, false);
+  assert.match(h.element('#history-page-status').textContent, /현재 페이지/);
+
+  const next = h.click('#history-page-next');
+  await new Promise((resolve) => setImmediate(resolve));
+  const secondRequest = h.requestFor('/api/history/messages');
+  assert.deepEqual(JSON.parse(secondRequest.init.body), {
+    peerId: 'peer-for-pagination',
+    cursor: { version: 'file-version-1', offset: 500, index: 50 },
+    limit: 50,
+  });
+  secondRequest.resolve(response(JSON.stringify({
+    version: 'file-version-1', hasMore: false, nextCursor: null,
+    messages: [{ index: 50, time: 50, sender: '상대방', text: 'page two' }],
+  })));
+  await next;
+  assert.equal(h.evaluate('selectedHistoryMessages.length'), 1);
+  assert.equal(h.element('#history-page-next').disabled, true);
+});
+
+test('actual UI: stale history selection reports the reload requirement', async () => {
+  const h = createHarness();
+  h.window.confirm = () => true;
+  h.evaluate("selectedHistoryPeer = 'peer'; historyPageVersion = 'old-version'; selectedHistoryIndices.add(4)");
+  const deletion = h.click('#delete-selected');
+  await new Promise((resolve) => setImmediate(resolve));
+  const request = h.requestFor('/api/history/delete-messages');
+  assert.equal(JSON.parse(request.init.body).version, 'old-version');
+  request.resolve(response('history changed; reload before applying selection', 409));
+  await deletion;
+  assert.equal(h.element('#message').textContent, 'history changed; reload before applying selection');
+});
+
 test('actual UI: staging cleanup failure remains visible after disconnect', () => {
   const h = createHarness();
   h.evaluate(`updateChatView({

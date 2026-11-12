@@ -3642,22 +3642,66 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some(identity) = state.identity.as_ref() else {
             return reject(&mut stream, "401 Unauthorized");
         };
-        let (_, messages, _) = match history::History::open(identity, body) {
-            Ok(history) => history,
+        let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Some(peer_id) = request.get("peerId").and_then(serde_json::Value::as_str) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let limit = request
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(50);
+        let Ok(limit) = usize::try_from(limit) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        if limit == 0 || limit > 100 {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        let cursor = match request.get("cursor") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => {
+                let Some(version) = value.get("version").and_then(serde_json::Value::as_str) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let (Some(offset), Some(index)) = (
+                    value.get("offset").and_then(serde_json::Value::as_u64),
+                    value.get("index").and_then(serde_json::Value::as_u64),
+                ) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                Some(history::HistoryPageCursor {
+                    version: version.to_owned(),
+                    offset,
+                    index,
+                })
+            }
+        };
+        let page = match history::History::read_page(identity, peer_id, cursor.as_ref(), limit) {
+            Ok(page) => page,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return reject(&mut stream, "409 Conflict")
+            }
             Err(_) => return reject(&mut stream, "400 Bad Request"),
         };
-        let payload: Vec<_> = messages
-            .into_iter()
-            .enumerate()
-            .map(|(index, item)| {
+        let payload = serde_json::json!({
+            "version": page.version,
+            "hasMore": page.next.is_some(),
+            "nextCursor": page.next.map(|cursor| serde_json::json!({
+                "version": cursor.version,
+                "offset": cursor.offset,
+                "index": cursor.index,
+            })),
+            "messages": page.entries.into_iter().map(|entry| {
+                let item = entry.message;
                 serde_json::json!({
-                    "index": index,
+                    "index": entry.index,
                     "time": item.unix_time,
                     "sender": chat_entry(item.clone()).sender,
                     "text": chat_entry(item).text
                 })
-            })
-            .collect();
+            }).collect::<Vec<_>>(),
+        });
         return respond(
             &mut stream,
             "200 OK",
@@ -3676,7 +3720,12 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             return reject(&mut stream, "400 Bad Request");
         };
         if peer_chat_active(&state, peer_id) {
-            return reject(&mut stream, "409 Conflict");
+            return respond(
+                &mut stream,
+                "409 Conflict",
+                "text/plain; charset=utf-8",
+                b"disconnect the conversation and reload history before applying selection",
+            );
         }
         let Some(indices) = payload.get("indices").and_then(serde_json::Value::as_array) else {
             return reject(&mut stream, "400 Bad Request");
@@ -3691,18 +3740,23 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             };
             selected.insert(index);
         }
-        let (mut history, messages, _) = match history::History::open(identity, peer_id) {
-            Ok(history) => history,
-            Err(_) => return reject(&mut stream, "400 Bad Request"),
+        let Some(version) = payload.get("version").and_then(serde_json::Value::as_str) else {
+            return reject(&mut stream, "400 Bad Request");
         };
-        let kept: Vec<_> = messages
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, item)| (!selected.contains(&index)).then_some(item))
-            .collect();
-        if let Err(_) = history.replace(&kept) {
-            return reject(&mut stream, "500 Internal Server Error");
-        }
+        let kept = match history::History::delete_indices_if_version(
+            identity, peer_id, version, &selected,
+        ) {
+            Ok(kept) => kept,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return respond(
+                    &mut stream,
+                    "409 Conflict",
+                    "text/plain; charset=utf-8",
+                    b"history changed; reload before applying selection",
+                )
+            }
+            Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+        };
         update_closed_chat_history(&state, peer_id, Some(&kept));
         return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
     }
