@@ -844,6 +844,18 @@ mod send_tests {
         );
         assert!(complete.contains("\"historyRestoreState\":\"completed\""));
         assert!(complete.contains("merge complete"));
+        chat_update(&operation, |snapshot| {
+            snapshot.history_restore_state = "failed";
+            snapshot.history_restore_status = Some("injected merge failure".to_owned());
+        });
+        let failure = call_test_api(
+            &state,
+            "/api/chat/status",
+            "restore-operation",
+            "test-session",
+        );
+        assert!(failure.contains("\"historyRestoreState\":\"failed\""));
+        assert!(failure.contains("injected merge failure"));
     }
 
     #[test]
