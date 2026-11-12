@@ -67,8 +67,16 @@ enum ChatCommand {
 
 struct ChatOperation {
     snapshot: Mutex<ChatSnapshot>,
+    message_reader: Mutex<Option<MessagePageReader>>,
     sender: Sender<ChatCommand>,
     cancelled: Arc<AtomicBool>,
+}
+
+struct MessagePageReader {
+    peer_id: String,
+    epoch: u64,
+    next_index: usize,
+    reader: history::HistoryReader,
 }
 
 struct ChatSnapshot {
@@ -78,6 +86,7 @@ struct ChatSnapshot {
     error: Option<String>,
     storage_error: Option<String>,
     messages: Vec<ChatEntry>,
+    message_count: usize,
     relay_ack: Option<String>,
     pending_sends: usize,
     identity_transition: Option<Vec<String>>,
@@ -122,6 +131,8 @@ struct HistorySyncSender {
     test_messages: Option<Vec<history::StoredMessage>>,
     #[cfg(test)]
     test_next_record: usize,
+    #[cfg(test)]
+    test_generated: Option<(usize, usize)>,
 }
 
 impl HistorySyncSender {
@@ -139,6 +150,8 @@ impl HistorySyncSender {
             test_messages: None,
             #[cfg(test)]
             test_next_record: 0,
+            #[cfg(test)]
+            test_generated: None,
         }
     }
 
@@ -151,12 +164,35 @@ impl HistorySyncSender {
         sender
     }
 
+    #[cfg(test)]
+    fn for_generated_test(request_id: String, count: usize, text_bytes: usize) -> Self {
+        let file = File::open("/dev/null").expect("null file for test reader");
+        let reader = history::HistoryReader::empty_for_test(file);
+        let mut sender = Self::new(request_id, reader, count);
+        sender.test_generated = Some((count, text_bytes));
+        sender
+    }
+
     fn next_record(&mut self) -> io::Result<Option<history::StoredMessage>> {
         #[cfg(test)]
         if let Some(messages) = self.test_messages.as_ref() {
             let item = messages.get(self.test_next_record).cloned();
             self.test_next_record += usize::from(item.is_some());
             return Ok(item);
+        }
+        #[cfg(test)]
+        if let Some((count, text_bytes)) = self.test_generated {
+            if self.test_next_record >= count {
+                return Ok(None);
+            }
+            let index = self.test_next_record;
+            self.test_next_record += 1;
+            return Ok(Some(history::StoredMessage {
+                unix_time: index as u64,
+                sender: history::MessageSender::Me,
+                text: "x".repeat(text_bytes),
+                proof: None,
+            }));
         }
         self.reader.next_record()
     }
@@ -447,6 +483,65 @@ fn chat_entry(item: history::StoredMessage) -> ChatEntry {
     }
 }
 
+fn read_chat_history_page(
+    state: &mut Option<MessagePageReader>,
+    identity: &Identity,
+    peer_id: &str,
+    epoch: u64,
+    cursor: usize,
+    expected_count: usize,
+    limit: usize,
+) -> io::Result<Vec<history::StoredMessage>> {
+    let limit = limit.min(256);
+    let reset = state.as_ref().is_none_or(|page| {
+        page.peer_id != peer_id || page.epoch != epoch || page.next_index != cursor
+    });
+    if reset {
+        let mut reader = history::History::reader_for_identity_copy(identity, peer_id)?;
+        for _ in 0..cursor {
+            if reader.next_record()?.is_none() {
+                break;
+            }
+        }
+        *state = Some(MessagePageReader {
+            peer_id: peer_id.to_owned(),
+            epoch,
+            next_index: cursor,
+            reader,
+        });
+    }
+    let mut result = Vec::with_capacity(limit);
+    if let Some(page) = state.as_mut() {
+        while result.len() < limit {
+            match page.reader.next_record()? {
+                Some(message) => result.push(message),
+                None => break,
+            }
+        }
+    }
+    if result.len() < limit && cursor.saturating_add(result.len()) < expected_count {
+        let mut reader = history::History::reader_for_identity_copy(identity, peer_id)?;
+        for _ in 0..cursor.saturating_add(result.len()) {
+            if reader.next_record()?.is_none() {
+                break;
+            }
+        }
+        while result.len() < limit {
+            match reader.next_record()? {
+                Some(message) => result.push(message),
+                None => break,
+            }
+        }
+        if let Some(page) = state.as_mut() {
+            page.reader = reader;
+        }
+    }
+    if let Some(page) = state.as_mut() {
+        page.next_index = cursor.saturating_add(result.len());
+    }
+    Ok(result)
+}
+
 fn identity_event(kind: &str, previous_id: &str, current_id: &str) -> history::StoredMessage {
     history::StoredMessage {
         unix_time: now_seconds(),
@@ -466,6 +561,30 @@ fn rejected_message(pending_events: &mut HashSet<String>, event_id: &str) -> boo
 #[cfg(test)]
 mod send_tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDataDirectory(std::path::PathBuf);
+
+    impl TestDataDirectory {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("ad2-sync-test-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            history::set_test_data_directory(Some(path.clone()));
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDataDirectory {
+        fn drop(&mut self) {
+            history::set_test_data_directory(None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn identity_transition_control_and_history_marker_roundtrip() {
@@ -545,6 +664,108 @@ mod send_tests {
         }
         assert!(received > 4_097_usize.div_ceil(SYNC_CHUNK_RECORDS));
         receiver.finish(&request_id, 4_097).unwrap();
+    }
+
+    #[test]
+    fn history_sync_streams_large_offers_through_chunks_staging_and_final_merge() {
+        let _data = TestDataDirectory::new();
+        let (sender_identity, _) = Identity::create().unwrap();
+        let sender_key = sender_identity.public_key();
+        for (case, (count, text_bytes)) in [(100_001usize, 1usize), (17_000, 4_096)]
+            .into_iter()
+            .enumerate()
+        {
+            let (receiver_identity, _) = Identity::create().unwrap();
+            let peer_id = encode_hex(&sender_key);
+            let request_id = format!("{:064x}", 0x600 + case);
+            let mut sender =
+                HistorySyncSender::for_generated_test(request_id.clone(), count, text_bytes);
+            let mut receiver = HistorySyncReceiver::default();
+            receiver.begin(&request_id, count).unwrap();
+            let mut staging =
+                history::RestoreStaging::create(&receiver_identity, &peer_id, &request_id).unwrap();
+            let (mut current_history, _, _) =
+                history::History::open(&receiver_identity, &peer_id).unwrap();
+            let mut chunks = 0usize;
+            let mut first_chunk_count = None;
+            loop {
+                let (chunk, frames) = sender.next_chunk().unwrap().unwrap();
+                assert!(!frames.is_empty());
+                assert!(frames.len() <= SYNC_CHUNK_RECORDS);
+                assert!(frames.iter().map(Vec::len).sum::<usize>() <= SYNC_CHUNK_BYTES);
+                first_chunk_count.get_or_insert(frames.len());
+                receiver
+                    .begin_chunk(&request_id, chunk, frames.len())
+                    .unwrap();
+                for frame in frames {
+                    let (frame_id, frame_chunk, payload) =
+                        history::transfer_chunk_metadata(&frame).unwrap();
+                    assert_eq!(frame_id, request_id);
+                    assert_eq!(frame_chunk, chunk);
+                    receiver
+                        .record(&request_id, frame_chunk, frame.len())
+                        .unwrap();
+                    let item = history::decode_transfer(
+                        &receiver_identity,
+                        &peer_id,
+                        &sender_key,
+                        payload,
+                    )
+                    .unwrap();
+                    staging.append_verified(&item).unwrap();
+                }
+                receiver.end_chunk(&request_id, chunk).unwrap();
+                if chunks == 0 {
+                    current_history
+                        .append(&history::StoredMessage {
+                            unix_time: count as u64 + 1,
+                            sender: history::MessageSender::Me,
+                            text: "arrived during transfer".to_owned(),
+                            proof: None,
+                        })
+                        .unwrap();
+                }
+                assert!(!sender.acknowledge(&"ff".repeat(32), chunk).unwrap());
+                let finished = sender.acknowledge(&request_id, chunk).unwrap();
+                chunks += 1;
+                if finished {
+                    break;
+                }
+            }
+            receiver.finish(&request_id, count).unwrap();
+            assert!(chunks > count / SYNC_CHUNK_RECORDS);
+            if text_bytes > 1 {
+                assert!(first_chunk_count.unwrap() < SYNC_CHUNK_RECORDS);
+            }
+            staging.finish().unwrap();
+            if text_bytes > 1 {
+                assert!(staging.storage_bytes().unwrap() > 64 * 1024 * 1024);
+            }
+            let summary = current_history
+                .merge_restore_staging(&receiver_identity, &mut staging)
+                .unwrap();
+            assert_eq!(summary.imported_count, count as u64);
+            assert_eq!(summary.total_count, count as u64 + 1);
+            assert!(summary.peak_sort_buffer_bytes <= 2 * 1024 * 1024);
+            let mut page_state = None;
+            let mut cursor = 0usize;
+            while cursor < summary.total_count as usize {
+                let page = read_chat_history_page(
+                    &mut page_state,
+                    &receiver_identity,
+                    &peer_id,
+                    case as u64 + 1,
+                    cursor,
+                    summary.total_count as usize,
+                    256,
+                )
+                .unwrap();
+                assert!(!page.is_empty());
+                cursor += page.len();
+            }
+            assert_eq!(cursor, count + 1);
+            staging.cleanup().unwrap();
+        }
     }
 
     #[test]
@@ -710,7 +931,7 @@ fn spawn_chat_worker(
                 return;
             }
         };
-        let result = (|| -> Result<(RelaySession, Option<history::History>, Vec<ChatEntry>, Option<String>, [u8; 32], String), String> {
+        let result = (|| -> Result<(RelaySession, Option<history::History>, Vec<ChatEntry>, usize, Option<String>, [u8; 32], String), String> {
             let invite = InviteCode::parse(&code).ok_or("초대 코드를 확인하세요.")?;
             let mut rendezvous = match role {
                 RoleForChat::Create => RelayRendezvous::create(DEFAULT_RELAY, &invite, tor_socks),
@@ -771,21 +992,18 @@ fn spawn_chat_worker(
                 .map_err(|_| "상대 확인 정보를 저장하지 못했습니다. 기존 확인 기록을 확인하세요.".to_owned())?;
             session
             };
-            let (history, entries, storage_error, pending_previous_ids) = match history::History::open(&identity, &peer_id) {
-                Ok((history, stored, recovered_partial)) => {
+            let (history, entries, message_count, storage_error, pending_previous_ids) = match history::History::open_for_chat(&identity, &peer_id) {
+                Ok((history, message_count, recovered_partial)) => {
                     let (pending, link_error) = match history::pending_local_identity_links(&identity, &peer_id, &previous_identity_ids) {
                         Ok(pending) => (pending, None),
                         Err(error) => (previous_identity_ids.clone(), Some(format!("이전 신원 연결 정보를 읽지 못했습니다. 재확인이 필요합니다: {error}"))),
                     };
-                    let entries = stored
-                        .into_iter()
-                        .map(chat_entry)
-                        .collect();
+                    let entries = Vec::new();
                     let warning = link_error.or_else(|| recovered_partial
                         .then(|| "대화 기록의 마지막 불완전 항목을 제거했습니다.".to_owned()));
-                    (Some(history), entries, warning, pending)
+                    (Some(history), entries, message_count, warning, pending)
                 }
-                Err(_) => (None, Vec::new(), Some("대화 기록을 열지 못했습니다. 이번 대화는 프로그램을 종료하면 사라질 수 있습니다.".to_owned()), previous_identity_ids.clone()),
+                Err(_) => (None, Vec::new(), 0, Some("대화 기록을 열지 못했습니다. 이번 대화는 프로그램을 종료하면 사라질 수 있습니다.".to_owned()), previous_identity_ids.clone()),
             };
             if !pending_previous_ids.is_empty() {
                 let announcement = chat_control(serde_json::json!({
@@ -794,13 +1012,14 @@ fn spawn_chat_worker(
                 }));
                 session.send(&announcement).map_err(|_| "신원 변경 안내를 상대에게 보내지 못했습니다.".to_owned())?;
             }
-            Ok((session, history, entries, storage_error, peer_key, peer_id))
+            Ok((session, history, entries, message_count, storage_error, peer_key, peer_id))
         })();
 
         let (mut session, mut history, peer_key, peer_id) = match result {
-            Ok((session, history, messages, storage_error, peer_key, peer_id)) => {
+            Ok((session, history, messages, message_count, storage_error, peer_key, peer_id)) => {
                 chat_update(&operation, |snapshot| {
                     snapshot.messages = messages;
+                    snapshot.message_count = message_count;
                     snapshot.storage_error = storage_error;
                     snapshot.phase = "connected";
                 });
@@ -875,6 +1094,7 @@ fn spawn_chat_worker(
                     "상대 응답이 45초 동안 없어 연결을 종료했습니다.",
                     !pending_events.is_empty(),
                 );
+                discard_restore_staging(&mut pending_restore, &operation);
                 return;
             }
             if now.duration_since(last_heartbeat) >= PEER_HEARTBEAT_INTERVAL {
@@ -885,6 +1105,7 @@ fn spawn_chat_worker(
                         "relay 연결이 끊겼습니다.",
                         !pending_events.is_empty(),
                     );
+                    discard_restore_staging(&mut pending_restore, &operation);
                     return;
                 }
                 last_heartbeat = Instant::now();
@@ -932,6 +1153,8 @@ fn spawn_chat_worker(
                                     history = None;
                                 }
                                 chat_update(&operation, |snapshot| {
+                                    snapshot.message_count =
+                                        snapshot.message_count.saturating_add(1);
                                     snapshot.messages.push(ChatEntry {
                                         unix_time: entry.unix_time,
                                         sender: "나",
@@ -953,6 +1176,8 @@ fn spawn_chat_worker(
                                 drop(history.take());
                                 chat_update(&operation, |snapshot| {
                                     snapshot.phase = "disconnected";
+                                    snapshot.message_count =
+                                        snapshot.message_count.saturating_add(1);
                                     snapshot.messages.push(ChatEntry {
                                         unix_time: entry.unix_time,
                                         sender: "나",
@@ -967,6 +1192,7 @@ fn spawn_chat_worker(
                                     });
                                 });
                                 let _ = processed.send(());
+                                discard_restore_staging(&mut pending_restore, &operation);
                                 return;
                             }
                         }
@@ -993,6 +1219,7 @@ fn spawn_chat_worker(
                                             messages.into_iter().map(chat_entry).collect();
                                         chat_update(&operation, |snapshot| {
                                             snapshot.messages = entries;
+                                            snapshot.message_count = snapshot.messages.len();
                                             snapshot.identity_transition = None;
                                             snapshot.message_epoch =
                                                 snapshot.message_epoch.wrapping_add(1);
@@ -1090,46 +1317,19 @@ fn spawn_chat_worker(
                             continue;
                         }
                         let mut resolved = if accept {
-                            match (history.as_mut(), operation.snapshot.lock().ok()) {
-                                (Some(current), _)
-                                    if pending_restore
-                                        .as_ref()
-                                        .is_some_and(|stage| stage.count() > 0) =>
-                                {
-                                    match history::History::read_for_identity_copy(
-                                        &identity, &peer_id,
-                                    ) {
-                                        Ok((existing, false)) => {
-                                            let offered =
-                                                pending_restore.as_mut().expect("checked staging");
-                                            let mut messages = Vec::new();
-                                            let read_result = (|| -> io::Result<()> {
-                                                offered.rewind()?;
-                                                while let Some(message) = offered.next_record()? {
-                                                    messages.push(message);
-                                                }
-                                                offered.rewind()?;
-                                                Ok(())
-                                            })(
-                                            );
-                                            match read_result.and_then(|()| history::merge_restored(&existing, &messages)) {
-                                            Ok(merged) => current.replace(&merged).map(|_| {
-                                                let restored_count = merged.len().saturating_sub(existing.len());
-                                                chat_update(&operation, |snapshot| {
-                                                    snapshot.messages = merged.into_iter().map(chat_entry).collect();
-                                                    snapshot.message_epoch = snapshot.message_epoch.wrapping_add(1);
-                                                    snapshot.history_restore_status = Some(format!("{restored_count}개 메시지를 복원했습니다. 서명이 없는 기존 형식 항목은 검증되지 않았습니다."));
-                                                });
-                                            }),
-                                            Err(error) => Err(error),
-                                          }
-                                        }
-                                        Ok((_, true)) => Err(io::Error::other(
-                                            "current history has an incomplete record",
-                                        )),
-                                        Err(error) => Err(error),
-                                    }
-                                }
+                            match (history.as_mut(), pending_restore.as_mut()) {
+                                (Some(current), Some(staging)) if staging.count() > 0 => current
+                                    .merge_restore_staging(&identity, staging)
+                                    .map(|summary| {
+                                        chat_update(&operation, |snapshot| {
+                                            snapshot.message_count = summary.total_count.min(usize::MAX as u64) as usize;
+                                            snapshot.message_epoch = snapshot.message_epoch.wrapping_add(1);
+                                            snapshot.history_restore_status = Some(format!(
+                                                "{}개 메시지를 복원했습니다. 서명 없는 기존 메시지는 완전한 중복 판정이 불가능합니다.",
+                                                summary.imported_count
+                                            ));
+                                        });
+                                    }),
                                 _ => Err(io::Error::other("no pending history offer")),
                             }
                         } else {
@@ -1208,6 +1408,7 @@ fn spawn_chat_worker(
                                 Err(_) => {
                                     drop(history.take());
                                     mark_chat_disconnected(&operation, "상대 메시지의 발신 서명 또는 형식 검증에 실패했습니다. 기록은 가져오지 않았습니다.", false);
+                                    discard_restore_staging(&mut pending_restore, &operation);
                                     return;
                                 }
                             };
@@ -1219,6 +1420,7 @@ fn spawn_chat_worker(
                                 history = None;
                             }
                             chat_update(&operation, |snapshot| {
+                                snapshot.message_count = snapshot.message_count.saturating_add(1);
                                 snapshot.messages.push(chat_entry(entry));
                                 if save_error.is_some() {
                                     snapshot.storage_error =
@@ -1326,6 +1528,7 @@ fn spawn_chat_worker(
                                         "상대의 내부 연결 안내 형식이 잘못되었습니다.".to_owned(),
                                     );
                                 });
+                                discard_restore_staging(&mut pending_restore, &operation);
                                 return;
                             }
                         };
@@ -1342,6 +1545,7 @@ fn spawn_chat_worker(
                                             "상대의 이전 신원 정보가 잘못되었습니다.",
                                             false,
                                         );
+                                        discard_restore_staging(&mut pending_restore, &operation);
                                         return;
                                     };
                                     let mut parsed = Vec::new();
@@ -1356,6 +1560,10 @@ fn spawn_chat_worker(
                                                 "상대의 이전 신원 정보가 잘못되었습니다.",
                                                 false,
                                             );
+                                            discard_restore_staging(
+                                                &mut pending_restore,
+                                                &operation,
+                                            );
                                             return;
                                         }
                                         parsed.push(id.to_ascii_lowercase());
@@ -1367,6 +1575,7 @@ fn spawn_chat_worker(
                                             "상대의 이전 신원 정보가 잘못되었습니다.",
                                             false,
                                         );
+                                        discard_restore_staging(&mut pending_restore, &operation);
                                         return;
                                     }
                                     let current_peer_id = operation
@@ -1410,6 +1619,7 @@ fn spawn_chat_worker(
                                             "상대의 신원 변경 응답이 잘못되었습니다.",
                                             false,
                                         );
+                                        discard_restore_staging(&mut pending_restore, &operation);
                                         return;
                                     };
                                     if !previous_identity_ids.contains(&previous_id) {
@@ -1620,23 +1830,13 @@ fn spawn_chat_worker(
                                             snapshot.history_restore_status = Some("상대 기록 제안의 시작 정보가 잘못되었습니다. 로컬 기록은 변경하지 않았습니다.".to_owned());
                                         });
                                     } else {
-                                        let aliases = history::History::read_for_identity_copy(
-                                            &identity, &peer_id,
-                                        )
-                                        .and_then(|(messages, incomplete)| {
-                                            if incomplete {
-                                                return Err(io::Error::other(
-                                                    "current history has an incomplete record",
-                                                ));
-                                            }
-                                            history::linked_identity_keys(
-                                                &identity,
-                                                &messages,
-                                                &identity.public_id(),
-                                                &peer_id,
-                                                &previous_identity_ids,
-                                            )
-                                        });
+                                        let aliases = history::linked_identity_keys(
+                                            &identity,
+                                            &[],
+                                            &identity.public_id(),
+                                            &peer_id,
+                                            &previous_identity_ids,
+                                        );
                                         let Ok((local_aliases, peer_aliases)) = aliases else {
                                             let _ = session.send(&chat_control(serde_json::json!({
                                                 "type": "history-sync-cancel", "requestId": request_id,
@@ -1980,6 +2180,7 @@ fn spawn_chat_worker(
                                         "알 수 없는 내부 연결 안내를 받았습니다.",
                                         false,
                                     );
+                                    discard_restore_staging(&mut pending_restore, &operation);
                                     return;
                                 }
                             }
@@ -2006,6 +2207,8 @@ fn spawn_chat_worker(
                                     notify_incoming_message();
                                 }
                                 chat_update(&operation, |snapshot| {
+                                    snapshot.message_count =
+                                        snapshot.message_count.saturating_add(1);
                                     snapshot.messages.push(ChatEntry {
                                         unix_time: entry.unix_time,
                                         sender: "상대방",
@@ -2023,6 +2226,7 @@ fn spawn_chat_worker(
                                     snapshot.error =
                                         Some("상대 메시지 형식이 잘못되었습니다.".to_owned());
                                 });
+                                discard_restore_staging(&mut pending_restore, &operation);
                                 return;
                             }
                         }
@@ -2068,6 +2272,7 @@ fn spawn_chat_worker(
                             snapshot.error = Some("relay 연결이 끊겨 마지막 메시지의 전송 결과를 확인하지 못했습니다. 로컬 기록에 보존되어 있으며 다시 보내면 중복될 수 있습니다.".to_owned());
                         }
                     });
+                    discard_restore_staging(&mut pending_restore, &operation);
                     return;
                 }
             }
@@ -2158,6 +2363,7 @@ fn update_closed_chat_history(
                     .cloned()
                     .map(chat_entry)
                     .collect();
+                snapshot.message_count = snapshot.messages.len();
             }
         }
     }
@@ -2701,6 +2907,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 error: None,
                 storage_error: None,
                 messages: Vec::new(),
+                message_count: 0,
                 relay_ack: None,
                 pending_sends: 0,
                 identity_transition: None,
@@ -2716,6 +2923,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 history_restore_status: None,
                 message_epoch: 0,
             }),
+            message_reader: Mutex::new(None),
             sender,
             cancelled: Arc::new(AtomicBool::new(false)),
         });
@@ -2783,7 +2991,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 "signed": entry.signed
             })).collect::<Vec<_>>(),
             "messageEpoch": snapshot.message_epoch,
-            "messageCount": snapshot.messages.len()
+            "messageCount": snapshot.message_count
         })
         .to_string();
         return respond(
@@ -3011,18 +3219,49 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Ok(snapshot) = operation.snapshot.lock() else {
             return reject(&mut stream, "503 Service Unavailable");
         };
-        let messages: Vec<_> = snapshot
+        let peer_id = snapshot.peer_id.clone();
+        let epoch = snapshot.message_epoch;
+        let message_count = snapshot.message_count;
+        let fallback = snapshot
             .messages
             .iter()
             .skip(cursor)
-            .map(|message| {
-                serde_json::json!({
-                    "time": message.unix_time,
-                    "sender": message.sender,
-                    "text": message.text
+            .take(256)
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(snapshot);
+        let messages: Vec<_> = if let (Some(identity), Some(peer_id)) =
+            (state.identity.as_ref().cloned(), peer_id.as_deref())
+        {
+            let Ok(mut reader_state) = operation.message_reader.lock() else {
+                return reject(&mut stream, "503 Service Unavailable");
+            };
+            match read_chat_history_page(
+                &mut reader_state,
+                &identity,
+                peer_id,
+                epoch,
+                cursor,
+                message_count,
+                256,
+            ) {
+                    Ok(page) => page.iter().map(|message| serde_json::json!({
+                        "time": message.unix_time,
+                        "sender": if message.sender == history::MessageSender::Me { "나" } else { "상대방" },
+                        "text": message.text
+                    })).collect(),
+                    Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+            }
+        } else {
+            fallback
+                .iter()
+                .map(|message| {
+                    serde_json::json!({
+                        "time": message.unix_time, "sender": message.sender, "text": message.text
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        };
         return respond(
             &mut stream,
             "200 OK",

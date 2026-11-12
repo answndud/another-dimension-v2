@@ -8,11 +8,12 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::{create_dir_all, rename, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 8] = b"ADLOG2\0\0";
@@ -36,30 +37,46 @@ const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
 const BACKUP_SALT_BYTES: usize = 16;
 pub(crate) const IDENTITY_EVENT_PREFIX: &str = "[AD2-IDENTITY-EVENT/1] ";
 static INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static CONVERSATION_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+const RESTORE_SORT_RUN_RECORDS: usize = 512;
+const RESTORE_SORT_RUN_BYTES: usize = 2 * 1024 * 1024;
+const RESTORE_MERGE_FAN_IN: usize = 16;
 #[cfg(test)]
 thread_local! {
     static TEST_DATA_DIRECTORY: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-    static TEST_FAILURES: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static TEST_FAILURES: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
-const FAIL_INDEX_WRITE: u8 = 1;
+const FAIL_INDEX_WRITE: u16 = 1;
 #[cfg(test)]
-const FAIL_DELETE_RESTORE: u8 = 2;
+const FAIL_DELETE_RESTORE: u16 = 2;
 #[cfg(test)]
-const FAIL_ROLLBACK_REPLACE: u8 = 8;
+const FAIL_ROLLBACK_REPLACE: u16 = 8;
 #[cfg(test)]
-const FAIL_LINKED_STORE: u8 = 16;
+const FAIL_LINKED_STORE: u16 = 16;
 #[cfg(test)]
-const FAIL_HISTORY_REPLACE_ONCE: u8 = 32;
+const FAIL_HISTORY_REPLACE_ONCE: u16 = 32;
+#[cfg(test)]
+const FAIL_RESTORE_INDEX: u16 = 64;
+#[cfg(test)]
+const FAIL_RESTORE_OUTPUT: u16 = 128;
+#[cfg(test)]
+const FAIL_RESTORE_RENAME: u16 = 256;
+#[cfg(test)]
+const FAIL_RESTORE_CLEANUP_ONCE: u16 = 512;
+#[cfg(test)]
+const FAIL_RESTORE_STAGE_WRITE: u16 = 1024;
+#[cfg(test)]
+const FAIL_RESTORE_RESULT_CLEANUP: u16 = 2048;
 
 #[cfg(test)]
-fn test_failure(failure: u8) -> bool {
+fn test_failure(failure: u16) -> bool {
     TEST_FAILURES.with(|failures| failures.get() & failure != 0)
 }
 
 #[cfg(test)]
-fn test_failure_once(failure: u8) -> bool {
+fn test_failure_once(failure: u16) -> bool {
     TEST_FAILURES.with(|failures| {
         let current = failures.get();
         if current & failure == 0 {
@@ -100,6 +117,13 @@ pub struct Summary {
     pub last_message: Option<u64>,
 }
 
+#[derive(Debug)]
+pub(crate) struct RestoreMergeSummary {
+    pub(crate) total_count: u64,
+    pub(crate) imported_count: u64,
+    pub(crate) peak_sort_buffer_bytes: usize,
+}
+
 pub struct History {
     file: File,
     path: PathBuf,
@@ -107,6 +131,7 @@ pub struct History {
     identity_id: String,
     peer_id: String,
     next_index: u64,
+    operation_lock: Arc<Mutex<()>>,
 }
 
 /// Sequential, non-repairing view of a history file. The captured file length
@@ -119,6 +144,8 @@ pub(crate) struct HistoryReader {
     peer_id: String,
     index: u64,
     end: u64,
+    valid_end: u64,
+    truncated: bool,
     legacy: bool,
 }
 
@@ -200,6 +227,10 @@ impl RestoreStaging {
     pub(crate) fn append_verified(&mut self, message: &StoredMessage) -> io::Result<()> {
         if self.finished {
             return Err(invalid_data("restore staging is already finished"));
+        }
+        #[cfg(test)]
+        if test_failure(FAIL_RESTORE_STAGE_WRITE) {
+            return Err(io::Error::other("injected restore staging write failure"));
         }
         let plaintext = encode_history_plain(message)?;
         let nonce = random_nonce()?;
@@ -311,7 +342,16 @@ impl RestoreStaging {
         self.count
     }
 
+    #[cfg(test)]
+    pub(crate) fn storage_bytes(&self) -> io::Result<u64> {
+        self.file.metadata().map(|metadata| metadata.len())
+    }
+
     pub(crate) fn cleanup(mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if test_failure_once(FAIL_RESTORE_CLEANUP_ONCE) {
+            return Err(io::Error::other("injected restore staging cleanup failure"));
+        }
         std::fs::remove_dir_all(&self.directory)?;
         self.cleaned = true;
         Ok(())
@@ -336,6 +376,8 @@ impl HistoryReader {
             peer_id: "11".repeat(32),
             index: 0,
             end: 0,
+            valid_end: 0,
+            truncated: false,
             legacy: false,
         }
     }
@@ -343,7 +385,17 @@ impl HistoryReader {
     pub(crate) fn rewind(&mut self) -> io::Result<()> {
         self.file.seek(SeekFrom::Start(MAGIC.len() as u64))?;
         self.index = 0;
+        self.valid_end = MAGIC.len() as u64;
+        self.truncated = false;
         Ok(())
+    }
+
+    fn valid_end(&self) -> u64 {
+        self.valid_end
+    }
+
+    fn was_truncated(&self) -> bool {
+        self.truncated
     }
 
     pub(crate) fn next_record(&mut self) -> io::Result<Option<StoredMessage>> {
@@ -352,6 +404,7 @@ impl HistoryReader {
             return Ok(None);
         }
         if position > self.end || self.end - position < 4 {
+            self.truncated = true;
             return Err(invalid_data("history snapshot ends in a partial record"));
         }
         let mut length = [0; 4];
@@ -359,9 +412,12 @@ impl HistoryReader {
         let length = u32::from_be_bytes(length) as usize;
         if !(NONCE_BYTES + 16 + 13..=NONCE_BYTES + 16 + 16 + MAX_MESSAGE_BYTES + 144)
             .contains(&length)
-            || self.end - position < 4 + length as u64
         {
             return Err(invalid_data("invalid record in history snapshot"));
+        }
+        if self.end - position < 4 + length as u64 {
+            self.truncated = true;
+            return Err(invalid_data("history snapshot ends in a partial record"));
         }
         let mut record = vec![0; length];
         self.file.read_exact(&mut record)?;
@@ -389,11 +445,282 @@ impl HistoryReader {
             .index
             .checked_add(1)
             .ok_or_else(|| invalid_data("history record index overflow"))?;
+        self.valid_end = self.file.stream_position()?;
         Ok(Some(message))
     }
 }
 
+fn open_history_reader(
+    path: PathBuf,
+    key: Zeroizing<[u8; 32]>,
+    identity_id: String,
+    peer_id: String,
+) -> io::Result<HistoryReader> {
+    let mut file = File::open(path)?;
+    let end = file.metadata()?.len();
+    if end < MAGIC.len() as u64 {
+        return Err(invalid_data("history snapshot header is incomplete"));
+    }
+    let mut magic = [0; 8];
+    file.read_exact(&mut magic)?;
+    let legacy = &magic == LEGACY_MAGIC;
+    if &magic != MAGIC && !legacy {
+        return Err(invalid_data("unsupported history format"));
+    }
+    Ok(HistoryReader {
+        file,
+        key,
+        identity_id,
+        peer_id,
+        index: 0,
+        end,
+        valid_end: MAGIC.len() as u64,
+        truncated: false,
+        legacy,
+    })
+}
+
+fn migrate_legacy_history_streaming(
+    path: &std::path::Path,
+    key: Zeroizing<[u8; 32]>,
+    identity_id: &str,
+    peer_id: &str,
+) -> io::Result<bool> {
+    let mut reader = open_history_reader(
+        path.to_owned(),
+        Zeroizing::new(*key),
+        identity_id.to_owned(),
+        peer_id.to_owned(),
+    )?;
+    let suffix = hex_encode(&random_nonce()?);
+    let temporary = path.with_file_name(format!(".history-migrate-{suffix}.tmp"));
+    let result = (|| {
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&temporary)?;
+        set_private_file(&output)?;
+        output.write_all(MAGIC)?;
+        let mut index = 0u64;
+        let mut truncated = false;
+        loop {
+            match reader.next_record() {
+                Ok(Some(message)) => {
+                    output.write_all(&encode_record(
+                        &key,
+                        identity_id,
+                        peer_id,
+                        index,
+                        &message,
+                    )?)?;
+                    index = index
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_data("history record index overflow"))?;
+                }
+                Ok(None) => break,
+                Err(error) if reader.was_truncated() => {
+                    let _ = error;
+                    truncated = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        output.sync_all()?;
+        rename(&temporary, path)?;
+        Ok(truncated)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn conversation_operation_lock(identity_id: &str, peer_id: &str) -> io::Result<Arc<Mutex<()>>> {
+    let key = format!(
+        "{}:{}",
+        identity_id.to_ascii_lowercase(),
+        peer_id.to_ascii_lowercase()
+    );
+    let locks = CONVERSATION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .map_err(|_| io::Error::other("conversation lock table unavailable"))?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+fn acquire_conversation_file_lock(identity: &Identity, peer_id: &str) -> io::Result<File> {
+    let identity_id = identity.public_id();
+    let directory = data_directory()?.join(&identity_id);
+    acquire_conversation_file_lock_at(&directory, &identity_id, peer_id, &identity.storage_key())
+}
+
+fn acquire_conversation_file_lock_for_path(
+    history_path: &std::path::Path,
+    identity_id: &str,
+    peer_id: &str,
+    key: &[u8; 32],
+) -> io::Result<File> {
+    let directory = history_path
+        .parent()
+        .ok_or_else(|| invalid_data("conversation directory unavailable"))?;
+    acquire_conversation_file_lock_at(directory, identity_id, peer_id, key)
+}
+
+fn acquire_conversation_file_lock_at(
+    directory: &std::path::Path,
+    _identity_id: &str,
+    peer_id: &str,
+    key: &[u8; 32],
+) -> io::Result<File> {
+    create_dir_all(&directory)?;
+    set_private_directory(&directory)?;
+    let filename = format!(
+        ".conversation-{}.lock",
+        opaque_conversation_name(&derive_index_key(key), &peer_id.to_ascii_lowercase())
+    );
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(directory.join(filename))?;
+    set_private_file(&file)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock only operates on the live descriptor owned by `file`.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(file)
+}
+
+fn unlock_conversation_file(file: File) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock only operates on the live descriptor owned by `file`.
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    }
+    drop(file);
+}
+
 impl History {
+    /// Open a chat history without collecting its messages in memory. The chat
+    /// API pages directly from the encrypted file and keeps only the count.
+    pub(crate) fn open_for_chat(
+        identity: &Identity,
+        peer_id: &str,
+    ) -> io::Result<(Self, usize, bool)> {
+        validate_peer_id(peer_id)?;
+        let identity_id = identity.public_id();
+        let peer_id = peer_id.to_ascii_lowercase();
+        let key = identity.storage_key();
+        let directory = data_directory()?.join(&identity_id);
+        create_dir_all(&directory)?;
+        set_private_directory(&directory)?;
+        let operation_lock = conversation_operation_lock(&identity_id, &peer_id)?;
+        let operation_guard = operation_lock
+            .lock()
+            .map_err(|_| io::Error::other("conversation lock unavailable"))?;
+        let file_lock = acquire_conversation_file_lock(identity, &peer_id)?;
+        let path = directory.join(format!(
+            "{}.adlog",
+            opaque_conversation_name(&derive_index_key(&key), &peer_id)
+        ));
+        cleanup_orphaned_restore_outputs(&directory, &path)?;
+        if !path.exists()
+            && read_index(identity, &identity_id, &directory)?
+                .iter()
+                .any(|existing| existing == &peer_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("indexed conversation file is missing: {}", path.display()),
+            ));
+        }
+        let mut recovered_partial = false;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
+        set_private_file(&file)?;
+        if file.metadata()?.len() < MAGIC.len() as u64 {
+            if file.metadata()?.len() > 0 {
+                file.set_len(0)?;
+                recovered_partial = true;
+            }
+            file.write_all(MAGIC)?;
+            file.sync_data()?;
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut magic = [0; 8];
+        file.read_exact(&mut magic)?;
+        if &magic == LEGACY_MAGIC {
+            recovered_partial |= migrate_legacy_history_streaming(
+                &path,
+                Zeroizing::new(*key),
+                &identity_id,
+                &peer_id,
+            )?;
+        } else if &magic != MAGIC {
+            return Err(invalid_data("unsupported history format"));
+        }
+        let mut reader = open_history_reader(
+            path.clone(),
+            Zeroizing::new(*key),
+            identity_id.clone(),
+            peer_id.clone(),
+        )?;
+        let mut count = 0usize;
+        loop {
+            match reader.next_record() {
+                Ok(Some(_)) => {
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_data("history record count overflow"))?;
+                }
+                Ok(None) => break,
+                Err(error) if reader.was_truncated() => {
+                    let valid_end = reader.valid_end();
+                    drop(reader);
+                    let file = OpenOptions::new().write(true).open(&path)?;
+                    file.set_len(valid_end)?;
+                    file.sync_all()?;
+                    recovered_partial = true;
+                    let _ = error;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let file = OpenOptions::new().read(true).append(true).open(&path)?;
+        set_private_file(&file)?;
+        register_conversation(identity, &identity_id, &peer_id, &directory)?;
+        let history = Self {
+            file,
+            path,
+            key,
+            identity_id,
+            peer_id,
+            next_index: count as u64,
+            operation_lock: Arc::clone(&operation_lock),
+        };
+        unlock_conversation_file(file_lock);
+        drop(operation_guard);
+        Ok((history, count, recovered_partial))
+    }
+
     pub(crate) fn reader_for_identity_copy(
         identity: &Identity,
         peer_id: &str,
@@ -406,26 +733,14 @@ impl History {
             "{}.adlog",
             opaque_conversation_name(&derive_index_key(&key), &peer_id)
         ));
-        let mut file = File::open(path)?;
-        let end = file.metadata()?.len();
-        if end < MAGIC.len() as u64 {
-            return Err(invalid_data("history snapshot header is incomplete"));
-        }
-        let mut magic = [0; 8];
-        file.read_exact(&mut magic)?;
-        let legacy = &magic == LEGACY_MAGIC;
-        if &magic != MAGIC && !legacy {
-            return Err(invalid_data("unsupported history format"));
-        }
-        Ok(HistoryReader {
-            file,
-            key,
-            identity_id,
-            peer_id,
-            index: 0,
-            end,
-            legacy,
-        })
+        let lock = conversation_operation_lock(&identity_id, &peer_id)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| io::Error::other("conversation lock unavailable"))?;
+        let file_lock = acquire_conversation_file_lock(identity, &peer_id)?;
+        let result = open_history_reader(path, key, identity_id, peer_id);
+        unlock_conversation_file(file_lock);
+        result
     }
 
     pub(crate) fn estimate_transfer(
@@ -473,11 +788,17 @@ impl History {
         let directory = data_directory()?.join(&identity_id);
         create_dir_all(&directory)?;
         set_private_directory(&directory)?;
+        let operation_lock = conversation_operation_lock(&identity_id, &peer_id)?;
+        let operation_guard = operation_lock
+            .lock()
+            .map_err(|_| io::Error::other("conversation lock unavailable"))?;
+        let file_lock = acquire_conversation_file_lock(identity, &peer_id)?;
         let index_key = derive_index_key(&key);
         let path = directory.join(format!(
             "{}.adlog",
             opaque_conversation_name(&index_key, &peer_id)
         ));
+        cleanup_orphaned_restore_outputs(&directory, &path)?;
         if !path.exists()
             && read_index(identity, &identity_id, &directory)?
                 .iter()
@@ -528,7 +849,10 @@ impl History {
             identity_id,
             peer_id,
             next_index,
+            operation_lock: Arc::clone(&operation_lock),
         };
+        unlock_conversation_file(file_lock);
+        drop(operation_guard);
         if migrate_legacy {
             history.replace(&messages)?;
         }
@@ -536,6 +860,17 @@ impl History {
     }
 
     pub fn append(&mut self, message: &StoredMessage) -> io::Result<()> {
+        let operation_lock = Arc::clone(&self.operation_lock);
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| io::Error::other("conversation lock unavailable"))?;
+        let file_lock = acquire_conversation_file_lock_for_path(
+            &self.path,
+            &self.identity_id,
+            &self.peer_id,
+            &self.key,
+        )?;
+        self.refresh_for_append()?;
         let record = encode_record(
             &self.key,
             &self.identity_id,
@@ -549,10 +884,27 @@ impl History {
             .next_index
             .checked_add(1)
             .ok_or_else(|| io::Error::other("history record limit reached"))?;
+        unlock_conversation_file(file_lock);
         Ok(())
     }
 
     pub fn replace(&mut self, messages: &[StoredMessage]) -> io::Result<()> {
+        let operation_lock = Arc::clone(&self.operation_lock);
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| io::Error::other("conversation lock unavailable"))?;
+        let file_lock = acquire_conversation_file_lock_for_path(
+            &self.path,
+            &self.identity_id,
+            &self.peer_id,
+            &self.key,
+        )?;
+        let result = self.replace_unlocked(messages);
+        unlock_conversation_file(file_lock);
+        result
+    }
+
+    fn replace_unlocked(&mut self, messages: &[StoredMessage]) -> io::Result<()> {
         #[cfg(test)]
         if test_failure_once(FAIL_HISTORY_REPLACE_ONCE) {
             return Err(io::Error::other("injected conversation replace failure"));
@@ -587,6 +939,227 @@ impl History {
         if result.is_err() {
             let _ = std::fs::remove_file(temporary);
         }
+        result
+    }
+
+    fn refresh_for_append(&mut self) -> io::Result<()> {
+        let mut reader = open_history_reader(
+            self.path.clone(),
+            Zeroizing::new(*self.key),
+            self.identity_id.clone(),
+            self.peer_id.clone(),
+        )?;
+        let mut next_index = 0u64;
+        while reader.next_record()?.is_some() {
+            next_index = next_index
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("history record index overflow"))?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
+        set_private_file(&file)?;
+        self.file = file;
+        self.next_index = next_index;
+        Ok(())
+    }
+
+    pub(crate) fn merge_restore_staging(
+        &mut self,
+        identity: &Identity,
+        staging: &mut RestoreStaging,
+    ) -> io::Result<RestoreMergeSummary> {
+        if identity.public_id() != self.identity_id
+            || staging.identity_id != self.identity_id
+            || staging.peer_id != self.peer_id
+            || !staging.finished
+        {
+            return Err(invalid_data(
+                "restore staging does not match this conversation",
+            ));
+        }
+        let operation_lock = Arc::clone(&self.operation_lock);
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| io::Error::other("conversation lock unavailable"))?;
+        let file_lock = acquire_conversation_file_lock_for_path(
+            &self.path,
+            &self.identity_id,
+            &self.peer_id,
+            &self.key,
+        )?;
+        let mut final_temp = None::<PathBuf>;
+        let result = (|| {
+            let stage_root = staging.directory.clone();
+            cleanup_restore_merge_attempt(&stage_root)?;
+            let mut count_reader = open_history_reader(
+                self.path.clone(),
+                Zeroizing::new(*self.key),
+                self.identity_id.clone(),
+                self.peer_id.clone(),
+            )?;
+            let mut existing_count = 0u64;
+            while count_reader.next_record()?.is_some() {
+                existing_count = existing_count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("history record count overflow"))?;
+            }
+            let total_capacity = existing_count
+                .checked_add(staging.count())
+                .ok_or_else(|| invalid_data("restore record count overflow"))?;
+            let mut index = RestoreDiskIndex::new(staging, total_capacity)?;
+            let mut levels = Vec::<Vec<PathBuf>>::new();
+            let mut serial = 0u64;
+            let mut buffer = Vec::<(u64, StoredMessage)>::new();
+            let mut buffer_bytes = 0usize;
+            let mut peak_buffer_bytes = 0usize;
+            let mut existing = open_history_reader(
+                self.path.clone(),
+                Zeroizing::new(*self.key),
+                self.identity_id.clone(),
+                self.peer_id.clone(),
+            )?;
+            while let Some(message) = existing.next_record()? {
+                index.index_message(&message, false)?;
+                push_restore_sort_item(
+                    message,
+                    &mut buffer,
+                    &mut buffer_bytes,
+                    &mut peak_buffer_bytes,
+                    &mut levels,
+                    &mut serial,
+                    &self.key,
+                    &self.identity_id,
+                    &self.peer_id,
+                    &stage_root,
+                )?;
+            }
+            staging.rewind()?;
+            let mut imported_count = 0u64;
+            while let Some(message) = staging.next_record()? {
+                if index.index_message(&message, true)? {
+                    imported_count = imported_count
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_data("restore count overflow"))?;
+                    push_restore_sort_item(
+                        message,
+                        &mut buffer,
+                        &mut buffer_bytes,
+                        &mut peak_buffer_bytes,
+                        &mut levels,
+                        &mut serial,
+                        &self.key,
+                        &self.identity_id,
+                        &self.peer_id,
+                        &stage_root,
+                    )?;
+                }
+            }
+            if !buffer.is_empty() {
+                let run = write_restore_sort_run(
+                    &stage_root,
+                    &mut serial,
+                    &self.key,
+                    &self.identity_id,
+                    &self.peer_id,
+                    &mut buffer,
+                )?;
+                add_restore_run_level(
+                    run,
+                    &mut levels,
+                    &mut serial,
+                    &self.key,
+                    &self.identity_id,
+                    &self.peer_id,
+                    &stage_root,
+                )?;
+            }
+            let mut runs: Vec<_> = levels.into_iter().flatten().collect();
+            while runs.len() > RESTORE_MERGE_FAN_IN {
+                let mut reduced = Vec::new();
+                for group in runs.chunks(RESTORE_MERGE_FAN_IN) {
+                    if group.len() == 1 {
+                        reduced.push(group[0].clone());
+                        continue;
+                    }
+                    let output = stage_root.join(format!("merge-{:016x}.adlog", serial));
+                    serial = serial
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_data("restore merge run counter overflow"))?;
+                    merge_encrypted_runs(
+                        group,
+                        &output,
+                        &self.key,
+                        &self.identity_id,
+                        &self.peer_id,
+                    )?;
+                    for input in group {
+                        std::fs::remove_file(input)?;
+                    }
+                    reduced.push(output);
+                }
+                runs = reduced;
+            }
+            let suffix = hex_encode(&random_nonce()?);
+            let filename = self
+                .path
+                .file_name()
+                .ok_or_else(|| invalid_data("conversation filename unavailable"))?;
+            let temporary = self.path.with_file_name(format!(
+                ".{}.restore-merge-{suffix}.tmp",
+                filename.to_string_lossy()
+            ));
+            final_temp = Some(temporary.clone());
+            let total_count = merge_encrypted_runs(
+                &runs,
+                &temporary,
+                &self.key,
+                &self.identity_id,
+                &self.peer_id,
+            )?;
+            let append_file = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&temporary)?;
+            set_private_file(&append_file)?;
+            #[cfg(test)]
+            if test_failure(FAIL_RESTORE_RENAME) {
+                return Err(io::Error::other(
+                    "injected restore atomic replacement failure",
+                ));
+            }
+            rename(&temporary, &self.path)?;
+            final_temp = None;
+            self.file = append_file;
+            self.next_index = total_count;
+            Ok(RestoreMergeSummary {
+                total_count,
+                imported_count,
+                peak_sort_buffer_bytes: peak_buffer_bytes,
+            })
+        })();
+        let result = match (result, final_temp) {
+            (Err(error), Some(path)) => match {
+                #[cfg(test)]
+                if test_failure(FAIL_RESTORE_RESULT_CLEANUP) {
+                    Err(io::Error::other("injected restore result cleanup failure"))
+                } else {
+                    std::fs::remove_file(&path)
+                }
+                #[cfg(not(test))]
+                std::fs::remove_file(&path)
+            } {
+                Ok(()) => Err(error),
+                Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => Err(error),
+                Err(cleanup) => Err(io::Error::other(format!(
+                    "restore merge failed ({error}); temporary result cleanup failed ({cleanup}); recoverable file: {}",
+                    path.display()
+                ))),
+            },
+            (result, _) => result,
+        };
+        unlock_conversation_file(file_lock);
         result
     }
 
@@ -625,6 +1198,11 @@ impl History {
             "{}.adlog",
             opaque_conversation_name(&derive_index_key(&key), &peer_id)
         ));
+        let operation_lock = conversation_operation_lock(&identity_id, &peer_id)?;
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| io::Error::other("conversation lock unavailable"))?;
+        let file_lock = acquire_conversation_file_lock(identity, &peer_id)?;
         let mut file = File::open(path)?;
         let (messages, _, recovered_partial) = read_records(
             &mut file,
@@ -633,6 +1211,7 @@ impl History {
             &peer_id,
             false,
         )?;
+        unlock_conversation_file(file_lock);
         Ok((messages, recovered_partial))
     }
 
@@ -646,6 +1225,11 @@ impl History {
             "{}.adlog",
             opaque_conversation_name(&derive_index_key(&key), &peer_id)
         ));
+        let operation_lock = conversation_operation_lock(&identity_id, &peer_id)?;
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| io::Error::other("conversation lock unavailable"))?;
+        let _file_lock = acquire_conversation_file_lock(identity, &peer_id)?;
         let lock = INDEX_LOCK.get_or_init(|| Mutex::new(()));
         let _guard = lock
             .lock()
@@ -2588,6 +3172,24 @@ fn cleanup_stale_restore_staging(root: &std::path::Path) -> io::Result<()> {
         if !entry.file_type()?.is_dir() {
             continue;
         }
+        let directory_name = entry.file_name();
+        let directory_name = directory_name.to_string_lossy();
+        if directory_name.len() != NONCE_BYTES * 2
+            || !directory_name.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        let records_path = entry.path().join("records.enc");
+        if !std::fs::symlink_metadata(&records_path)
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            continue;
+        }
+        let mut records = File::open(&records_path)?;
+        let mut magic = [0; RESTORE_STAGING_MAGIC.len()];
+        if records.read_exact(&mut magic).is_err() || &magic != RESTORE_STAGING_MAGIC {
+            continue;
+        }
         let lock_path = entry.path().join("owner.lock");
         let lock = match OpenOptions::new().read(true).write(true).open(&lock_path) {
             Ok(file) => file,
@@ -2608,6 +3210,390 @@ fn cleanup_stale_restore_staging(root: &std::path::Path) -> io::Result<()> {
             }
         }
         std::fs::remove_dir_all(entry.path())?;
+    }
+    Ok(())
+}
+
+fn cleanup_restore_merge_attempt(root: &std::path::Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "merge-index"
+            || (entry.file_type()?.is_file()
+                && ((name.starts_with("sort-") || name.starts_with("merge-"))
+                    && name.ends_with(".adlog")))
+        {
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_orphaned_restore_outputs(
+    directory: &std::path::Path,
+    history_path: &std::path::Path,
+) -> io::Result<()> {
+    let filename = history_path
+        .file_name()
+        .ok_or_else(|| invalid_data("conversation filename unavailable"))?
+        .to_string_lossy();
+    let prefix = format!(".{filename}.restore-merge-");
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(suffix) = name
+            .strip_prefix(&prefix)
+            .and_then(|tail| tail.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        if !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+struct RestoreDiskIndex {
+    file: File,
+    capacity: u64,
+    key: Zeroizing<[u8; 32]>,
+}
+
+impl RestoreDiskIndex {
+    const SLOT_BYTES: u64 = 82;
+
+    fn new(staging: &RestoreStaging, entries: u64) -> io::Result<Self> {
+        let capacity = entries
+            .checked_mul(2)
+            .and_then(u64::checked_next_power_of_two)
+            .unwrap_or(u64::MAX)
+            .max(16);
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(staging.directory.join("merge-index"))?;
+        set_private_file(&file)?;
+        file.set_len(
+            capacity
+                .checked_mul(Self::SLOT_BYTES)
+                .ok_or_else(|| invalid_data("restore index is too large"))?,
+        )?;
+        Ok(Self {
+            file,
+            capacity,
+            key: Zeroizing::new(*staging.key),
+        })
+    }
+
+    fn index_message(&mut self, message: &StoredMessage, offered: bool) -> io::Result<bool> {
+        #[cfg(test)]
+        if test_failure(FAIL_RESTORE_INDEX) {
+            return Err(io::Error::other("injected restore index write failure"));
+        }
+        if let Some(proof) = &message.proof {
+            self.index_signed(proof.id, message, offered)
+        } else {
+            self.index_legacy(message, offered)
+        }
+    }
+
+    fn index_signed(
+        &mut self,
+        id: [u8; 16],
+        message: &StoredMessage,
+        offered: bool,
+    ) -> io::Result<bool> {
+        let mut id_input = b"signed-id\0".to_vec();
+        id_input.extend_from_slice(&id);
+        let id_hash = keyed_restore_hash(&self.key, &id_input);
+        let mut content_input = b"signed-content\0".to_vec();
+        content_input.extend_from_slice(&encode_history_plain(message)?);
+        let content_hash = keyed_restore_hash(&self.key, &content_input);
+        let slot = self.find_slot(1, &id_hash)?;
+        if let Some((_, stored)) = slot {
+            if stored[34..66] != content_hash {
+                return Err(invalid_data("message ID collision in restore proposal"));
+            }
+            return Ok(!offered);
+        }
+        self.write_slot(self.empty_slot(1, &id_hash, &content_hash, 0, 0)?)?;
+        Ok(true)
+    }
+
+    fn index_legacy(&mut self, message: &StoredMessage, offered: bool) -> io::Result<bool> {
+        let mut key_input = b"legacy-message\0".to_vec();
+        key_input.extend_from_slice(&encode_history_plain(message)?);
+        let legacy_hash = keyed_restore_hash(&self.key, &key_input);
+        let slot = self.find_slot(2, &legacy_hash)?;
+        let (existing, seen) = slot
+            .as_ref()
+            .map(|(_, raw)| {
+                (
+                    u64::from_be_bytes(raw[66..74].try_into().expect("fixed slot")),
+                    u64::from_be_bytes(raw[74..82].try_into().expect("fixed slot")),
+                )
+            })
+            .unwrap_or((0, 0));
+        let (next_existing, next_seen, keep) = if offered {
+            let next_seen = seen
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("legacy restore duplicate count overflow"))?;
+            (existing, next_seen, next_seen > existing)
+        } else {
+            (
+                existing
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("legacy restore duplicate count overflow"))?,
+                seen,
+                true,
+            )
+        };
+        let raw = self.empty_slot(2, &legacy_hash, &[0; 32], next_existing, next_seen)?;
+        if let Some((position, _)) = slot {
+            self.file.seek(SeekFrom::Start(position))?;
+            self.file.write_all(&raw)?;
+        } else {
+            self.write_slot(raw)?;
+        }
+        Ok(keep)
+    }
+
+    fn find_slot(&mut self, kind: u8, digest: &[u8; 32]) -> io::Result<Option<(u64, [u8; 82])>> {
+        let start =
+            u64::from_be_bytes(digest[..8].try_into().expect("fixed digest")) & (self.capacity - 1);
+        for offset in 0..self.capacity {
+            let slot = (start + offset) & (self.capacity - 1);
+            let position = slot * Self::SLOT_BYTES;
+            self.file.seek(SeekFrom::Start(position))?;
+            let mut raw = [0; 82];
+            self.file.read_exact(&mut raw)?;
+            if raw[0] == 0 {
+                return Ok(None);
+            }
+            if raw[0] != 1 || raw[1] != kind {
+                continue;
+            }
+            if &raw[2..34] == digest {
+                return Ok(Some((position, raw)));
+            }
+        }
+        Err(invalid_data("restore disk index is full"))
+    }
+
+    fn empty_slot(
+        &self,
+        kind: u8,
+        digest: &[u8; 32],
+        value: &[u8; 32],
+        existing: u64,
+        seen: u64,
+    ) -> io::Result<[u8; 82]> {
+        let mut raw = [0; 82];
+        raw[0] = 1;
+        raw[1] = kind;
+        raw[2..34].copy_from_slice(digest);
+        raw[34..66].copy_from_slice(value);
+        raw[66..74].copy_from_slice(&existing.to_be_bytes());
+        raw[74..82].copy_from_slice(&seen.to_be_bytes());
+        Ok(raw)
+    }
+
+    fn write_slot(&mut self, raw: [u8; 82]) -> io::Result<()> {
+        let digest = &raw[2..34];
+        let start =
+            u64::from_be_bytes(digest[..8].try_into().expect("fixed digest")) & (self.capacity - 1);
+        for offset in 0..self.capacity {
+            let position = ((start + offset) & (self.capacity - 1)) * Self::SLOT_BYTES;
+            self.file.seek(SeekFrom::Start(position))?;
+            let mut existing = [0; 82];
+            self.file.read_exact(&mut existing)?;
+            if existing[0] == 0 {
+                self.file.seek(SeekFrom::Start(position))?;
+                self.file.write_all(&raw)?;
+                return Ok(());
+            }
+        }
+        Err(invalid_data("restore disk index is full"))
+    }
+}
+
+fn keyed_restore_hash(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().into()
+}
+
+fn write_restore_sort_run(
+    directory: &std::path::Path,
+    serial: &mut u64,
+    key: &[u8; 32],
+    identity_id: &str,
+    peer_id: &str,
+    items: &mut Vec<(u64, StoredMessage)>,
+) -> io::Result<PathBuf> {
+    items.sort_by_key(|(_, message)| message.unix_time);
+    let path = directory.join(format!("sort-{:016x}.adlog", *serial));
+    *serial = serial
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("restore sort run counter overflow"))?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    set_private_file(&file)?;
+    file.write_all(MAGIC)?;
+    for (index, (_, message)) in items.drain(..).enumerate() {
+        file.write_all(&encode_record(
+            key,
+            identity_id,
+            peer_id,
+            index as u64,
+            &message,
+        )?)?;
+    }
+    file.sync_all()?;
+    Ok(path)
+}
+
+fn merge_encrypted_runs(
+    input_paths: &[PathBuf],
+    output_path: &std::path::Path,
+    key: &[u8; 32],
+    identity_id: &str,
+    peer_id: &str,
+) -> io::Result<u64> {
+    if input_paths.len() > RESTORE_MERGE_FAN_IN {
+        return Err(invalid_data("too many restore sort inputs"));
+    }
+    let mut readers = input_paths
+        .iter()
+        .map(|path| {
+            open_history_reader(
+                path.clone(),
+                Zeroizing::new(*key),
+                identity_id.to_owned(),
+                peer_id.to_owned(),
+            )
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut current = Vec::<Option<StoredMessage>>::with_capacity(readers.len());
+    let mut heap = BinaryHeap::<Reverse<(u64, usize)>>::new();
+    for (index, reader) in readers.iter_mut().enumerate() {
+        let message = reader.next_record()?;
+        if let Some(message) = &message {
+            heap.push(Reverse((message.unix_time, index)));
+        }
+        current.push(message);
+    }
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(output_path)?;
+    set_private_file(&output)?;
+    output.write_all(MAGIC)?;
+    let mut output_index = 0u64;
+    while let Some(Reverse((_, source))) = heap.pop() {
+        let message = current[source]
+            .take()
+            .ok_or_else(|| invalid_data("restore sort cursor is unavailable"))?;
+        output.write_all(&encode_record(
+            key,
+            identity_id,
+            peer_id,
+            output_index,
+            &message,
+        )?)?;
+        output_index = output_index
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("restored history is too large"))?;
+        #[cfg(test)]
+        if output_index == 1 && test_failure(FAIL_RESTORE_OUTPUT) {
+            return Err(io::Error::other("injected restore output write failure"));
+        }
+        current[source] = readers[source].next_record()?;
+        if let Some(next) = &current[source] {
+            heap.push(Reverse((next.unix_time, source)));
+        }
+    }
+    output.sync_all()?;
+    Ok(output_index)
+}
+
+fn add_restore_run_level(
+    mut path: PathBuf,
+    levels: &mut Vec<Vec<PathBuf>>,
+    serial: &mut u64,
+    key: &[u8; 32],
+    identity_id: &str,
+    peer_id: &str,
+    directory: &std::path::Path,
+) -> io::Result<()> {
+    let mut level = 0usize;
+    loop {
+        if levels.len() <= level {
+            levels.push(Vec::new());
+        }
+        levels[level].push(path);
+        if levels[level].len() < RESTORE_MERGE_FAN_IN {
+            return Ok(());
+        }
+        let inputs = std::mem::take(&mut levels[level]);
+        let output = directory.join(format!("merge-{:016x}.adlog", *serial));
+        *serial = serial
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("restore merge run counter overflow"))?;
+        merge_encrypted_runs(&inputs, &output, key, identity_id, peer_id)?;
+        for input in inputs {
+            std::fs::remove_file(input)?;
+        }
+        path = output;
+        level += 1;
+    }
+}
+
+fn push_restore_sort_item(
+    message: StoredMessage,
+    buffer: &mut Vec<(u64, StoredMessage)>,
+    buffer_bytes: &mut usize,
+    peak_buffer_bytes: &mut usize,
+    levels: &mut Vec<Vec<PathBuf>>,
+    serial: &mut u64,
+    key: &[u8; 32],
+    identity_id: &str,
+    peer_id: &str,
+    directory: &std::path::Path,
+) -> io::Result<()> {
+    let size = std::mem::size_of::<StoredMessage>()
+        + message.text.len()
+        + if message.proof.is_some() { 144 } else { 0 };
+    if !buffer.is_empty()
+        && (buffer.len() >= RESTORE_SORT_RUN_RECORDS
+            || buffer_bytes.saturating_add(size) > RESTORE_SORT_RUN_BYTES)
+    {
+        let run = write_restore_sort_run(directory, serial, key, identity_id, peer_id, buffer)?;
+        *buffer_bytes = 0;
+        add_restore_run_level(run, levels, serial, key, identity_id, peer_id, directory)?;
+    }
+    *buffer_bytes = buffer_bytes.saturating_add(size);
+    *peak_buffer_bytes = (*peak_buffer_bytes).max(*buffer_bytes);
+    buffer.push((0, message));
+    if buffer.len() >= RESTORE_SORT_RUN_RECORDS || *buffer_bytes >= RESTORE_SORT_RUN_BYTES {
+        let run = write_restore_sort_run(directory, serial, key, identity_id, peer_id, buffer)?;
+        *buffer_bytes = 0;
+        add_restore_run_level(run, levels, serial, key, identity_id, peer_id, directory)?;
     }
     Ok(())
 }
@@ -2687,9 +3673,15 @@ pub(crate) fn data_directory() -> io::Result<PathBuf> {
 }
 
 #[cfg(test)]
+pub(crate) fn set_test_data_directory(path: Option<PathBuf>) {
+    TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = path);
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        decode_peer_id, History, MessageSender, StoredMessage, MAX_BACKUP_BYTES, MAX_MESSAGE_BYTES,
+        decode_peer_id, History, MessageSender, RestoreStaging, StoredMessage, MAX_BACKUP_BYTES,
+        MAX_MESSAGE_BYTES,
     };
     use crate::identity::Identity;
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -2751,6 +3743,32 @@ mod tests {
     }
 
     #[test]
+    fn chat_history_open_keeps_only_count_and_page_sized_results() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "3a".repeat(32);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        for index in 0..600 {
+            history.append(&message(index, "page item")).unwrap();
+        }
+        drop(history);
+        let (history, count, recovered) = History::open_for_chat(&identity, &peer).unwrap();
+        assert_eq!(count, 600);
+        assert!(!recovered);
+        let mut reader = History::reader_for_identity_copy(&identity, &peer).unwrap();
+        for _ in 0..500 {
+            reader.next_record().unwrap().unwrap();
+        }
+        assert_eq!(
+            (0..256)
+                .filter(|_| reader.next_record().unwrap().is_some())
+                .count(),
+            100
+        );
+        drop(history);
+    }
+
+    #[test]
     fn restore_staging_encrypts_records_and_removes_only_its_owned_directory() {
         let _data = IsolatedData::new();
         let (identity, _) = Identity::create().unwrap();
@@ -2793,6 +3811,251 @@ mod tests {
         assert!(unrelated.exists());
         assert_eq!(std::fs::read(unrelated).unwrap(), b"preserve");
         assert_eq!(std::fs::read_dir(root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn stale_restore_cleanup_preserves_active_and_unowned_directories() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "4a".repeat(32);
+        let root = super::data_directory()
+            .unwrap()
+            .join(identity.public_id())
+            .join(".history-restore");
+        let mut active = RestoreStaging::create(&identity, &peer, &"4b".repeat(32)).unwrap();
+        active.append_verified(&message(1, "active")).unwrap();
+        let stale = root.join("4c".repeat(12));
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join("owner.lock"), []).unwrap();
+        std::fs::write(stale.join("records.enc"), super::RESTORE_STAGING_MAGIC).unwrap();
+        let unowned = root.join("notes");
+        std::fs::create_dir(&unowned).unwrap();
+        std::fs::write(unowned.join("keep"), b"keep").unwrap();
+        super::cleanup_stale_restore_staging(&root).unwrap();
+        assert!(active.directory.exists());
+        assert!(!stale.exists());
+        assert_eq!(std::fs::read(unowned.join("keep")).unwrap(), b"keep");
+        active.cleanup().unwrap();
+    }
+
+    #[test]
+    fn restore_result_cleanup_failure_reports_recoverable_path_and_open_cleans_it() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "4d".repeat(32);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history.append(&message(1, "original")).unwrap();
+        let mut staging = RestoreStaging::create(&identity, &peer, &"4e".repeat(32)).unwrap();
+        staging.append_verified(&message(2, "proposal")).unwrap();
+        staging.finish().unwrap();
+        super::TEST_FAILURES.with(|failures| {
+            failures.set(super::FAIL_RESTORE_RENAME | super::FAIL_RESTORE_RESULT_CLEANUP)
+        });
+        let error = history
+            .merge_restore_staging(&identity, &mut staging)
+            .unwrap_err();
+        super::TEST_FAILURES.with(|failures| failures.set(0));
+        let text = error.to_string();
+        assert!(text.contains("recoverable file:"));
+        let path = text.split("recoverable file: ").nth(1).unwrap();
+        let path = PathBuf::from(path);
+        assert!(path.exists());
+        assert_eq!(
+            History::read_for_identity_copy(&identity, &peer)
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        drop(history);
+        let (_, messages, _) = History::open(&identity, &peer).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn streamed_restore_merge_preserves_order_multiplicity_and_reports_bounded_buffer() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "40".repeat(32);
+        let request = "41".repeat(32);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history
+            .append(&message(2, "same time existing one"))
+            .unwrap();
+        history
+            .append(&message(2, "same time existing two"))
+            .unwrap();
+        history.append(&message(3, "legacy repeat")).unwrap();
+        history.append(&message(3, "legacy repeat")).unwrap();
+        let mut staging = RestoreStaging::create(&identity, &peer, &request).unwrap();
+        staging
+            .append_verified(&message(1, "earlier proposal"))
+            .unwrap();
+        staging
+            .append_verified(&message(2, "same time proposal"))
+            .unwrap();
+        staging
+            .append_verified(&message(3, "legacy repeat"))
+            .unwrap();
+        staging
+            .append_verified(&message(3, "legacy repeat"))
+            .unwrap();
+        staging
+            .append_verified(&message(3, "legacy repeat"))
+            .unwrap();
+        staging.finish().unwrap();
+        let summary = history
+            .merge_restore_staging(&identity, &mut staging)
+            .unwrap();
+        assert_eq!(summary.imported_count, 3);
+        assert!(summary.peak_sort_buffer_bytes <= super::RESTORE_SORT_RUN_BYTES);
+        let messages = History::read_for_identity_copy(&identity, &peer).unwrap().0;
+        assert_eq!(messages.len() as u64, summary.total_count);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|item| item.unix_time)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 2, 2, 3, 3, 3]
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|item| item.text == "legacy repeat")
+                .count(),
+            3
+        );
+        assert_eq!(
+            messages.iter().filter(|item| item.unix_time == 2).count(),
+            3
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|item| item.unix_time == 2)
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "same time existing one",
+                "same time existing two",
+                "same time proposal"
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_staging_write_failure_leaves_no_completed_proposal() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let mut staging =
+            RestoreStaging::create(&identity, &"4f".repeat(32), &"50".repeat(32)).unwrap();
+        super::TEST_FAILURES.with(|failures| failures.set(super::FAIL_RESTORE_STAGE_WRITE));
+        assert!(staging.append_verified(&message(1, "not stored")).is_err());
+        super::TEST_FAILURES.with(|failures| failures.set(0));
+        staging.finish().unwrap();
+        assert_eq!(staging.count(), 0);
+        assert_eq!(staging.next_record().unwrap(), None);
+    }
+
+    #[test]
+    fn restore_staging_cleanup_failure_is_returned_to_the_caller() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let staging =
+            RestoreStaging::create(&identity, &"53".repeat(32), &"54".repeat(32)).unwrap();
+        let directory = staging.directory.clone();
+        super::TEST_FAILURES.with(|failures| failures.set(super::FAIL_RESTORE_CLEANUP_ONCE));
+        let error = staging.cleanup().unwrap_err();
+        super::TEST_FAILURES.with(|failures| failures.set(0));
+        assert!(error.to_string().contains("cleanup failure"));
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn streamed_restore_merge_retries_and_preserves_original_on_injected_failures() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "42".repeat(32);
+        let request = "43".repeat(32);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history.append(&message(1, "keep original")).unwrap();
+        let original = History::read_for_identity_copy(&identity, &peer).unwrap().0;
+        let mut staging = RestoreStaging::create(&identity, &peer, &request).unwrap();
+        staging.append_verified(&message(2, "offer")).unwrap();
+        staging.finish().unwrap();
+        for failure in [
+            super::FAIL_RESTORE_INDEX,
+            super::FAIL_RESTORE_OUTPUT,
+            super::FAIL_RESTORE_RENAME,
+        ] {
+            super::TEST_FAILURES.with(|failures| failures.set(failure));
+            assert!(history
+                .merge_restore_staging(&identity, &mut staging)
+                .is_err());
+            super::TEST_FAILURES.with(|failures| failures.set(0));
+            assert_eq!(
+                History::read_for_identity_copy(&identity, &peer).unwrap().0,
+                original
+            );
+        }
+        let merged = history
+            .merge_restore_staging(&identity, &mut staging)
+            .unwrap();
+        assert_eq!(merged.imported_count, 1);
+        assert_eq!(
+            History::read_for_identity_copy(&identity, &peer)
+                .unwrap()
+                .0
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn streamed_restore_merge_rejects_signed_id_collision_without_replacing_history() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "44".repeat(32);
+        let request = "45".repeat(32);
+        let mut original =
+            super::sign_message(&identity, &peer, 7, "signed original".into()).unwrap();
+        let mut conflict = original.clone();
+        conflict.text = "same ID with changed content".into();
+        let proof = original.proof.as_mut().unwrap();
+        proof.id = [9; 16];
+        conflict.proof.as_mut().unwrap().id = [9; 16];
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history.append(&original).unwrap();
+        let mut staging = RestoreStaging::create(&identity, &peer, &request).unwrap();
+        staging.append_verified(&conflict).unwrap();
+        staging.finish().unwrap();
+        assert!(history
+            .merge_restore_staging(&identity, &mut staging)
+            .is_err());
+        assert_eq!(
+            History::read_for_identity_copy(&identity, &peer).unwrap().0,
+            vec![original]
+        );
+    }
+
+    #[test]
+    fn streamed_restore_merge_skips_identical_signed_ids() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "51".repeat(32);
+        let original = super::sign_message(&identity, &peer, 7, "signed duplicate".into()).unwrap();
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history.append(&original).unwrap();
+        let mut staging = RestoreStaging::create(&identity, &peer, &"52".repeat(32)).unwrap();
+        staging.append_verified(&original).unwrap();
+        staging.append_verified(&original).unwrap();
+        staging.finish().unwrap();
+        let summary = history
+            .merge_restore_staging(&identity, &mut staging)
+            .unwrap();
+        assert_eq!(summary.imported_count, 0);
+        assert_eq!(summary.total_count, 1);
     }
 
     #[test]
@@ -3412,9 +4675,14 @@ mod tests {
         bytes.extend_from_slice(&encrypted);
         std::fs::write(&path, bytes).unwrap();
 
-        let (_, messages, _) = History::open(&identity, &peer).unwrap();
-        assert_eq!(messages, vec![entry]);
-        assert!(messages[0].proof.is_none());
+        let (history, count, _) = History::open_for_chat(&identity, &peer).unwrap();
+        let mut reader = History::reader_for_identity_copy(&identity, &peer).unwrap();
+        assert_eq!(count, 1);
+        let restored = reader.next_record().unwrap().unwrap();
+        assert_eq!(restored, entry);
+        assert!(restored.proof.is_none());
+        assert_eq!(reader.next_record().unwrap(), None);
+        drop(history);
         assert_eq!(&std::fs::read(path).unwrap()[..8], super::MAGIC);
     }
 
