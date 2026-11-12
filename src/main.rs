@@ -526,11 +526,12 @@ fn restore_merge_active(operation: &ChatOperation) -> bool {
     operation
         .snapshot
         .lock()
-        .map(|snapshot| {
-            snapshot.history_restore_in_progress
-                || matches!(snapshot.history_restore_state, "merge-queued" | "merging")
-        })
+        .map(|snapshot| history_restore_is_merging(snapshot.history_restore_state))
         .unwrap_or(true)
+}
+
+fn history_restore_is_merging(state: &str) -> bool {
+    matches!(state, "merge-queued" | "merging")
 }
 
 fn restore_merge_send_error(operation: &ChatOperation) -> Option<&'static str> {
@@ -1350,6 +1351,26 @@ mod send_tests {
             command_receiver.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
+        {
+            let mut snapshot = operation.snapshot.lock().unwrap();
+            snapshot.history_restore_state = "receiving";
+            snapshot.history_restore_in_progress = true;
+        }
+        let send_worker = thread::spawn(move || {
+            let ChatCommand::Send(text, processed) = command_receiver.recv().unwrap() else {
+                panic!("expected send during history transfer");
+            };
+            assert_eq!(text, "send while receiving history");
+            processed.send(Ok(())).unwrap();
+        });
+        let accepted_send = call_test_api(
+            &state,
+            "/api/chat/send",
+            "count-operation\nsend while receiving history",
+            "test-session",
+        );
+        assert!(accepted_send.starts_with("HTTP/1.1 202 Accepted"));
+        send_worker.join().unwrap();
         assert!(response.contains("restored proposal"));
 
         let mut unavailable_queue = VecDeque::new();
@@ -1424,6 +1445,27 @@ mod send_tests {
             },
         )
         .is_err());
+    }
+
+    #[test]
+    fn history_restore_blocks_chat_io_only_during_final_merge_states() {
+        assert!(history_restore_is_merging("merge-queued"));
+        assert!(history_restore_is_merging("merging"));
+        for state in [
+            "idle",
+            "estimating",
+            "awaiting-transfer-consent",
+            "transfer-queued",
+            "receiving",
+            "awaiting-merge-consent",
+            "completed",
+            "failed",
+        ] {
+            assert!(
+                !history_restore_is_merging(state),
+                "{state} must allow normal chat I/O"
+            );
+        }
     }
 
     #[test]
@@ -4134,9 +4176,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         if snapshot.phase != "connected" {
             return reject(&mut stream, "409 Conflict");
         }
-        if snapshot.history_restore_in_progress
-            || matches!(snapshot.history_restore_state, "merge-queued" | "merging")
-        {
+        if history_restore_is_merging(snapshot.history_restore_state) {
             return respond(
                 &mut stream,
                 "409 Conflict",
