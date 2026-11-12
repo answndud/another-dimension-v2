@@ -23,6 +23,7 @@ const BACKUP_PASSWORD_MAGIC: &[u8; 8] = b"ADBACK2\0";
 const BACKUP_COMBINED_MAGIC: &[u8; 8] = b"ADBACK3\0";
 const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
 const BACKUP_SALT_BYTES: usize = 16;
+pub(crate) const IDENTITY_EVENT_PREFIX: &str = "[AD2-IDENTITY-EVENT/1] ";
 static INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 #[cfg(test)]
 thread_local! {
@@ -269,74 +270,99 @@ impl History {
         password: Option<&str>,
     ) -> io::Result<Vec<u8>> {
         let (_, messages, _) = Self::open(identity, peer_id)?;
-        let mut payload = Zeroizing::new(Vec::new());
-        if let Some(password) = password {
-            validate_backup_password(password)?;
+        encode_backup(identity, peer_id, &messages, password)
+    }
+
+    /// Re-encrypt an existing portable backup for a new identity without
+    /// importing it into either local history store or modifying the source.
+    pub fn reprotect_backup(
+        previous_identity: &Identity,
+        replacement_identity: &Identity,
+        backup: &[u8],
+        previous_password: Option<&str>,
+        replacement_password: Option<&str>,
+    ) -> io::Result<Vec<u8>> {
+        let (peer_id, messages) = decode_backup(previous_identity, backup, previous_password)?;
+        encode_backup(
+            replacement_identity,
+            &peer_id,
+            &messages,
+            replacement_password,
+        )
+    }
+
+    /// Authenticate a portable backup without importing or changing local history.
+    pub fn verify_backup(
+        identity: &Identity,
+        backup: &[u8],
+        password: Option<&str>,
+    ) -> io::Result<(String, usize)> {
+        let (peer_id, messages) = decode_backup(identity, backup, password)?;
+        Ok((peer_id, messages.len()))
+    }
+
+    /// Merge an explicitly linked prior conversation into this conversation.
+    /// The destination is committed before the old entry is removed.
+    pub fn link_prior_identity(
+        &mut self,
+        identity: &Identity,
+        previous_peer_id: &str,
+        transition: StoredMessage,
+    ) -> io::Result<Vec<StoredMessage>> {
+        validate_peer_id(previous_peer_id)?;
+        if previous_peer_id.eq_ignore_ascii_case(&self.peer_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "identity transition must refer to a prior conversation",
+            ));
         }
-        let salt_len = if password.is_some() {
-            BACKUP_SALT_BYTES
-        } else {
-            0
-        };
-        let header_len = if password.is_some() {
-            BACKUP_COMBINED_MAGIC.len()
-        } else {
-            BACKUP_MAGIC.len()
-        } + salt_len
-            + NONCE_BYTES;
-        let peer = decode_peer_id(peer_id)?;
-        payload.extend_from_slice(&peer);
-        let count = u32::try_from(messages.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many messages"))?;
-        payload.extend_from_slice(&count.to_be_bytes());
-        for message in messages {
-            let text = message.text.as_bytes();
-            payload.extend_from_slice(&message.unix_time.to_be_bytes());
-            payload.push(match message.sender {
-                MessageSender::Me => 0,
-                MessageSender::Other => 1,
-            });
-            payload.extend_from_slice(&(text.len() as u32).to_be_bytes());
-            payload.extend_from_slice(text);
-            if payload.len().saturating_add(header_len + 16) > MAX_BACKUP_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "backup is too large",
-                ));
-            }
+        let (previous, recovered_partial) =
+            Self::read_for_identity_copy(identity, previous_peer_id)?;
+        if recovered_partial {
+            return Err(invalid_data("prior conversation has an incomplete record"));
         }
-        let mut salt = [0; BACKUP_SALT_BYTES];
-        File::open("/dev/urandom")?.read_exact(&mut salt)?;
-        let nonce = random_nonce()?;
-        let (magic, key) = match password {
-            Some(password) => {
-                let password_key = derive_password_backup_key(password, &salt)?;
-                (
-                    BACKUP_COMBINED_MAGIC,
-                    derive_combined_backup_key(&identity.storage_key(), &password_key),
-                )
-            }
-            None => (BACKUP_MAGIC, derive_backup_key(&identity.storage_key())),
-        };
-        let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
-            .map_err(|_| io::Error::other("backup key unavailable"))?;
-        let encrypted = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &payload,
-                    aad: &backup_aad(identity, magic, password.is_some().then_some(&salt)),
-                },
-            )
-            .map_err(|_| io::Error::other("backup encryption failed"))?;
-        let mut backup = Vec::with_capacity(magic.len() + salt_len + NONCE_BYTES + encrypted.len());
-        backup.extend_from_slice(magic);
-        if password.is_some() {
-            backup.extend_from_slice(&salt);
+        let (current, recovered_partial) = Self::read_for_identity_copy(identity, &self.peer_id)?;
+        if recovered_partial {
+            return Err(invalid_data(
+                "current conversation has an incomplete record",
+            ));
         }
-        backup.extend_from_slice(&nonce);
-        backup.extend_from_slice(&encrypted);
-        Ok(backup)
+        let mut merged = merge_snapshot(current, previous);
+        if !merged
+            .iter()
+            .any(|item| item.sender == transition.sender && item.text == transition.text)
+        {
+            merged.push(transition);
+            merged.sort_by_key(|item| item.unix_time);
+        }
+        self.replace(&merged)?;
+        Self::delete_conversation(identity, previous_peer_id)?;
+        Ok(merged)
+    }
+
+    pub fn append_system_once(
+        &mut self,
+        identity: &Identity,
+        entry: StoredMessage,
+    ) -> io::Result<bool> {
+        if entry.sender != MessageSender::Me || !entry.text.starts_with(IDENTITY_EVENT_PREFIX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected a system history entry",
+            ));
+        }
+        let (messages, recovered_partial) = Self::read_for_identity_copy(identity, &self.peer_id)?;
+        if recovered_partial {
+            return Err(invalid_data("conversation has an incomplete record"));
+        }
+        if messages
+            .iter()
+            .any(|message| message.sender == entry.sender && message.text == entry.text)
+        {
+            return Ok(false);
+        }
+        self.append(&entry)?;
+        Ok(true)
     }
 
     pub fn import_backup(
@@ -344,117 +370,7 @@ impl History {
         backup: &[u8],
         password: Option<&str>,
     ) -> io::Result<(String, usize)> {
-        if backup.len() > MAX_BACKUP_BYTES || backup.len() < BACKUP_MAGIC.len() + NONCE_BYTES + 16 {
-            return Err(invalid_data("invalid backup file"));
-        }
-        let magic = &backup[..BACKUP_MAGIC.len()];
-        let (salt, nonce_start, key) = if magic == BACKUP_MAGIC {
-            if password.is_some() {
-                return Err(invalid_data("legacy backup does not use a password"));
-            }
-            let nonce_start = BACKUP_MAGIC.len();
-            (
-                None,
-                nonce_start,
-                derive_backup_key(&identity.storage_key()),
-            )
-        } else if magic == BACKUP_PASSWORD_MAGIC {
-            // ADBACK2 was password-only. Keep importing it, but new exports use
-            // ADBACK3 so both the identity secret and password are required.
-            let password = password.ok_or_else(|| invalid_data("backup password required"))?;
-            validate_backup_password(password)?;
-            let salt_start = BACKUP_MAGIC.len();
-            let nonce_start = salt_start + BACKUP_SALT_BYTES;
-            if backup.len() < nonce_start + NONCE_BYTES + 16 {
-                return Err(invalid_data("invalid backup file"));
-            }
-            let salt: [u8; BACKUP_SALT_BYTES] = backup[salt_start..nonce_start]
-                .try_into()
-                .expect("fixed-size salt slice");
-            (
-                Some(salt),
-                nonce_start,
-                derive_password_backup_key(password, &salt)?,
-            )
-        } else if magic == BACKUP_COMBINED_MAGIC {
-            let password = password.ok_or_else(|| invalid_data("backup password required"))?;
-            validate_backup_password(password)?;
-            let salt_start = BACKUP_MAGIC.len();
-            let nonce_start = salt_start + BACKUP_SALT_BYTES;
-            if backup.len() < nonce_start + NONCE_BYTES + 16 {
-                return Err(invalid_data("invalid backup file"));
-            }
-            let salt: [u8; BACKUP_SALT_BYTES] = backup[salt_start..nonce_start]
-                .try_into()
-                .expect("fixed-size salt slice");
-            let password_key = derive_password_backup_key(password, &salt)?;
-            (
-                Some(salt),
-                nonce_start,
-                derive_combined_backup_key(&identity.storage_key(), &password_key),
-            )
-        } else {
-            return Err(invalid_data("invalid backup file"));
-        };
-        let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
-            .map_err(|_| invalid_data("invalid backup key"))?;
-        let payload = Zeroizing::new(
-            cipher
-                .decrypt(
-                    Nonce::from_slice(&backup[nonce_start..nonce_start + NONCE_BYTES]),
-                    Payload {
-                        msg: &backup[nonce_start + NONCE_BYTES..],
-                        aad: &backup_aad(identity, magic, salt.as_ref()),
-                    },
-                )
-                .map_err(|_| invalid_data("backup authentication failed"))?,
-        );
-        if payload.len() < 36 {
-            return Err(invalid_data("invalid backup payload"));
-        }
-        let peer_id = hex_encode(&payload[..32]);
-        let count = u32::from_be_bytes(payload[32..36].try_into().expect("fixed slice")) as usize;
-        if count > 1_000_000 || count > (payload.len() - 36) / 13 {
-            return Err(invalid_data("too many backup messages"));
-        }
-        let mut cursor = 36;
-        let mut imported = Vec::with_capacity(count);
-        for _ in 0..count {
-            if payload.len().saturating_sub(cursor) < 13 {
-                return Err(invalid_data("truncated backup message"));
-            }
-            let unix_time =
-                u64::from_be_bytes(payload[cursor..cursor + 8].try_into().expect("fixed slice"));
-            cursor += 8;
-            let sender = match payload[cursor] {
-                0 => MessageSender::Me,
-                1 => MessageSender::Other,
-                _ => return Err(invalid_data("invalid backup sender")),
-            };
-            cursor += 1;
-            let text_len =
-                u32::from_be_bytes(payload[cursor..cursor + 4].try_into().expect("fixed slice"))
-                    as usize;
-            cursor += 4;
-            if text_len == 0
-                || text_len > MAX_MESSAGE_BYTES
-                || payload.len().saturating_sub(cursor) < text_len
-            {
-                return Err(invalid_data("invalid backup message length"));
-            }
-            let text = std::str::from_utf8(&payload[cursor..cursor + text_len])
-                .map_err(|_| invalid_data("backup text is not UTF-8"))?
-                .to_owned();
-            cursor += text_len;
-            imported.push(StoredMessage {
-                unix_time,
-                sender,
-                text,
-            });
-        }
-        if cursor != payload.len() {
-            return Err(invalid_data("unexpected backup data"));
-        }
+        let (peer_id, imported) = decode_backup(identity, backup, password)?;
 
         let (mut history, existing, _) = Self::open(identity, &peer_id)?;
         let merged = merge_snapshot(existing, imported);
@@ -462,6 +378,201 @@ impl History {
         history.replace(&merged)?;
         Ok((peer_id, count))
     }
+}
+
+fn encode_backup(
+    identity: &Identity,
+    peer_id: &str,
+    messages: &[StoredMessage],
+    password: Option<&str>,
+) -> io::Result<Vec<u8>> {
+    let mut payload = Zeroizing::new(Vec::new());
+    if let Some(password) = password {
+        validate_backup_password(password)?;
+    }
+    let salt_len = if password.is_some() {
+        BACKUP_SALT_BYTES
+    } else {
+        0
+    };
+    let header_len = if password.is_some() {
+        BACKUP_COMBINED_MAGIC.len()
+    } else {
+        BACKUP_MAGIC.len()
+    } + salt_len
+        + NONCE_BYTES;
+    let peer = decode_peer_id(peer_id)?;
+    payload.extend_from_slice(&peer);
+    let count = u32::try_from(messages.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many messages"))?;
+    payload.extend_from_slice(&count.to_be_bytes());
+    for message in messages {
+        let text = message.text.as_bytes();
+        payload.extend_from_slice(&message.unix_time.to_be_bytes());
+        payload.push(match message.sender {
+            MessageSender::Me => 0,
+            MessageSender::Other => 1,
+        });
+        payload.extend_from_slice(&(text.len() as u32).to_be_bytes());
+        payload.extend_from_slice(text);
+        if payload.len().saturating_add(header_len + 16) > MAX_BACKUP_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "backup is too large",
+            ));
+        }
+    }
+    let mut salt = [0; BACKUP_SALT_BYTES];
+    File::open("/dev/urandom")?.read_exact(&mut salt)?;
+    let nonce = random_nonce()?;
+    let (magic, key) = match password {
+        Some(password) => {
+            let password_key = derive_password_backup_key(password, &salt)?;
+            (
+                BACKUP_COMBINED_MAGIC,
+                derive_combined_backup_key(&identity.storage_key(), &password_key),
+            )
+        }
+        None => (BACKUP_MAGIC, derive_backup_key(&identity.storage_key())),
+    };
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
+        .map_err(|_| io::Error::other("backup key unavailable"))?;
+    let encrypted = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &payload,
+                aad: &backup_aad(identity, magic, password.is_some().then_some(&salt)),
+            },
+        )
+        .map_err(|_| io::Error::other("backup encryption failed"))?;
+    let mut backup = Vec::with_capacity(magic.len() + salt_len + NONCE_BYTES + encrypted.len());
+    backup.extend_from_slice(magic);
+    if password.is_some() {
+        backup.extend_from_slice(&salt);
+    }
+    backup.extend_from_slice(&nonce);
+    backup.extend_from_slice(&encrypted);
+    Ok(backup)
+}
+
+fn decode_backup(
+    identity: &Identity,
+    backup: &[u8],
+    password: Option<&str>,
+) -> io::Result<(String, Vec<StoredMessage>)> {
+    if backup.len() > MAX_BACKUP_BYTES || backup.len() < BACKUP_MAGIC.len() + NONCE_BYTES + 16 {
+        return Err(invalid_data("invalid backup file"));
+    }
+    let magic = &backup[..BACKUP_MAGIC.len()];
+    let (salt, nonce_start, key) = if magic == BACKUP_MAGIC {
+        if password.is_some() {
+            return Err(invalid_data("legacy backup does not use a password"));
+        }
+        let nonce_start = BACKUP_MAGIC.len();
+        (
+            None,
+            nonce_start,
+            derive_backup_key(&identity.storage_key()),
+        )
+    } else if magic == BACKUP_PASSWORD_MAGIC {
+        // ADBACK2 was password-only. Keep importing it, but new exports use
+        // ADBACK3 so both the identity secret and password are required.
+        let password = password.ok_or_else(|| invalid_data("backup password required"))?;
+        validate_backup_password(password)?;
+        let salt_start = BACKUP_MAGIC.len();
+        let nonce_start = salt_start + BACKUP_SALT_BYTES;
+        if backup.len() < nonce_start + NONCE_BYTES + 16 {
+            return Err(invalid_data("invalid backup file"));
+        }
+        let salt: [u8; BACKUP_SALT_BYTES] = backup[salt_start..nonce_start]
+            .try_into()
+            .expect("fixed-size salt slice");
+        (
+            Some(salt),
+            nonce_start,
+            derive_password_backup_key(password, &salt)?,
+        )
+    } else if magic == BACKUP_COMBINED_MAGIC {
+        let password = password.ok_or_else(|| invalid_data("backup password required"))?;
+        validate_backup_password(password)?;
+        let salt_start = BACKUP_MAGIC.len();
+        let nonce_start = salt_start + BACKUP_SALT_BYTES;
+        if backup.len() < nonce_start + NONCE_BYTES + 16 {
+            return Err(invalid_data("invalid backup file"));
+        }
+        let salt: [u8; BACKUP_SALT_BYTES] = backup[salt_start..nonce_start]
+            .try_into()
+            .expect("fixed-size salt slice");
+        let password_key = derive_password_backup_key(password, &salt)?;
+        (
+            Some(salt),
+            nonce_start,
+            derive_combined_backup_key(&identity.storage_key(), &password_key),
+        )
+    } else {
+        return Err(invalid_data("invalid backup file"));
+    };
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
+        .map_err(|_| invalid_data("invalid backup key"))?;
+    let payload = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(&backup[nonce_start..nonce_start + NONCE_BYTES]),
+                Payload {
+                    msg: &backup[nonce_start + NONCE_BYTES..],
+                    aad: &backup_aad(identity, magic, salt.as_ref()),
+                },
+            )
+            .map_err(|_| invalid_data("backup authentication failed"))?,
+    );
+    if payload.len() < 36 {
+        return Err(invalid_data("invalid backup payload"));
+    }
+    let peer_id = hex_encode(&payload[..32]);
+    let count = u32::from_be_bytes(payload[32..36].try_into().expect("fixed slice")) as usize;
+    if count > 1_000_000 || count > (payload.len() - 36) / 13 {
+        return Err(invalid_data("too many backup messages"));
+    }
+    let mut cursor = 36;
+    let mut imported = Vec::with_capacity(count);
+    for _ in 0..count {
+        if payload.len().saturating_sub(cursor) < 13 {
+            return Err(invalid_data("truncated backup message"));
+        }
+        let unix_time =
+            u64::from_be_bytes(payload[cursor..cursor + 8].try_into().expect("fixed slice"));
+        cursor += 8;
+        let sender = match payload[cursor] {
+            0 => MessageSender::Me,
+            1 => MessageSender::Other,
+            _ => return Err(invalid_data("invalid backup sender")),
+        };
+        cursor += 1;
+        let text_len =
+            u32::from_be_bytes(payload[cursor..cursor + 4].try_into().expect("fixed slice"))
+                as usize;
+        cursor += 4;
+        if text_len == 0
+            || text_len > MAX_MESSAGE_BYTES
+            || payload.len().saturating_sub(cursor) < text_len
+        {
+            return Err(invalid_data("invalid backup message length"));
+        }
+        let text = std::str::from_utf8(&payload[cursor..cursor + text_len])
+            .map_err(|_| invalid_data("backup text is not UTF-8"))?
+            .to_owned();
+        cursor += text_len;
+        imported.push(StoredMessage {
+            unix_time,
+            sender,
+            text,
+        });
+    }
+    if cursor != payload.len() {
+        return Err(invalid_data("unexpected backup data"));
+    }
+    Ok((peer_id, imported))
 }
 
 /// Backups contain snapshots without record IDs. Preserve the greatest count of
@@ -1030,6 +1141,51 @@ mod tests {
         );
         assert_eq!(std::fs::read(history_path).unwrap(), original_history);
         assert_eq!(std::fs::read(contact_path).unwrap(), original_contact);
+        assert_eq!(
+            crate::identity::previous_public_ids(&replacement).unwrap(),
+            vec![old_identity.public_id()]
+        );
+    }
+
+    #[test]
+    fn identity_transition_link_merges_before_removing_previous_conversation() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let previous_peer = "51".repeat(32);
+        let current_peer = "52".repeat(32);
+        let repeated = StoredMessage {
+            unix_time: 10,
+            sender: MessageSender::Other,
+            text: "repeated before transition".to_owned(),
+        };
+        let current = message(20, "new identity session");
+        let (mut old_history, _, _) = History::open(&identity, &previous_peer).unwrap();
+        old_history.append(&repeated).unwrap();
+        old_history.append(&repeated).unwrap();
+        let (mut new_history, _, _) = History::open(&identity, &current_peer).unwrap();
+        new_history.append(&current).unwrap();
+        let transition = StoredMessage {
+            unix_time: 30,
+            sender: MessageSender::Me,
+            text: format!(
+                "{}peer:{previous_peer}:{current_peer}",
+                super::IDENTITY_EVENT_PREFIX
+            ),
+        };
+
+        let merged = new_history
+            .link_prior_identity(&identity, &previous_peer, transition.clone())
+            .unwrap();
+
+        assert_eq!(merged.iter().filter(|item| *item == &repeated).count(), 2);
+        assert!(merged.contains(&current));
+        assert!(merged.contains(&transition));
+        assert!(History::known_peer_ids(&identity)
+            .unwrap()
+            .contains(&current_peer));
+        assert!(!History::known_peer_ids(&identity)
+            .unwrap()
+            .contains(&previous_peer));
     }
 
     #[test]
@@ -1170,6 +1326,62 @@ mod tests {
             .unwrap()
             .1,
             3
+        );
+    }
+
+    #[test]
+    fn old_identity_backup_can_be_reprotected_without_changing_the_source() {
+        let _data = IsolatedData::new();
+        let (old_identity, old_code) = Identity::create().unwrap();
+        let (replacement, _) = Identity::create().unwrap();
+        let peer = "ac".repeat(32);
+        let original_messages = vec![
+            message(1_700_000_001, "first"),
+            message(1_700_000_001, "first"),
+        ];
+        let source = legacy_password_backup(
+            &old_identity,
+            &peer,
+            &original_messages,
+            "previous backup password",
+        );
+        let source_copy = source.clone();
+
+        assert!(History::reprotect_backup(
+            &old_identity,
+            &replacement,
+            &source,
+            Some("wrong previous password"),
+            None,
+        )
+        .is_err());
+        let reprotected = History::reprotect_backup(
+            &old_identity,
+            &replacement,
+            &source,
+            Some("previous backup password"),
+            Some("new backup password"),
+        )
+        .unwrap();
+
+        assert_eq!(source, source_copy);
+        assert_eq!(
+            History::verify_backup(&replacement, &reprotected, Some("new backup password"))
+                .unwrap(),
+            (peer.clone(), original_messages.len())
+        );
+        assert!(
+            History::verify_backup(&old_identity, &reprotected, Some("new backup password"))
+                .is_err()
+        );
+        assert_eq!(
+            History::verify_backup(&old_identity, &source, Some("previous backup password"))
+                .unwrap(),
+            (peer, original_messages.len())
+        );
+        assert_eq!(
+            Identity::from_code(&old_code).unwrap().public_id(),
+            old_identity.public_id()
         );
     }
 

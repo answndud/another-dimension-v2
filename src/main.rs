@@ -26,6 +26,7 @@ const PAGE: &[u8] = include_bytes!("../web/index.html");
 const SCRIPT: &[u8] = include_bytes!("../web/app.js");
 const MAX_HEADER: usize = 8192;
 const MAX_BODY: usize = 24 * 1024 * 1024;
+const CHAT_CONTROL_PREFIX: &[u8] = b"[AD2-CONTROL/1] ";
 const CODE_LIFETIME: Duration = Duration::from_secs(300);
 const MAX_ATTEMPTS: u8 = 5;
 const PEER_HEARTBEAT_FRAME: &[u8] = &[0xff, b'A', b'D', b'2', b'-', b'H', b'B', b'2'];
@@ -54,6 +55,7 @@ struct AppSettings {
 enum ChatCommand {
     Confirm,
     Send(String, Sender<()>),
+    AcceptIdentityTransition(String, Sender<bool>),
     Cancel,
 }
 
@@ -72,6 +74,8 @@ struct ChatSnapshot {
     messages: Vec<ChatEntry>,
     relay_ack: Option<String>,
     pending_sends: usize,
+    identity_transition: Option<Vec<String>>,
+    message_epoch: u64,
 }
 
 #[derive(Clone)]
@@ -92,6 +96,85 @@ fn submit_chat_message(sender: &Sender<ChatCommand>, text: String, timeout: Dura
     sender.send(ChatCommand::Send(text, processed)).is_ok() && result.recv_timeout(timeout).is_ok()
 }
 
+fn chat_control(value: serde_json::Value) -> Vec<u8> {
+    let mut frame = CHAT_CONTROL_PREFIX.to_vec();
+    frame.extend_from_slice(value.to_string().as_bytes());
+    frame
+}
+
+fn parse_chat_control(message: &[u8]) -> Result<Option<serde_json::Value>, ()> {
+    let Some(payload) = message.strip_prefix(CHAT_CONTROL_PREFIX) else {
+        return Ok(None);
+    };
+    serde_json::from_slice(payload).map(Some).map_err(|_| ())
+}
+
+fn chat_entry(item: history::StoredMessage) -> ChatEntry {
+    let is_identity_event = item.text.starts_with(history::IDENTITY_EVENT_PREFIX);
+    let display_text = item
+        .text
+        .strip_prefix(history::IDENTITY_EVENT_PREFIX)
+        .and_then(|value| {
+            let mut parts = value.split(':');
+            let kind = parts.next()?;
+            let previous = parts.next()?;
+            let current = parts.next()?;
+            if previous.len() != 64 || current.len() != 64 {
+                return None;
+            }
+            Some(match kind {
+                "self" => format!(
+                    "내 신원이 {}에서 {}로 변경되어 이 대화를 이어갑니다.",
+                    &previous[..12],
+                    &current[..12]
+                ),
+                "peer" => format!(
+                    "상대 신원이 {}에서 {}로 변경되어 기존 기록을 연결했습니다.",
+                    &previous[..12],
+                    &current[..12]
+                ),
+                _ => return None,
+            })
+        });
+    ChatEntry {
+        unix_time: item.unix_time,
+        sender: if is_identity_event {
+            "신원 변경"
+        } else {
+            match item.sender {
+                history::MessageSender::Me => "나",
+                history::MessageSender::Other => "상대방",
+            }
+        },
+        text: display_text.unwrap_or(item.text),
+    }
+}
+
+fn identity_event(kind: &str, previous_id: &str, current_id: &str) -> history::StoredMessage {
+    history::StoredMessage {
+        unix_time: now_seconds(),
+        sender: history::MessageSender::Me,
+        text: format!(
+            "{}{kind}:{previous_id}:{current_id}",
+            history::IDENTITY_EVENT_PREFIX
+        ),
+    }
+}
+
+fn identity_event_exists_for_previous(
+    messages: &[history::StoredMessage],
+    kind: &str,
+    previous_id: &str,
+) -> bool {
+    messages.iter().any(|message| {
+        let Some(marker) = message.text.strip_prefix(history::IDENTITY_EVENT_PREFIX) else {
+            return false;
+        };
+        let mut fields = marker.split(':');
+        fields.next() == Some(kind) && fields.next() == Some(previous_id)
+    })
+}
+
 fn rejected_message(pending_events: &mut HashSet<String>, event_id: &str) -> bool {
     pending_events.remove(event_id)
 }
@@ -99,6 +182,31 @@ fn rejected_message(pending_events: &mut HashSet<String>, event_id: &str) -> boo
 #[cfg(test)]
 mod send_tests {
     use super::*;
+
+    #[test]
+    fn identity_transition_control_and_history_marker_roundtrip() {
+        let previous = "ab".repeat(32);
+        let current = "cd".repeat(32);
+        let frame = chat_control(serde_json::json!({
+            "type": "identity-transition",
+            "previousPeerIds": [previous],
+        }));
+        let control = parse_chat_control(&frame).unwrap().unwrap();
+        assert_eq!(
+            control["previousPeerIds"][0].as_str().unwrap(),
+            "ab".repeat(32)
+        );
+
+        let event = identity_event("peer", &"ab".repeat(32), &current);
+        assert!(identity_event_exists_for_previous(
+            std::slice::from_ref(&event),
+            "peer",
+            &"ab".repeat(32)
+        ));
+        let displayed = chat_entry(event);
+        assert_eq!(displayed.sender, "신원 변경");
+        assert!(displayed.text.contains("cdcdcdcdcdcd"));
+    }
 
     #[test]
     fn queued_message_is_not_acknowledged_if_worker_exits() {
@@ -225,6 +333,17 @@ fn spawn_chat_worker(
     last_notification: Arc<Mutex<Option<Instant>>>,
 ) {
     thread::spawn(move || {
+        let previous_identity_ids = match identity::previous_public_ids(&identity) {
+            Ok(ids) => ids,
+            Err(_) => {
+                chat_update(&operation, |snapshot| {
+                    snapshot.phase = "failed";
+                    snapshot.error =
+                        Some("이전 신원 기록을 읽지 못해 연결을 시작하지 않았습니다.".to_owned());
+                });
+                return;
+            }
+        };
         let result = (|| -> Result<(RelaySession, Option<history::History>, Vec<ChatEntry>, Option<String>), String> {
             let invite = InviteCode::parse(&code).ok_or("초대 코드를 확인하세요.")?;
             let mut rendezvous = match role {
@@ -259,12 +378,15 @@ fn spawn_chat_worker(
                     Ok(ChatCommand::Confirm) => break verification,
                     Ok(ChatCommand::Cancel) => return Err("취소되었습니다.".to_owned()),
                     Ok(ChatCommand::Send(_, _)) => {}
+                    Ok(ChatCommand::AcceptIdentityTransition(_, result)) => {
+                        let _ = result.send(false);
+                    }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return Err("취소되었습니다.".to_owned()),
                 }
             }};
             chat_update(&operation, |snapshot| snapshot.phase = "confirming");
-            let session = if expected_peer.is_some() {
+            let mut session = if expected_peer.is_some() {
                 rendezvous.confirm(verification).map_err(|error| relay_failure_message(&error, "confirmation", tor_socks.is_some()))?
             } else {
             let (session, rendezvous_secret) = rendezvous
@@ -277,25 +399,32 @@ fn spawn_chat_worker(
                 .map_err(|_| "상대 확인 정보를 저장하지 못했습니다. 기존 확인 기록을 확인하세요.".to_owned())?;
             session
             };
-            let (history, entries, storage_error) = match history::History::open(&identity, &peer_id) {
+            let (history, entries, storage_error, pending_previous_ids) = match history::History::open(&identity, &peer_id) {
                 Ok((history, stored, recovered_partial)) => {
+                    let pending = previous_identity_ids
+                        .iter()
+                        .filter(|old_id| {
+                            !identity_event_exists_for_previous(&stored, "self", old_id)
+                        })
+                        .cloned()
+                        .collect();
                     let entries = stored
                         .into_iter()
-                        .map(|item| ChatEntry {
-                            unix_time: item.unix_time,
-                            sender: match item.sender {
-                                history::MessageSender::Me => "나",
-                                history::MessageSender::Other => "상대방",
-                            },
-                            text: item.text,
-                        })
+                        .map(chat_entry)
                         .collect();
                     let warning = recovered_partial
                         .then(|| "대화 기록의 마지막 불완전 항목을 제거했습니다.".to_owned());
-                    (Some(history), entries, warning)
+                    (Some(history), entries, warning, pending)
                 }
-                Err(_) => (None, Vec::new(), Some("대화 기록을 열지 못했습니다. 이번 대화는 프로그램을 종료하면 사라질 수 있습니다.".to_owned())),
+                Err(_) => (None, Vec::new(), Some("대화 기록을 열지 못했습니다. 이번 대화는 프로그램을 종료하면 사라질 수 있습니다.".to_owned()), previous_identity_ids.clone()),
             };
+            if !pending_previous_ids.is_empty() {
+                let announcement = chat_control(serde_json::json!({
+                    "type": "identity-transition",
+                    "previousPeerIds": pending_previous_ids,
+                }));
+                session.send(&announcement).map_err(|_| "신원 변경 안내를 상대에게 보내지 못했습니다.".to_owned())?;
+            }
             Ok((session, history, entries, storage_error))
         })();
 
@@ -320,6 +449,7 @@ fn spawn_chat_worker(
                 return;
             }
         };
+        let mut peer_transition_ids = Vec::<String>::new();
         let mut pending_events = HashSet::<String>::new();
         let mut last_peer_activity = Instant::now();
         let mut last_heartbeat = Instant::now();
@@ -412,6 +542,48 @@ fn spawn_chat_worker(
                         operation.cancelled.store(true, Ordering::SeqCst);
                         break;
                     }
+                    Ok(ChatCommand::AcceptIdentityTransition(previous_peer_id, result)) => {
+                        let linked = if peer_transition_ids.contains(&previous_peer_id) {
+                            let current_peer_id = operation
+                                .snapshot
+                                .lock()
+                                .ok()
+                                .and_then(|snapshot| snapshot.peer_id.clone())
+                                .unwrap_or_default();
+                            let transition =
+                                identity_event("peer", &previous_peer_id, &current_peer_id);
+                            match history.as_mut() {
+                                Some(current) => current
+                                    .link_prior_identity(&identity, &previous_peer_id, transition)
+                                    .map(|messages| {
+                                        let entries =
+                                            messages.into_iter().map(chat_entry).collect();
+                                        chat_update(&operation, |snapshot| {
+                                            snapshot.messages = entries;
+                                            snapshot.identity_transition = None;
+                                            snapshot.message_epoch =
+                                                snapshot.message_epoch.wrapping_add(1);
+                                        });
+                                    })
+                                    .is_ok(),
+                                None => false,
+                            }
+                        } else {
+                            false
+                        };
+                        if linked {
+                            let frame = chat_control(serde_json::json!({
+                                "type": "identity-linked",
+                                "previousPeerId": previous_peer_id,
+                            }));
+                            if session.send(&frame).is_err() {
+                                chat_update(&operation, |snapshot| {
+                                    snapshot.storage_error = Some("기존 기록은 이 기기에 연결했지만 상대에게 변경 알림을 보내지 못했습니다.".to_owned());
+                                });
+                            }
+                        }
+                        let _ = result.send(linked);
+                    }
                     Ok(ChatCommand::Confirm) => {}
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return,
@@ -428,6 +600,143 @@ fn spawn_chat_worker(
                             continue;
                         }
                         last_peer_activity = Instant::now();
+                        let control = match parse_chat_control(&message) {
+                            Ok(control) => control,
+                            Err(()) => {
+                                drop(history.take());
+                                chat_update(&operation, |snapshot| {
+                                    snapshot.phase = "disconnected";
+                                    snapshot.error = Some(
+                                        "상대의 내부 연결 안내 형식이 잘못되었습니다.".to_owned(),
+                                    );
+                                });
+                                return;
+                            }
+                        };
+                        if let Some(control) = control {
+                            match control.get("type").and_then(serde_json::Value::as_str) {
+                                Some("identity-transition") => {
+                                    let Some(ids) = control
+                                        .get("previousPeerIds")
+                                        .and_then(serde_json::Value::as_array)
+                                    else {
+                                        drop(history.take());
+                                        mark_chat_disconnected(
+                                            &operation,
+                                            "상대의 이전 신원 정보가 잘못되었습니다.",
+                                            false,
+                                        );
+                                        return;
+                                    };
+                                    let mut parsed = Vec::new();
+                                    for id in ids.iter().filter_map(serde_json::Value::as_str) {
+                                        if history::decode_peer_id(id).is_err()
+                                            || parsed.contains(&id.to_ascii_lowercase())
+                                            || parsed.len() >= 32
+                                        {
+                                            drop(history.take());
+                                            mark_chat_disconnected(
+                                                &operation,
+                                                "상대의 이전 신원 정보가 잘못되었습니다.",
+                                                false,
+                                            );
+                                            return;
+                                        }
+                                        parsed.push(id.to_ascii_lowercase());
+                                    }
+                                    if parsed.len() != ids.len() {
+                                        drop(history.take());
+                                        mark_chat_disconnected(
+                                            &operation,
+                                            "상대의 이전 신원 정보가 잘못되었습니다.",
+                                            false,
+                                        );
+                                        return;
+                                    }
+                                    let current_peer_id = operation
+                                        .snapshot
+                                        .lock()
+                                        .ok()
+                                        .and_then(|snapshot| snapshot.peer_id.clone())
+                                        .unwrap_or_default();
+                                    let current_messages =
+                                        history::History::open(&identity, &current_peer_id)
+                                            .map(|(_, messages, _)| messages)
+                                            .unwrap_or_default();
+                                    let mut pending = Vec::new();
+                                    for old_id in parsed {
+                                        if identity_event_exists_for_previous(
+                                            &current_messages,
+                                            "peer",
+                                            &old_id,
+                                        ) {
+                                            let ack = chat_control(serde_json::json!({
+                                                "type": "identity-linked",
+                                                "previousPeerId": old_id,
+                                            }));
+                                            let _ = session.send(&ack);
+                                        } else {
+                                            pending.push(old_id);
+                                        }
+                                    }
+                                    peer_transition_ids = pending.clone();
+                                    chat_update(&operation, |snapshot| {
+                                        snapshot.identity_transition = Some(pending);
+                                    });
+                                }
+                                Some("identity-linked") => {
+                                    let Some(previous_id) = control
+                                        .get("previousPeerId")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_ascii_lowercase)
+                                    else {
+                                        drop(history.take());
+                                        mark_chat_disconnected(
+                                            &operation,
+                                            "상대의 신원 변경 응답이 잘못되었습니다.",
+                                            false,
+                                        );
+                                        return;
+                                    };
+                                    if !previous_identity_ids.contains(&previous_id) {
+                                        continue;
+                                    }
+                                    let entry =
+                                        identity_event("self", &previous_id, &identity.public_id());
+                                    match history.as_mut() {
+                                        Some(current) => match current
+                                            .append_system_once(&identity, entry.clone())
+                                        {
+                                            Ok(true) => chat_update(&operation, |snapshot| {
+                                                snapshot.messages.push(chat_entry(entry))
+                                            }),
+                                            Ok(false) => {}
+                                            Err(_) => chat_update(&operation, |snapshot| {
+                                                snapshot.storage_error = Some(
+                                                    "신원 변경 기록을 저장하지 못했습니다."
+                                                        .to_owned(),
+                                                )
+                                            }),
+                                        },
+                                        None => chat_update(&operation, |snapshot| {
+                                            snapshot.storage_error = Some(
+                                                "신원 변경 기록을 저장하지 못했습니다.".to_owned(),
+                                            )
+                                        }),
+                                    }
+                                }
+                                _ => {
+                                    drop(history.take());
+                                    mark_chat_disconnected(
+                                        &operation,
+                                        "알 수 없는 내부 연결 안내를 받았습니다.",
+                                        false,
+                                    );
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
                         match String::from_utf8(message) {
                             Ok(text) => {
                                 let entry = history::StoredMessage {
@@ -597,14 +906,8 @@ fn update_closed_chat_history(
                 snapshot.messages = messages
                     .unwrap_or_default()
                     .iter()
-                    .map(|item| ChatEntry {
-                        unix_time: item.unix_time,
-                        sender: match item.sender {
-                            history::MessageSender::Me => "나",
-                            history::MessageSender::Other => "상대방",
-                        },
-                        text: item.text.clone(),
-                    })
+                    .cloned()
+                    .map(chat_entry)
                     .collect();
             }
         }
@@ -893,6 +1196,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/chat/reconnect HTTP/1.1"
             | "POST /api/chat/status HTTP/1.1"
             | "POST /api/chat/confirm HTTP/1.1"
+            | "POST /api/chat/link-identity HTTP/1.1"
             | "POST /api/chat/cancel HTTP/1.1"
             | "POST /api/chat/send HTTP/1.1"
             | "POST /api/chat/messages HTTP/1.1"
@@ -903,6 +1207,8 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/history/delete-conversation HTTP/1.1"
             | "POST /api/history/export-backup HTTP/1.1"
             | "POST /api/history/import-backup HTTP/1.1"
+            | "POST /api/history/reprotect-backup HTTP/1.1"
+            | "POST /api/history/verify-backup HTTP/1.1"
             | "POST /api/contacts/export-backup HTTP/1.1"
             | "POST /api/contacts/import-backup HTTP/1.1"
     ) {
@@ -1137,6 +1443,8 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 messages: Vec::new(),
                 relay_ack: None,
                 pending_sends: 0,
+                identity_transition: None,
+                message_epoch: 0,
             }),
             sender,
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -1188,6 +1496,8 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             "storageError": snapshot.storage_error,
             "relayAck": snapshot.relay_ack,
             "pendingSends": snapshot.pending_sends,
+            "identityTransition": snapshot.identity_transition,
+            "messageEpoch": snapshot.message_epoch,
             "messageCount": snapshot.messages.len()
         })
         .to_string();
@@ -1212,6 +1522,60 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             b"ok",
         );
     }
+    if first == "POST /api/chat/link-identity HTTP/1.1" {
+        let Some((operation_id, previous_peer_id)) = body.split_once('\n') else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        if history::decode_peer_id(previous_peer_id).is_err() {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        let previous_peer_id = previous_peer_id.to_ascii_lowercase();
+        if peer_chat_active(&state, &previous_peer_id) {
+            return reject(&mut stream, "409 Conflict");
+        }
+        let Some(operation) = state.chats.get(operation_id) else {
+            return reject(&mut stream, "404 Not Found");
+        };
+        let Ok(snapshot) = operation.snapshot.lock() else {
+            return reject(&mut stream, "503 Service Unavailable");
+        };
+        if snapshot.phase != "connected"
+            || !snapshot
+                .identity_transition
+                .as_ref()
+                .is_some_and(|ids| ids.iter().any(|id| id == &previous_peer_id))
+        {
+            return reject(&mut stream, "409 Conflict");
+        }
+        drop(snapshot);
+        let Some(identity) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        let contact_directory = history::data_directory()?
+            .join(identity.public_id())
+            .join("verified-contacts");
+        let Ok(previous_peer_key) = history::decode_peer_id(&previous_peer_id) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        if contacts::load(&contact_directory, identity, previous_peer_key).is_err() {
+            return reject(&mut stream, "409 Conflict");
+        }
+        let (result_sender, result_receiver) = mpsc::channel();
+        if operation
+            .sender
+            .send(ChatCommand::AcceptIdentityTransition(
+                previous_peer_id,
+                result_sender,
+            ))
+            .is_err()
+        {
+            return reject(&mut stream, "409 Conflict");
+        }
+        return match result_receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok(true) => respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok"),
+            _ => reject(&mut stream, "409 Conflict"),
+        };
+    }
     if first == "POST /api/chat/cancel HTTP/1.1" {
         let Some(operation) = state.chats.get(body) else {
             return reject(&mut stream, "404 Not Found");
@@ -1229,7 +1593,14 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some((operation_id, text)) = body.split_once('\n') else {
             return reject(&mut stream, "400 Bad Request");
         };
-        if text.trim().is_empty() || text.len() > 4078 {
+        if text.trim().is_empty()
+            || text.len() > 4078
+            || text.as_bytes().starts_with(CHAT_CONTROL_PREFIX)
+            || text
+                .as_bytes()
+                .starts_with(history::IDENTITY_EVENT_PREFIX.as_bytes())
+            || text.contains('\0')
+        {
             return reject(&mut stream, "400 Bad Request");
         }
         let Some(operation) = state.chats.get(operation_id) else {
@@ -1391,11 +1762,8 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 serde_json::json!({
                     "index": index,
                     "time": item.unix_time,
-                    "sender": match item.sender {
-                        history::MessageSender::Me => "나",
-                        history::MessageSender::Other => "상대방",
-                    },
-                    "text": item.text
+                    "sender": chat_entry(item.clone()).sender,
+                    "text": chat_entry(item).text
                 })
             })
             .collect();
@@ -1557,6 +1925,103 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             "200 OK",
             "application/json; charset=utf-8",
             payload.as_bytes(),
+        );
+    }
+    if first == "POST /api/history/reprotect-backup HTTP/1.1" {
+        let Some(identity) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        let Ok(mut request) = serde_json::from_str::<serde_json::Value>(body) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Some(fields) = request.as_object_mut() else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Some(backup_text) = fields
+            .remove("backup")
+            .and_then(|value| value.as_str().map(str::to_owned))
+        else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Some(previous_code) = fields
+            .remove("previousCode")
+            .and_then(|value| value.as_str().map(|value| Zeroizing::new(value.to_owned())))
+        else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let previous_password = fields
+            .remove("previousPassword")
+            .and_then(|value| value.as_str().map(|value| Zeroizing::new(value.to_owned())))
+            .filter(|password| !password.is_empty());
+        let replacement_password = fields
+            .remove("replacementPassword")
+            .and_then(|value| value.as_str().map(|value| Zeroizing::new(value.to_owned())))
+            .filter(|password| !password.is_empty());
+        if !fields.is_empty() {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        let Some(previous_identity) = Identity::from_code(&previous_code) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Ok(backup) = BASE64.decode(backup_text) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Ok(reprotected) = history::History::reprotect_backup(
+            &previous_identity,
+            identity,
+            &backup,
+            previous_password.as_deref().map(String::as_str),
+            replacement_password.as_deref().map(String::as_str),
+        ) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        return respond(
+            &mut stream,
+            "200 OK",
+            "text/plain; charset=utf-8",
+            BASE64.encode(reprotected).as_bytes(),
+        );
+    }
+    if first == "POST /api/history/verify-backup HTTP/1.1" {
+        let Some(identity) = state.identity.as_ref() else {
+            return reject(&mut stream, "401 Unauthorized");
+        };
+        let Ok(mut request) = serde_json::from_str::<serde_json::Value>(body) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Some(fields) = request.as_object_mut() else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Some(backup_text) = fields
+            .remove("backup")
+            .and_then(|value| value.as_str().map(str::to_owned))
+        else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let password = fields
+            .remove("password")
+            .and_then(|value| value.as_str().map(|value| Zeroizing::new(value.to_owned())))
+            .filter(|password| !password.is_empty());
+        if !fields.is_empty() {
+            return reject(&mut stream, "400 Bad Request");
+        }
+        let Ok(backup) = BASE64.decode(backup_text) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let Ok((peer_id, message_count)) = history::History::verify_backup(
+            identity,
+            &backup,
+            password.as_deref().map(String::as_str),
+        ) else {
+            return reject(&mut stream, "400 Bad Request");
+        };
+        let response =
+            serde_json::json!({ "peerId": peer_id, "messageCount": message_count }).to_string();
+        return respond(
+            &mut stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            response.as_bytes(),
         );
     }
     match first.as_str() {

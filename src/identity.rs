@@ -3,8 +3,8 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use std::fs::File;
-use std::io::{self, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use zeroize::Zeroizing;
 
 const LEGACY_PREFIX: &str = "AD1-";
@@ -16,6 +16,7 @@ const STORAGE_KEY_CONTEXT: &[u8] = b"another-dimension-v2/local-history/v1";
 const CODE_KEY_BYTES: usize = 32;
 const NONCE_BYTES: usize = 12;
 const WRAPPED_SEED_BYTES: usize = 32 + 16;
+const ORIGINS_FILE: &str = "identity-origins.txt";
 
 pub struct Identity {
     // Retained for independently derived storage and identity-code wrapping keys.
@@ -160,6 +161,12 @@ impl Identity {
         }
 
         let result = (|| {
+            fs::create_dir_all(&destination)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))?;
+            }
             for peer_id in crate::history::History::known_peer_ids(self)? {
                 let (messages, recovered_partial) =
                     crate::history::History::read_for_identity_copy(self, &peer_id)?;
@@ -183,6 +190,31 @@ impl Identity {
             for contact in &source_contacts {
                 crate::contacts::save(&contact_directory, replacement, contact)?;
             }
+            let mut origins = previous_public_ids(self)?;
+            origins.push(self.public_id());
+            origins.sort();
+            origins.dedup();
+            if origins.len() > 32 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "identity lineage is too long",
+                ));
+            }
+            let origin_path = destination.join(ORIGINS_FILE);
+            let temporary = destination.join(format!(".{ORIGINS_FILE}.tmp"));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            for id in origins {
+                writeln!(file, "{id}")?;
+            }
+            file.sync_all()?;
+            fs::rename(temporary, origin_path)?;
             Ok(())
         })();
 
@@ -191,6 +223,47 @@ impl Identity {
         }
         result
     }
+}
+
+pub(crate) fn previous_public_ids(identity: &Identity) -> io::Result<Vec<String>> {
+    let path = crate::history::data_directory()?
+        .join(identity.public_id())
+        .join(ORIGINS_FILE);
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.len() > 32 * 65 => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "identity lineage is too large",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    }
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut ids = Vec::new();
+    for id in contents.lines() {
+        if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid identity lineage record",
+            ));
+        }
+        ids.push(id.to_ascii_lowercase());
+        if ids.len() > 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "identity lineage is too long",
+            ));
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
 }
 
 fn derive_code_key(wrap_key: &[u8; CODE_KEY_BYTES]) -> Zeroizing<[u8; 32]> {
