@@ -508,8 +508,8 @@ mod send_tests {
             })
             .sum();
         assert!(messages.len() > 4_096);
-        assert!(total_bytes > 16 * 1024 * 1024);
         assert!(total_bytes < MAX_SYNC_BYTES);
+        assert!(total_bytes > 16 * 1024 * 1024);
 
         let mut sender = HistorySyncSender::new(request_id.clone(), messages);
         let mut receiver = HistorySyncReceiver::default();
@@ -1298,18 +1298,15 @@ fn spawn_chat_worker(
                                         .ok()
                                         .and_then(|snapshot| snapshot.peer_id.clone())
                                         .unwrap_or_default();
-                                    let current_messages =
-                                        history::History::open(&identity, &current_peer_id)
-                                            .map(|(_, messages, _)| messages)
-                                            .unwrap_or_default();
                                     let mut pending = Vec::new();
                                     for old_id in parsed {
-                                        if identity_event_exists_for_previous(
-                                            &current_messages,
-                                            "peer",
-                                            &old_id,
+                                        if history::is_linked_peer_identity(
+                                            &identity,
                                             &current_peer_id,
-                                        ) {
+                                            &old_id,
+                                        )
+                                        .unwrap_or(false)
+                                        {
                                             let ack = chat_control(serde_json::json!({
                                                 "type": "identity-linked",
                                                 "previousPeerId": old_id,
@@ -1347,10 +1344,27 @@ fn spawn_chat_worker(
                                         Some(current) => match current
                                             .append_system_once(&identity, entry.clone())
                                         {
-                                            Ok(true) => chat_update(&operation, |snapshot| {
-                                                snapshot.messages.push(chat_entry(entry))
-                                            }),
-                                            Ok(false) => {}
+                                            Ok(added) => {
+                                                match history::record_linked_local_identity(
+                                                    &identity,
+                                                    &peer_id,
+                                                    &previous_id,
+                                                ) {
+                                                    Ok(()) if added => {
+                                                        chat_update(&operation, |snapshot| {
+                                                            snapshot
+                                                                .messages
+                                                                .push(chat_entry(entry))
+                                                        })
+                                                    }
+                                                    Ok(()) => {}
+                                                    Err(error) => {
+                                                        chat_update(&operation, |snapshot| {
+                                                            snapshot.storage_error = Some(format!("이전 신원 연결 확인 정보를 저장하지 못했습니다. 재연결 후 다시 시도하세요: {error}"))
+                                                        })
+                                                    }
+                                                }
+                                            }
                                             Err(_) => chat_update(&operation, |snapshot| {
                                                 snapshot.storage_error = Some(
                                                     "신원 변경 기록을 저장하지 못했습니다."
@@ -1485,6 +1499,7 @@ fn spawn_chat_worker(
                                                 ));
                                             }
                                             history::linked_identity_keys(
+                                                &identity,
                                                 &messages,
                                                 &identity.public_id(),
                                                 &peer_id,

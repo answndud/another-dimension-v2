@@ -25,6 +25,7 @@ const BACKUP_PASSWORD_MAGIC: &[u8; 8] = b"ADBACK2\0";
 const BACKUP_COMBINED_MAGIC: &[u8; 8] = b"ADBACK3\0";
 const BACKUP_SIGNED_MAGIC: &[u8; 8] = b"ADBACK4\0";
 const BACKUP_BUNDLE_MAGIC: &[u8; 8] = b"ADPACK1\0";
+const LINKED_KEYS_MAGIC: &[u8; 8] = b"ADLKEY1\0";
 const TRANSFER_MAGIC: &[u8; 6] = b"ADREC1";
 const TRANSFER_CHUNK_MAGIC: &[u8; 5] = b"ADCH1";
 const MESSAGE_MAGIC: &[u8; 6] = b"ADMSG1";
@@ -44,6 +45,8 @@ const FAIL_INDEX_WRITE: u8 = 1;
 const FAIL_DELETE_RESTORE: u8 = 2;
 #[cfg(test)]
 const FAIL_ROLLBACK_REPLACE: u8 = 8;
+#[cfg(test)]
+const FAIL_LINKED_STORE: u8 = 16;
 
 #[cfg(test)]
 fn test_failure(failure: u8) -> bool {
@@ -495,7 +498,19 @@ impl History {
         // Always restore chronological ordering, including when the transition
         // marker was already present in one of the snapshots.
         merged.sort_by_key(|item| item.unix_time);
+        let old_trust = read_linked_keys(identity, &self.peer_id)?;
+        let mut new_trust = old_trust.clone();
+        new_trust.1.insert(previous_peer_id.to_ascii_lowercase());
         self.replace(&merged)?;
+        if let Err(error) = write_linked_keys(identity, &self.peer_id, &new_trust) {
+            let rollback = self.replace(&current);
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(io::Error::other(format!(
+                    "identity link trust save failed ({error}); restoring destination failed ({rollback_error})"
+                ))),
+            };
+        }
         if let Err(delete_error) = Self::delete_conversation(identity, previous_peer_id) {
             #[cfg(test)]
             let rollback = if test_failure(FAIL_ROLLBACK_REPLACE) {
@@ -507,10 +522,18 @@ impl History {
             };
             #[cfg(not(test))]
             let rollback = self.replace(&current);
-            if let Err(rollback_error) = rollback {
-                return Err(io::Error::other(format!(
-                    "prior conversation cleanup failed ({delete_error}); restoring destination also failed ({rollback_error})"
-                )));
+            let trust_rollback = write_linked_keys(identity, &self.peer_id, &old_trust);
+            match (rollback, trust_rollback) {
+                (Ok(()), Ok(())) => {}
+                (rollback, trust) => {
+                    let rollback_error = rollback.err().map(|error| error.to_string());
+                    let trust_error = trust.err().map(|error| error.to_string());
+                    return Err(io::Error::other(format!(
+                        "prior conversation cleanup failed ({delete_error}); destination rollback: {}; identity trust rollback: {}",
+                        rollback_error.as_deref().unwrap_or("succeeded"),
+                        trust_error.as_deref().unwrap_or("succeeded")
+                    )));
+                }
             }
             return Err(delete_error);
         }
@@ -555,6 +578,30 @@ impl History {
         history.replace(&merged)?;
         Ok((peer_id, count))
     }
+}
+
+/// Persist an identity relationship independently of conversation content.
+/// `previous_id` is accepted only from a completed local link flow.
+pub(crate) fn record_linked_local_identity(
+    identity: &Identity,
+    peer_id: &str,
+    previous_id: &str,
+) -> io::Result<()> {
+    validate_peer_id(previous_id)?;
+    let mut linked = read_linked_keys(identity, peer_id)?;
+    linked.0.insert(previous_id.to_ascii_lowercase());
+    write_linked_keys(identity, peer_id, &linked)
+}
+
+pub(crate) fn is_linked_peer_identity(
+    identity: &Identity,
+    peer_id: &str,
+    previous_id: &str,
+) -> io::Result<bool> {
+    validate_peer_id(previous_id)?;
+    Ok(read_linked_keys(identity, peer_id)?
+        .1
+        .contains(&previous_id.to_ascii_lowercase()))
 }
 
 fn encode_backup(
@@ -809,6 +856,7 @@ fn decode_backup(
     }
     let previous_local_ids = crate::identity::previous_public_ids(identity)?;
     let (local_aliases, peer_aliases) = linked_identity_keys(
+        identity,
         &imported,
         &identity.public_id(),
         &peer_id,
@@ -1083,7 +1131,8 @@ fn decode_wire_message(
 /// Return only aliases whose explicit link marker is in the current local
 /// conversation. Remote transition announcements alone are never sufficient.
 pub(crate) fn linked_identity_keys(
-    messages: &[StoredMessage],
+    identity: &Identity,
+    _messages: &[StoredMessage],
     identity_id: &str,
     peer_id: &str,
     previous_local_ids: &[String],
@@ -1092,49 +1141,159 @@ pub(crate) fn linked_identity_keys(
     let peer_id = peer_id.to_ascii_lowercase();
     validate_peer_id(&identity_id)?;
     validate_peer_id(&peer_id)?;
-    let local_origins: HashSet<_> = previous_local_ids
+    // Legacy text markers are untrusted conversation content: a restored
+    // unsigned record can contain them. Only the identity-key authenticated
+    // local relation store contributes aliases.
+    let (locals, peers) = read_linked_keys(identity, &peer_id)?;
+    let origins: HashSet<_> = previous_local_ids
         .iter()
         .map(|id| id.to_ascii_lowercase())
         .collect();
-    let mut local_aliases = HashSet::new();
-    let mut peer_aliases = HashSet::new();
-    for message in messages {
-        if message.sender != MessageSender::Me {
-            continue;
-        }
-        let Some(marker) = message.text.strip_prefix(IDENTITY_EVENT_PREFIX) else {
-            continue;
-        };
-        let fields: Vec<_> = marker.split(':').collect();
-        if fields.len() != 3 || fields[1..].iter().any(|id| id.len() != 64) {
-            continue;
-        }
-        let (role, current_id) = match fields[0] {
-            "self" => ("self", identity_id.as_str()),
-            "peer" => ("peer", peer_id.as_str()),
-            _ => continue,
-        };
-        let previous_id = fields[1].to_ascii_lowercase();
-        if !fields[2].eq_ignore_ascii_case(current_id)
-            || previous_id == current_id
-            || !previous_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            continue;
-        }
-        if role == "self" && !local_origins.contains(&previous_id) {
-            continue;
-        }
-        let key = decode_peer_id(&previous_id)?;
-        if role == "self" {
-            local_aliases.insert(key);
-        } else {
-            peer_aliases.insert(key);
-        }
-    }
+    let local_aliases = locals
+        .into_iter()
+        .filter(|id| origins.contains(id))
+        .map(|id| decode_peer_id(&id))
+        .collect::<io::Result<HashSet<_>>>()?;
+    let peer_aliases = peers
+        .into_iter()
+        .map(|id| decode_peer_id(&id))
+        .collect::<io::Result<HashSet<_>>>()?;
     Ok((
         local_aliases.into_iter().collect(),
         peer_aliases.into_iter().collect(),
     ))
+}
+
+type LinkedIds = (HashSet<String>, HashSet<String>);
+
+fn linked_key_path(identity: &Identity, peer_id: &str) -> io::Result<PathBuf> {
+    let identity_id = identity.public_id();
+    let directory = data_directory()?.join(identity_id);
+    let key = identity.storage_key();
+    let index_key = derive_index_key(&key);
+    Ok(directory.join(format!(
+        ".linked-{}.adkey",
+        opaque_conversation_name(&index_key, peer_id)
+    )))
+}
+
+fn read_linked_keys(identity: &Identity, peer_id: &str) -> io::Result<LinkedIds> {
+    validate_peer_id(peer_id)?;
+    let identity_id = identity.public_id();
+    let peer_id = peer_id.to_ascii_lowercase();
+    let path = linked_key_path(identity, &peer_id)?;
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((HashSet::new(), HashSet::new()))
+        }
+        Err(error) => return Err(error),
+    };
+    if bytes.len() < 8 + NONCE_BYTES + 16 || !bytes.starts_with(LINKED_KEYS_MAGIC) {
+        return Err(invalid_data("invalid linked identity key store"));
+    }
+    let nonce = Nonce::from_slice(&bytes[8..20]);
+    let key = identity.storage_key();
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
+        .map_err(|_| invalid_data("linked identity key unavailable"))?;
+    let aad = [identity_id.as_bytes(), peer_id.as_bytes()].concat();
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &bytes[20..],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| invalid_data("linked identity key store authentication failed"))?,
+    );
+    if plaintext.len() < 2 {
+        return Err(invalid_data("invalid linked identity key data"));
+    }
+    let local_count = plaintext[0] as usize;
+    let peer_count = plaintext[1] as usize;
+    if local_count > 32 || peer_count > 32 || plaintext.len() != 2 + (local_count + peer_count) * 32
+    {
+        return Err(invalid_data("invalid linked identity key count"));
+    }
+    let mut locals = HashSet::new();
+    let mut peers = HashSet::new();
+    for (index, chunk) in plaintext[2..].chunks_exact(32).enumerate() {
+        let id = hex_encode(chunk);
+        if index < local_count {
+            locals.insert(id);
+        } else {
+            peers.insert(id);
+        }
+    }
+    Ok((locals, peers))
+}
+
+fn write_linked_keys(identity: &Identity, peer_id: &str, linked: &LinkedIds) -> io::Result<()> {
+    #[cfg(test)]
+    if test_failure(FAIL_LINKED_STORE) {
+        return Err(io::Error::other("injected linked identity store failure"));
+    }
+    validate_peer_id(peer_id)?;
+    if linked.0.len() > 32 || linked.1.len() > 32 {
+        return Err(invalid_data("linked identity key count exceeded"));
+    }
+    let identity_id = identity.public_id();
+    let peer_id = peer_id.to_ascii_lowercase();
+    let path = linked_key_path(identity, &peer_id)?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| invalid_data("linked key directory unavailable"))?;
+    create_dir_all(directory)?;
+    set_private_directory(directory)?;
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(
+        2 + (linked.0.len() + linked.1.len()) * 32,
+    ));
+    plaintext.push(linked.0.len() as u8);
+    plaintext.push(linked.1.len() as u8);
+    for id in &linked.0 {
+        plaintext.extend_from_slice(&decode_peer_id(id)?);
+    }
+    for id in &linked.1 {
+        plaintext.extend_from_slice(&decode_peer_id(id)?);
+    }
+    let mut nonce = [0; NONCE_BYTES];
+    File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+    let key = identity.storage_key();
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
+        .map_err(|_| invalid_data("linked identity key unavailable"))?;
+    let aad = [identity_id.as_bytes(), peer_id.as_bytes()].concat();
+    let encrypted = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| io::Error::other("linked identity key encryption failed"))?;
+    let mut contents = LINKED_KEYS_MAGIC.to_vec();
+    contents.extend_from_slice(&nonce);
+    contents.extend_from_slice(&encrypted);
+    let temporary = path.with_extension(format!("{}.tmp", hex_encode(&random_nonce()?)));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&temporary)?;
+        file.write_all(&contents)?;
+        file.sync_all()?;
+        rename(&temporary, &path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
 }
 
 pub(crate) fn is_transfer_frame(frame: &[u8]) -> bool {
@@ -1906,9 +2065,36 @@ mod tests {
             History::read_for_identity_copy(&alice_new, &bob_id).unwrap();
         assert!(!incomplete);
         let local_origins = crate::identity::previous_public_ids(&alice_new).unwrap();
-        let (local_aliases, peer_aliases) =
-            super::linked_identity_keys(&alice_messages, &alice_new_id, &bob_id, &local_origins)
-                .unwrap();
+        let fake_message = StoredMessage {
+            unix_time: 104,
+            sender: MessageSender::Me,
+            text: format!(
+                "{}self:{}:{}",
+                super::IDENTITY_EVENT_PREFIX,
+                "55".repeat(32),
+                alice_new_id
+            ),
+            proof: None,
+        };
+        let (untrusted_local, untrusted_peer) = super::linked_identity_keys(
+            &alice_new,
+            &[fake_message],
+            &alice_new_id,
+            &bob_id,
+            &local_origins,
+        )
+        .unwrap();
+        assert!(untrusted_local.is_empty());
+        assert!(untrusted_peer.is_empty());
+        super::record_linked_local_identity(&alice_new, &bob_id, &alice_old_id).unwrap();
+        let (local_aliases, peer_aliases) = super::linked_identity_keys(
+            &alice_new,
+            &alice_messages,
+            &alice_new_id,
+            &bob_id,
+            &local_origins,
+        )
+        .unwrap();
         assert!(local_aliases.contains(&super::decode_peer_id(&alice_old_id).unwrap()));
         assert!(peer_aliases.is_empty());
         let alice_backup = History::export_backup(&alice_new, &bob_id, None).unwrap();
@@ -1923,7 +2109,7 @@ mod tests {
             History::read_for_identity_copy(&bob, &alice_new_id).unwrap();
         assert!(!incomplete);
         let (bob_local_aliases, bob_peer_aliases) =
-            super::linked_identity_keys(&bob_messages, &bob.public_id(), &alice_new_id, &[])
+            super::linked_identity_keys(&bob, &bob_messages, &bob.public_id(), &alice_new_id, &[])
                 .unwrap();
         assert!(bob_local_aliases.is_empty());
         assert!(bob_peer_aliases.contains(&super::decode_peer_id(&alice_old_id).unwrap()));
@@ -2325,12 +2511,41 @@ mod tests {
             .split("recoverable file: ")
             .nth(1)
             .unwrap()
-            .split("); restoring destination")
+            .split("); destination rollback")
             .next()
             .unwrap();
         assert!(std::path::Path::new(recovery_path).is_file());
-        assert!(error.contains("restoring destination also failed"));
+        assert!(
+            error.contains("destination rollback: injected current conversation rollback failure")
+        );
         assert!(error.contains("injected current conversation rollback failure"));
+    }
+
+    #[test]
+    fn linked_identity_store_failure_rolls_back_merged_history() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let previous_peer = "76".repeat(32);
+        let current_peer = "77".repeat(32);
+        let (mut previous, _, _) = History::open(&identity, &previous_peer).unwrap();
+        previous.append(&message(1, "prior record")).unwrap();
+        let (mut current, _, _) = History::open(&identity, &current_peer).unwrap();
+        current.append(&message(2, "current record")).unwrap();
+        super::TEST_FAILURES.with(|flags| flags.set(super::FAIL_LINKED_STORE));
+        let error = current.link_prior_identity(&identity, &previous_peer, message(3, "link"));
+        super::TEST_FAILURES.with(|flags| flags.set(0));
+        assert!(error
+            .unwrap_err()
+            .to_string()
+            .contains("injected linked identity store failure"));
+        let (current_messages, _) =
+            History::read_for_identity_copy(&identity, &current_peer).unwrap();
+        let (prior_messages, _) =
+            History::read_for_identity_copy(&identity, &previous_peer).unwrap();
+        assert_eq!(current_messages.len(), 1);
+        assert_eq!(current_messages[0].text, "current record");
+        assert_eq!(prior_messages.len(), 1);
+        assert!(!super::is_linked_peer_identity(&identity, &current_peer, &previous_peer).unwrap());
     }
 
     #[test]
