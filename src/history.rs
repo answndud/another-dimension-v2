@@ -926,7 +926,14 @@ pub(crate) fn decode_signed_message(
     peer_key: &[u8; 32],
     frame: &[u8],
 ) -> io::Result<StoredMessage> {
-    decode_wire_message(identity, peer_id, peer_key, frame, MESSAGE_MAGIC)
+    let message = decode_wire_message(identity, peer_id, peer_key, frame, MESSAGE_MAGIC)?;
+    if message.proof.is_none() {
+        return Err(invalid_data("new message has no signature"));
+    }
+    if message.sender != MessageSender::Other {
+        return Err(invalid_data("new message has an invalid sender"));
+    }
+    Ok(message)
 }
 
 fn decode_wire_message(
@@ -1646,6 +1653,56 @@ mod tests {
         let mut collision = received.clone();
         collision.text = "different contents".into();
         assert!(super::merge_restored(&[received], &[collision]).is_err());
+    }
+
+    #[test]
+    fn new_message_decoder_requires_remote_sender_and_valid_proof() {
+        let _data = IsolatedData::new();
+        let (alice, _) = Identity::create().unwrap();
+        let (bob, _) = Identity::create().unwrap();
+        let bob_id = super::hex_encode(&bob.public_key());
+        let alice_id = super::hex_encode(&alice.public_key());
+        let outgoing = super::sign_message(&alice, &bob_id, 500, "authentic".into()).unwrap();
+        let frame = super::encode_signed_message(&outgoing).unwrap();
+        let received =
+            super::decode_signed_message(&bob, &alice_id, &alice.public_key(), &frame).unwrap();
+        assert_eq!(received.sender, MessageSender::Other);
+
+        let proof_at = 6 + 1 + 8 + 4 + outgoing.text.len();
+        let mut unsigned = frame.clone();
+        unsigned.truncate(proof_at + 1);
+        unsigned[proof_at] = 0;
+        assert!(
+            super::decode_signed_message(&bob, &alice_id, &alice.public_key(), &unsigned).is_err()
+        );
+
+        let mut wrong_sender = frame.clone();
+        wrong_sender[6] = 1;
+        assert!(
+            super::decode_signed_message(&bob, &alice_id, &alice.public_key(), &wrong_sender)
+                .is_err()
+        );
+
+        let id_at = proof_at + 1;
+        let signature_at = id_at + 16 + 32 + 32;
+        for offset in [7, id_at, signature_at] {
+            let mut altered = frame.clone();
+            altered[offset] ^= 1;
+            assert!(
+                super::decode_signed_message(&bob, &alice_id, &alice.public_key(), &altered)
+                    .is_err()
+            );
+        }
+
+        let legacy = StoredMessage {
+            proof: None,
+            sender: MessageSender::Other,
+            ..message(500, "unsigned legacy")
+        };
+        let legacy_frame = super::encode_transfer(&legacy).unwrap();
+        let restored =
+            super::decode_transfer(&bob, &alice_id, &alice.public_key(), &legacy_frame).unwrap();
+        assert!(restored.proof.is_none());
     }
 
     #[test]
