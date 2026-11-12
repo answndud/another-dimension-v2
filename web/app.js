@@ -294,8 +294,9 @@ async function openHistory(peerId) {
   document.querySelector('#contact-reconnect').hidden = !verifiedPeers.has(peerId);
   document.querySelector('#contact-export').hidden = !verifiedPeers.has(peerId);
   messageFilter.value = '';
-  await loadHistoryPage(null);
+  if (!(await loadHistoryPage(null))) return false;
   show('history');
+  return true;
 }
 
 async function loadHistoryPage(cursor) {
@@ -1293,8 +1294,10 @@ document.querySelector('#history-reprotect-save').addEventListener('click', asyn
 });
 
 async function reloadHistoryDetail() {
-  await openHistory(selectedHistoryPeer);
+  const opened = await openHistory(selectedHistoryPeer);
+  if (!opened) return false;
   await refreshHistoryList();
+  return true;
 }
 
 async function deleteHistoryRange(start, end, prompt) {
@@ -1304,8 +1307,11 @@ async function deleteHistoryRange(start, end, prompt) {
     message.textContent = '먼저 해당 대화의 연결을 종료한 뒤 다시 시도하세요.';
     return;
   }
-  if (!response.ok) { message.textContent = '기록을 삭제하지 못했습니다.'; return; }
-  await reloadHistoryDetail();
+  if (!response.ok) { message.textContent = (await response.text()) || '기록을 삭제하지 못했습니다.'; return; }
+  if (!(await reloadHistoryDetail())) {
+    message.textContent = '삭제는 완료했지만 기록 화면을 다시 불러오지 못했습니다. 새로 불러와 확인하세요.';
+    return;
+  }
   message.textContent = '선택한 기간의 기록을 삭제했습니다.';
 }
 
@@ -1322,8 +1328,11 @@ document.querySelector('#delete-selected').addEventListener('click', async () =>
     message.textContent = (await response.text()) || '기록이 바뀌어 선택을 적용하지 않았습니다. 다시 불러와 선택을 갱신하세요.';
     return;
   }
-  if (!response.ok) { message.textContent = '기록을 삭제하지 못했습니다.'; return; }
-  await reloadHistoryDetail();
+  if (!response.ok) { message.textContent = (await response.text()) || '기록을 삭제하지 못했습니다.'; return; }
+  if (!(await reloadHistoryDetail())) {
+    message.textContent = '삭제는 완료했지만 기록 화면을 다시 불러오지 못했습니다. 새로 불러와 확인하세요.';
+    return;
+  }
   message.textContent = `${count}개 메시지를 삭제했습니다.`;
 });
 

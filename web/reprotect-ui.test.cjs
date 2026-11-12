@@ -497,6 +497,26 @@ test('actual UI: stale history selection reports the reload requirement', async 
   assert.equal(h.element('#message').textContent, 'history changed; reload before applying selection');
 });
 
+test('actual UI: successful deletion reloads the detail page and clears stale selection', async () => {
+  const h = createHarness();
+  h.window.confirm = () => true;
+  h.evaluate("selectedHistoryPeer = 'peer'; historyPageVersion = 'v1'; selectedHistoryIndices.add(4)");
+  const deletion = h.click('#delete-selected');
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/history/delete-messages').resolve(response('ok'));
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/history/messages').resolve(response(JSON.stringify({
+    version: 'v2', hasMore: false, nextCursor: null,
+    messages: [{ index: 0, time: 1, sender: '나', text: 'remaining' }],
+  })));
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/history/list').resolve(response('[]'));
+  await deletion;
+  assert.equal(h.evaluate('selectedHistoryIndices.size'), 0);
+  assert.equal(h.evaluate('selectedHistoryMessages.length'), 1);
+  assert.equal(h.element('#message').textContent, '1개 메시지를 삭제했습니다.');
+});
+
 test('actual UI: restore jobs reopen only for the identity that created them', async (t) => {
   const restoreJob = JSON.stringify({ operationId: 'private-operation', identityId: 'identity-A' });
   const settings = JSON.stringify({

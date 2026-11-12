@@ -70,6 +70,14 @@ const FAIL_RESTORE_CLEANUP_ONCE: u16 = 512;
 const FAIL_RESTORE_STAGE_WRITE: u16 = 1024;
 #[cfg(test)]
 const FAIL_RESTORE_RESULT_CLEANUP: u16 = 2048;
+#[cfg(test)]
+const FAIL_HISTORY_DELETE_WRITE: u16 = 4096;
+#[cfg(test)]
+const FAIL_HISTORY_DELETE_SYNC: u16 = 8192;
+#[cfg(test)]
+const FAIL_HISTORY_DELETE_RENAME: u16 = 16384;
+#[cfg(test)]
+const FAIL_HISTORY_DELETE_CLEANUP: u16 = 32768;
 
 #[cfg(test)]
 fn test_failure(failure: u16) -> bool {
@@ -143,6 +151,15 @@ pub(crate) struct RestoreMergeSummary {
     pub(crate) total_count: u64,
     pub(crate) imported_count: u64,
     pub(crate) peak_sort_buffer_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HistoryDeleteSummary {
+    pub(crate) remaining_count: u64,
+    pub(crate) deleted_count: u64,
+    /// Conservative bound for per-record message/decode/encode buffers; does
+    /// not include allocator bookkeeping or fixed reader state.
+    pub(crate) peak_record_bytes: usize,
 }
 
 pub struct History {
@@ -522,7 +539,15 @@ fn open_history_reader(
     identity_id: String,
     peer_id: String,
 ) -> io::Result<HistoryReader> {
-    let mut file = File::open(path)?;
+    history_reader_from_file(File::open(path)?, key, identity_id, peer_id)
+}
+
+fn history_reader_from_file(
+    mut file: File,
+    key: Zeroizing<[u8; 32]>,
+    identity_id: String,
+    peer_id: String,
+) -> io::Result<HistoryReader> {
     let end = file.metadata()?.len();
     if end < MAGIC.len() as u64 {
         return Err(invalid_data("history snapshot header is incomplete"));
@@ -1033,6 +1058,108 @@ impl History {
         result
     }
 
+    fn replace_filtered_unlocked(
+        &mut self,
+        reader: &mut HistoryReader,
+        mut keep: impl FnMut(u64, &StoredMessage) -> bool,
+        validate: impl FnOnce(u64) -> io::Result<()>,
+    ) -> io::Result<HistoryDeleteSummary> {
+        let suffix = hex_encode(&random_nonce()?);
+        let filename = self
+            .path
+            .file_name()
+            .ok_or_else(|| invalid_data("conversation filename unavailable"))?;
+        let temporary = self.path.with_file_name(format!(
+            ".{}.delete-{suffix}.tmp",
+            filename.to_string_lossy()
+        ));
+        let result = (|| {
+            let mut output = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .append(true)
+                .write(true)
+                .open(&temporary)?;
+            set_private_file(&output)?;
+            output.write_all(MAGIC)?;
+            let mut summary = HistoryDeleteSummary::default();
+            let mut next_index = 0_u64;
+            while let Some(message) = reader.next_record()? {
+                summary.peak_record_bytes = summary.peak_record_bytes.max(
+                    std::mem::size_of::<StoredMessage>()
+                        .saturating_add(message.text.capacity().saturating_mul(4))
+                        .saturating_add(1024),
+                );
+                let source_index = reader.index().saturating_sub(1);
+                if keep(source_index, &message) {
+                    let record = encode_record(
+                        &self.key,
+                        &self.identity_id,
+                        &self.peer_id,
+                        next_index,
+                        &message,
+                    )?;
+                    summary.peak_record_bytes = summary.peak_record_bytes.max(
+                        std::mem::size_of::<StoredMessage>()
+                            .saturating_add(message.text.capacity().saturating_mul(4))
+                            .saturating_add(record.capacity())
+                            .saturating_add(1024),
+                    );
+                    #[cfg(test)]
+                    if test_failure_once(FAIL_HISTORY_DELETE_WRITE) {
+                        return Err(io::Error::other("injected history delete write failure"));
+                    }
+                    output.write_all(&record)?;
+                    next_index = next_index
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_data("history record index overflow"))?;
+                    summary.remaining_count = next_index;
+                } else {
+                    summary.deleted_count = summary
+                        .deleted_count
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_data("deleted history count overflow"))?;
+                }
+            }
+            validate(reader.index())?;
+            #[cfg(test)]
+            if test_failure_once(FAIL_HISTORY_DELETE_SYNC) {
+                return Err(io::Error::other("injected history delete sync failure"));
+            }
+            output.sync_all()?;
+            #[cfg(test)]
+            if test_failure_once(FAIL_HISTORY_DELETE_RENAME) {
+                return Err(io::Error::other("injected history delete replace failure"));
+            }
+            let file_version = history_file_version(&output)?;
+            rename(&temporary, &self.path)?;
+            self.file_version = file_version;
+            self.file = output;
+            self.next_index = next_index;
+            Ok(summary)
+        })();
+        if result.is_err() && temporary.exists() {
+            #[cfg(test)]
+            let cleanup = if test_failure_once(FAIL_HISTORY_DELETE_CLEANUP) {
+                Err(io::Error::other(
+                    "injected history delete temporary cleanup failure",
+                ))
+            } else {
+                std::fs::remove_file(&temporary)
+            };
+            #[cfg(not(test))]
+            let cleanup = std::fs::remove_file(&temporary);
+            if let Err(cleanup_error) = cleanup {
+                let error = result.unwrap_err();
+                return Err(io::Error::other(format!(
+                    "history rewrite failed ({error}); temporary cleanup failed ({cleanup_error}); recoverable file: {}",
+                    temporary.display()
+                )));
+            }
+        }
+        result
+    }
+
     fn refresh_for_append(&mut self) -> io::Result<()> {
         let current = File::open(&self.path)?;
         let current_version = history_file_version(&current)?;
@@ -1391,7 +1518,58 @@ impl History {
         peer_id: &str,
         expected_version: &str,
         selected: &HashSet<usize>,
-    ) -> io::Result<Vec<StoredMessage>> {
+    ) -> io::Result<HistoryDeleteSummary> {
+        if selected.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no history messages selected",
+            ));
+        }
+        Self::delete_filtered(
+            identity,
+            peer_id,
+            Some(expected_version),
+            |index, _| usize::try_from(index).map_or(true, |index| !selected.contains(&index)),
+            |count| {
+                if selected.iter().any(|index| *index as u64 >= count) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "selected message index is outside history",
+                    ));
+                }
+                Ok(())
+            },
+        )
+    }
+
+    pub(crate) fn delete_time_range(
+        identity: &Identity,
+        peer_id: &str,
+        start: u64,
+        end: u64,
+    ) -> io::Result<HistoryDeleteSummary> {
+        if start > end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid history date range",
+            ));
+        }
+        Self::delete_filtered(
+            identity,
+            peer_id,
+            None,
+            |_, message| message.unix_time < start || message.unix_time > end,
+            |_| Ok(()),
+        )
+    }
+
+    fn delete_filtered(
+        identity: &Identity,
+        peer_id: &str,
+        expected_version: Option<&str>,
+        keep: impl FnMut(u64, &StoredMessage) -> bool,
+        validate: impl FnOnce(u64) -> io::Result<()>,
+    ) -> io::Result<HistoryDeleteSummary> {
         validate_peer_id(peer_id)?;
         let identity_id = identity.public_id();
         let peer_id = peer_id.to_ascii_lowercase();
@@ -1407,44 +1585,36 @@ impl History {
             .map_err(|_| io::Error::other("conversation lock unavailable"))?;
         let file_lock = acquire_conversation_file_lock(identity, &peer_id)?;
         let result = (|| {
-            let mut file = File::open(&path)?;
-            let version = history_file_version(&file)?;
+            let source = File::open(&path)?;
+            let version = history_file_version(&source)?;
             let token = format!(
                 "{:x}-{:x}-{:x}-{:x}",
                 version.device, version.inode, version.length, version.modified_nanos
             );
-            if token != expected_version {
+            if expected_version.is_some_and(|expected| token != expected) {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "history changed; reload required",
                 ));
             }
-            let (messages, next_index, _) = read_records(
-                &mut file,
+            let mut reader = history_reader_from_file(
+                source,
                 Zeroizing::new(*key),
-                &identity_id,
-                &peer_id,
-                false,
+                identity_id.clone(),
+                peer_id.clone(),
             )?;
-            let kept: Vec<_> = messages
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, item)| (!selected.contains(&index)).then_some(item))
-                .collect();
             let append_file = OpenOptions::new().read(true).append(true).open(&path)?;
-            let file_version = history_file_version(&append_file)?;
             let mut history = History {
                 file: append_file,
                 path,
                 key,
                 identity_id,
                 peer_id,
-                next_index,
-                file_version,
+                next_index: 0,
+                file_version: version,
                 operation_lock: Arc::clone(&operation_lock),
             };
-            history.replace_unlocked(&kept)?;
-            Ok(kept)
+            history.replace_filtered_unlocked(&mut reader, keep, validate)
         })();
         unlock_conversation_file(file_lock);
         result
@@ -4099,10 +4269,184 @@ mod tests {
         let fresh = History::read_page(&identity, &peer, None, 100).unwrap();
         let kept = History::delete_indices_if_version(&identity, &peer, &fresh.version, &selected)
             .unwrap();
-        assert_eq!(kept.len(), 237);
+        assert_eq!(kept.remaining_count, 237);
         let after = History::read_page(&identity, &peer, None, 100).unwrap();
         assert_eq!(after.entries[0].message.text, "page item");
         assert_eq!(History::list(&identity).unwrap()[0].message_count, 237);
+    }
+
+    #[test]
+    fn streaming_history_deletion_preserves_boundaries_rejects_bad_indices_and_refreshes_handles() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "42".repeat(32);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        let mut first = message(10, "same timestamp one");
+        first.sender = MessageSender::Other;
+        first.proof = Some(super::MessageProof {
+            id: [9; 16],
+            signer: [1; 32],
+            recipient: [2; 32],
+            signature: [3; 64],
+        });
+        let second = message(10, "same timestamp two");
+        let last = message(20, "inclusive end");
+        history
+            .replace(&[first.clone(), second.clone(), last.clone()])
+            .unwrap();
+        let old = History::read_page(&identity, &peer, None, 10).unwrap();
+        let out_of_range = HashSet::from([3]);
+        assert_eq!(
+            History::delete_indices_if_version(&identity, &peer, &old.version, &out_of_range)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let selected_same_time = HashSet::from([1]);
+        let selected_result =
+            History::delete_indices_if_version(&identity, &peer, &old.version, &selected_same_time)
+                .unwrap();
+        assert_eq!(selected_result.remaining_count, 2);
+        let after_selection = History::read_page(&identity, &peer, None, 10).unwrap();
+        assert_eq!(after_selection.entries[0].message, first);
+        assert_eq!(
+            after_selection.entries[0]
+                .message
+                .proof
+                .as_ref()
+                .unwrap()
+                .id,
+            [9; 16]
+        );
+        let ranged = History::delete_time_range(&identity, &peer, 10, 10).unwrap();
+        assert_eq!(ranged.deleted_count, 1);
+        assert_eq!(ranged.remaining_count, 1);
+        let page = History::read_page(&identity, &peer, None, 10).unwrap();
+        assert_eq!(page.entries[0].message, last);
+        history
+            .append(&message(30, "append after rewrite"))
+            .unwrap();
+        let page = History::read_page(&identity, &peer, None, 10).unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries[1].message.text, "append after rewrite");
+
+        let page = History::read_page(&identity, &peer, None, 10).unwrap();
+        let selected = HashSet::from([0]);
+        let deleted =
+            History::delete_indices_if_version(&identity, &peer, &page.version, &selected).unwrap();
+        assert_eq!(deleted.remaining_count, 1);
+    }
+
+    #[test]
+    fn streaming_history_deletion_failures_preserve_original_and_report_cleanup_path() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "43".repeat(32);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history.append(&message(1, "preserve me")).unwrap();
+        history.append(&message(2, "keep this record")).unwrap();
+        let before = std::fs::read(&history.path).unwrap();
+        let page = History::read_page(&identity, &peer, None, 10).unwrap();
+        let selected = HashSet::from([0]);
+        for failure in [
+            super::FAIL_HISTORY_DELETE_WRITE,
+            super::FAIL_HISTORY_DELETE_SYNC,
+            super::FAIL_HISTORY_DELETE_RENAME,
+        ] {
+            super::TEST_FAILURES.with(|failures| failures.set(failure));
+            assert!(
+                History::delete_indices_if_version(&identity, &peer, &page.version, &selected)
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&history.path).unwrap(), before);
+        }
+        super::TEST_FAILURES.with(|failures| {
+            failures.set(super::FAIL_HISTORY_DELETE_WRITE | super::FAIL_HISTORY_DELETE_CLEANUP)
+        });
+        let error = History::delete_indices_if_version(&identity, &peer, &page.version, &selected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("recoverable file:"));
+        assert_eq!(std::fs::read(&history.path).unwrap(), before);
+        let retry =
+            History::delete_indices_if_version(&identity, &peer, &page.version, &selected).unwrap();
+        assert_eq!(retry.remaining_count, 1);
+    }
+
+    #[test]
+    fn streaming_history_deletion_rejects_partial_source_without_repairing_it() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "46".repeat(32);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history.append(&message(1, "valid record")).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&history.path).unwrap();
+        file.write_all(&[0, 0]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let original = std::fs::read(&history.path).unwrap();
+        assert!(History::delete_time_range(&identity, &peer, 0, 2).is_err());
+        assert_eq!(std::fs::read(&history.path).unwrap(), original);
+    }
+
+    fn write_synthetic_history(history: &History, count: u64, text: &str) -> u64 {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&history.path)
+            .unwrap();
+        file.write_all(super::MAGIC).unwrap();
+        for index in 0..count {
+            let record = super::encode_record(
+                &history.key,
+                &history.identity_id,
+                &history.peer_id,
+                index,
+                &message(index, text),
+            )
+            .unwrap();
+            file.write_all(&record).unwrap();
+        }
+        file.sync_all().unwrap();
+        file.metadata().unwrap().len()
+    }
+
+    #[test]
+    fn streaming_selection_deletion_handles_over_one_hundred_thousand_records() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "44".repeat(32);
+        let (history, _, _) = History::open(&identity, &peer).unwrap();
+        let _bytes = write_synthetic_history(&history, 100_005, "bounded record");
+        let version = History::read_page(&identity, &peer, None, 1)
+            .unwrap()
+            .version;
+        let selected = HashSet::from([0, 50_000, 100_004]);
+        let result =
+            History::delete_indices_if_version(&identity, &peer, &version, &selected).unwrap();
+        assert_eq!(result.remaining_count, 100_002);
+        assert_eq!(result.deleted_count, 3);
+        assert!(result.peak_record_bytes < 32 * 1024);
+        assert_eq!(History::list(&identity).unwrap()[0].message_count, 100_002);
+    }
+
+    #[test]
+    fn streaming_range_deletion_handles_over_sixty_four_mib_and_inclusive_cutoff() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "45".repeat(32);
+        let (history, _, _) = History::open(&identity, &peer).unwrap();
+        let source_bytes = write_synthetic_history(&history, 17_000, &"x".repeat(4096));
+        assert!(source_bytes > 64 * 1024 * 1024);
+        // Keep-recent uses an inclusive end; the exact cutoff second is deleted.
+        let result = History::delete_time_range(&identity, &peer, 0, 8_499).unwrap();
+        assert_eq!(result.deleted_count, 8_500);
+        assert_eq!(result.remaining_count, 8_500);
+        assert!(result.peak_record_bytes < 32 * 1024);
+        let page = History::read_page(&identity, &peer, None, 1).unwrap();
+        assert_eq!(page.entries[0].message.unix_time, 8_500);
+        let last = History::read_page(&identity, &peer, page.next.as_ref(), 1).unwrap();
+        assert_eq!(last.entries[0].message.unix_time, 8_501);
     }
 
     #[test]

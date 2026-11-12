@@ -3437,11 +3437,7 @@ fn respond_settings(stream: &mut TcpStream, state: &State) -> io::Result<()> {
     )
 }
 
-fn update_closed_chat_history(
-    state: &State,
-    peer_id: &str,
-    messages: Option<&[history::StoredMessage]>,
-) {
+fn update_closed_chat_history(state: &State, peer_id: &str, message_count: u64) {
     for operation in state.chats.values() {
         if let Ok(mut snapshot) = operation.snapshot.lock() {
             if snapshot
@@ -3450,13 +3446,9 @@ fn update_closed_chat_history(
                 .is_some_and(|current| current.eq_ignore_ascii_case(peer_id))
                 && matches!(snapshot.phase, "closed" | "failed" | "disconnected")
             {
-                snapshot.messages = messages
-                    .unwrap_or_default()
-                    .iter()
-                    .cloned()
-                    .map(chat_entry)
-                    .collect();
-                snapshot.message_count = snapshot.messages.len();
+                snapshot.messages.clear();
+                snapshot.message_count = message_count.min(usize::MAX as u64) as usize;
+                snapshot.message_epoch = snapshot.message_epoch.wrapping_add(1);
             }
         }
     }
@@ -4587,10 +4579,10 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some(version) = payload.get("version").and_then(serde_json::Value::as_str) else {
             return reject(&mut stream, "400 Bad Request");
         };
-        let kept = match history::History::delete_indices_if_version(
+        let summary = match history::History::delete_indices_if_version(
             identity, peer_id, version, &selected,
         ) {
-            Ok(kept) => kept,
+            Ok(summary) => summary,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 return respond(
                     &mut stream,
@@ -4599,9 +4591,21 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                     b"history changed; reload before applying selection",
                 )
             }
-            Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+            Err(error) => {
+                let status = if error.kind() == io::ErrorKind::InvalidInput {
+                    "400 Bad Request"
+                } else {
+                    "500 Internal Server Error"
+                };
+                return respond(
+                    &mut stream,
+                    status,
+                    "text/plain; charset=utf-8",
+                    error.to_string().as_bytes(),
+                );
+            }
         };
-        update_closed_chat_history(&state, peer_id, Some(&kept));
+        update_closed_chat_history(&state, peer_id, summary.remaining_count);
         return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
     }
     if first == "POST /api/history/delete-range HTTP/1.1" {
@@ -4622,15 +4626,23 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         if start > end {
             return reject(&mut stream, "400 Bad Request");
         }
-        let (mut history, messages, _) = match history::History::open(identity, peer_id) {
-            Ok(history) => history,
-            Err(_) => return reject(&mut stream, "400 Bad Request"),
+        let summary = match history::History::delete_time_range(identity, peer_id, start, end) {
+            Ok(summary) => summary,
+            Err(error) => {
+                let status = if error.kind() == io::ErrorKind::InvalidInput {
+                    "400 Bad Request"
+                } else {
+                    "500 Internal Server Error"
+                };
+                return respond(
+                    &mut stream,
+                    status,
+                    "text/plain; charset=utf-8",
+                    error.to_string().as_bytes(),
+                );
+            }
         };
-        let kept = history::outside_time_range(&messages, start, end);
-        if let Err(_) = history.replace(&kept) {
-            return reject(&mut stream, "500 Internal Server Error");
-        }
-        update_closed_chat_history(&state, peer_id, Some(&kept));
+        update_closed_chat_history(&state, peer_id, summary.remaining_count);
         return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
     }
     if first == "POST /api/history/delete-conversation HTTP/1.1" {
@@ -4648,7 +4660,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 error.to_string().as_bytes(),
             );
         }
-        update_closed_chat_history(&state, body, None);
+        update_closed_chat_history(&state, body, 0);
         return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
     }
     if first == "POST /api/history/export-backup HTTP/1.1" {
@@ -4751,10 +4763,8 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                     )
                 }
             };
-            for (peer_id, _, _) in &restored {
-                if let Ok((_, messages, _)) = history::History::open(identity, peer_id) {
-                    update_closed_chat_history(&state, peer_id, Some(&messages));
-                }
+            for (peer_id, message_count, _) in &restored {
+                update_closed_chat_history(&state, peer_id, *message_count as u64);
             }
             let payload = serde_json::json!({ "conversations": restored.iter().map(|(peer_id, count, linked)| serde_json::json!({ "peerId": peer_id, "messageCount": count, "linkedIdentityRestored": linked })).collect::<Vec<_>>() }).to_string();
             return respond(
@@ -4776,9 +4786,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                     )
                 }
             };
-        if let Ok((_, messages, _)) = history::History::open(identity, &peer_id) {
-            update_closed_chat_history(&state, &peer_id, Some(&messages));
-        }
+        update_closed_chat_history(&state, &peer_id, count as u64);
         let payload = serde_json::json!({ "peerId": peer_id, "messageCount": count, "linkedIdentityRestored": linked }).to_string();
         return respond(
             &mut stream,
