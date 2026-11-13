@@ -77,16 +77,25 @@ function appendMessageBody(container, text) {
     try { parsed = new URL(candidate); } catch (_) { parsed = null; }
     if (!parsed || !['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password) continue;
     if (start > cursor) container.append(document.createTextNode(source.slice(cursor, start)));
-    const link = document.createElement('a');
-    link.href = parsed.href;
-    link.textContent = candidate;
-    link.target = '_blank';
-    link.rel = 'noopener noreferrer';
-    link.addEventListener('click', (event) => {
-      if (activeNetworkMode === 'tor' && !window.confirm('이 링크는 외부 브라우저에서 열립니다. 외부 브라우저가 Tor를 사용하지 않아 실제 IP 주소가 노출될 수 있습니다. 계속 여시겠습니까?')) {
-        event.preventDefault();
-      }
-    });
+    let link;
+    if (activeNetworkMode === 'tor') {
+      link = document.createElement('button');
+      link.type = 'button';
+      link.className = 'message-external-link';
+      link.textContent = candidate;
+      link.setAttribute('aria-label', `외부 브라우저에서 열기: ${candidate}`);
+      link.addEventListener('click', () => {
+        if (window.confirm('이 링크는 외부 브라우저에서 열립니다. 외부 브라우저가 Tor를 사용하지 않아 실제 IP 주소가 노출될 수 있습니다. 계속 여시겠습니까?')) {
+          window.open(parsed.href, '_blank', 'noopener,noreferrer');
+        }
+      });
+    } else {
+      link = document.createElement('a');
+      link.href = parsed.href;
+      link.textContent = candidate;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+    }
     container.append(link);
     cursor = start + candidate.length;
   }

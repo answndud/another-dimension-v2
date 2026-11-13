@@ -75,6 +75,8 @@ function createHarness() {
   const window = {
     ReprotectWork,
     confirm: () => false,
+    openedUrls: [],
+    open(url, target, features) { this.openedUrls.push({ url, target, features }); },
     showOpenFilePicker: null,
     showSaveFilePicker: null,
   };
@@ -725,10 +727,8 @@ test('actual UI: live and saved messages link only valid HTTP(S) URLs safely', a
 
   let confirmCalls = 0;
   h.window.confirm = () => { confirmCalls += 1; return false; };
-  let prevented = false;
-  liveLinks[0].listeners.click({ preventDefault() { prevented = true; } });
+  assert.equal(typeof liveLinks[0].listeners.click, 'undefined');
   assert.equal(confirmCalls, 0, 'saved Tor mode must not override active general mode');
-  assert.equal(prevented, false);
 
   await t.test('Tor confirmation applies to stored history links and cancel blocks opening', async () => {
     const torSettings = { ...generalSettings, activeMode: 'tor', savedMode: 'general' };
@@ -737,24 +737,25 @@ test('actual UI: live and saved messages link only valid HTTP(S) URLs safely', a
     await loading;
     h.evaluate(`selectedHistoryMessages = [{index: 0, time: 1, sender: '상대', text: 'https://safe.example and data:text/html,<b>x</b>'}]; renderHistoryMessages()`);
     const storedBody = h.element('#history-messages').children[0].children[2];
-    const storedLink = storedBody.children.find((child) => child.href);
+    const storedLink = storedBody.children.find((child) => child.type === 'button');
     assert.ok(storedLink);
+    assert.equal(storedLink.textContent, 'https://safe.example');
+    assert.equal(storedBody.children.some((child) => child.href), false, 'Tor rendering must not expose a directly navigable href');
     let warning = '';
     h.window.confirm = (text) => { warning = text; return false; };
-    prevented = false;
-    storedLink.listeners.click({ preventDefault() { prevented = true; } });
+    storedLink.listeners.click({});
     assert.match(warning, /외부 브라우저가 Tor를 사용하지 않아/);
-    assert.equal(prevented, true);
-    assert.equal(storedLink.rel, 'noopener noreferrer');
+    assert.equal(h.window.openedUrls.length, 0);
     assert.equal(storedBody.children.some((child) => child.textContent.includes('data:text/html')), true);
   });
 
   await t.test('Tor confirmation allows opening only after explicit confirmation', async () => {
     h.window.confirm = () => true;
-    const anchor = h.element('#history-messages').children[0].children[2].children.find((child) => child.href);
-    let prevented = false;
-    anchor.listeners.click({ preventDefault() { prevented = true; } });
-    assert.equal(prevented, false);
+    const button = h.element('#history-messages').children[0].children[2].children.find((child) => child.type === 'button');
+    button.listeners.click({});
+    assert.deepEqual(h.window.openedUrls, [{
+      url: 'https://safe.example/', target: '_blank', features: 'noopener,noreferrer',
+    }]);
   });
 });
 
