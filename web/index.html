@@ -6,81 +6,501 @@
   <title>Another Dimension</title>
   <style>
     :root {
-      color-scheme: light; font: 16px/1.55 system-ui, sans-serif;
-      --page: #f4f6f8; --surface: #fff; --surface-muted: #fafbfc; --text: #20252b;
-      --muted: #59636e; --border: #d9dee3; --border-soft: #e0e4e8;
-      --input: #fff; --input-border: #bbc3cc; --button: #f8fafb; --button-hover: #edf1f5;
-      --primary: #263849; --primary-hover: #344b60; --primary-text: #fff;
-      --link: #155da8;
-      --focus: #7ba7e1; --shadow: #20252b0a; --dialog-shadow: #20252b33;
-      color: var(--text); background: var(--page);
+      color-scheme: light;
+      font: 15px/1.55 system-ui, sans-serif;
+      --page: #F5F7FA;
+      --surface: #FFFFFF;
+      --surface-muted: #F8FAFC;
+      --text: #1B2733;
+      --muted: #526172;
+      --border: #D9E1E8;
+      --border-soft: #E6EBF0;
+      --input: #FFFFFF;
+      --input-border: #C5D0DA;
+      --button: #FFFFFF;
+      --button-hover: #F0F4F7;
+      --primary: #263849;
+      --primary-hover: #344B60;
+      --primary-text: #FFFFFF;
+      --link: #155DA8;
+      --focus: #3A78B8;
+      --danger: #B42318;
+      --danger-hover: #912018;
+      --danger-text: #FFFFFF;
+      --danger-surface: #FEF3F2;
+      --danger-border: #F0B8B4;
+      --shadow: rgb(27 39 51 / 8%);
+      --dialog-shadow: rgb(15 23 42 / 22%);
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-6: 24px;
+      --space-8: 32px;
+      --space-12: 48px;
+      --control-height: 44px;
+      --radius-control: 8px;
+      --radius-card: 12px;
+      --radius-dialog: 12px;
+      color: var(--text);
+      background: var(--page);
     }
     :root[data-theme="dark"] {
       color-scheme: dark;
-      --page: #1c1d21; --surface: #25262b; --surface-muted: #1d1e22; --text: #f0f0f2;
-      --muted: #b8b8c0; --border: #3a3c41; --border-soft: #34353b;
-      --input: #1d1e22; --input-border: #45464d; --button: #2b2c32; --button-hover: #36373f;
-      --primary: #8bfcb9; --primary-hover: #b0ffd0; --primary-text: #14251b;
-      --link: #8bfcb9;
-      --focus: #8bfcb9; --shadow: rgb(0 0 0 / 18%); --dialog-shadow: rgb(0 0 0 / 30%);
+      --page: #0F151D;
+      --surface: #18232D;
+      --surface-muted: #202C38;
+      --text: #EDF3F9;
+      --muted: #AFBECF;
+      --border: #334456;
+      --border-soft: #2B3948;
+      --input: #111B24;
+      --input-border: #46596B;
+      --button: #202C38;
+      --button-hover: #2A3948;
+      --primary: #D7E5EE;
+      --primary-hover: #E7F0F5;
+      --primary-text: #13212F;
+      --link: #9CCBFF;
+      --focus: #9CCBFF;
+      --danger: #FFB4AB;
+      --danger-hover: #FFC7C0;
+      --danger-text: #3A0906;
+      --danger-surface: #321B1A;
+      --danger-border: #71322E;
+      --shadow: rgb(0 0 0 / 22%);
+      --dialog-shadow: rgb(0 0 0 / 48%);
     }
     * { box-sizing: border-box; }
-    body { max-width: 70rem; margin: 0 auto; padding: 0 2rem 4rem; }
-    header { display: flex; align-items: center; justify-content: space-between; min-height: 5.5rem; gap: 1rem; border-bottom: 1px solid var(--border-soft); }
-    h1 { margin: 0; font-size: .82rem; font-weight: 700; letter-spacing: .12em; }
-    h2 { margin: 0 0 1rem; font-size: 1.25rem; font-weight: 650; letter-spacing: -.03em; }
-    h3 { margin: 0 0 .6rem; font-size: .95rem; }
+    body { max-width: 84rem; margin: 0 auto; padding: 0 var(--space-8) var(--space-12); }
+    .site-header { display: flex; height: 72px; min-height: 72px; align-items: center; justify-content: space-between; gap: var(--space-4); border-bottom: 1px solid var(--border-soft); }
+    .site-header-controls, .identity-header-actions { display: flex; align-items: center; gap: var(--space-2); }
+    .site-header-controls { margin-left: auto; }
+    .identity-header-actions { display: none; }
+    body:has(#identity-active:not([hidden])) .identity-header-actions { display: flex; }
+    h1 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: .04em; white-space: nowrap; }
+    h2 { margin: 0 0 var(--space-4); font-size: 24px; font-weight: 700; letter-spacing: -.02em; }
+    h3 { margin: 0 0 var(--space-2); font-size: 18px; font-weight: 600; }
     main { width: min(100%, 50.625rem); margin: 5rem auto; }
     form, section { max-width: 42rem; }
-    section { margin: 0 0 1rem; padding: 1.75rem; border: 1px solid var(--border); border-radius: .4rem; background: var(--surface); box-shadow: 0 2px 8px var(--shadow); }
-    .entry-card { max-width: 42rem; margin: 0 auto 1rem; padding: 2rem; border: 1px solid var(--border); border-radius: .4rem; background: var(--surface); box-shadow: 0 2px 8px var(--shadow); }
-    #connect-form { display: grid; gap: .8rem; }
-    #connect-form > label { margin: 0; }
-    #connect-form > p { margin: 0; color: var(--muted); }
-    .entry-card form { display: grid; gap: .75rem; }
-    .entry-card label { margin: .15rem 0 0; font-weight: 600; }
-    label { display: block; margin: 1rem 0 .45rem; font-weight: 600; }
-    input, textarea, select { width: 100%; padding: .7rem .8rem; border: 1px solid var(--input-border); border-radius: .25rem; color: var(--text); background: var(--input); font: inherit; }
+    section { margin: 0 0 var(--space-4); padding: var(--space-6); border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); box-shadow: 0 1px 3px var(--shadow); }
+    .entry-card { max-width: 42rem; margin: 0 auto var(--space-4); padding: var(--space-8); border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); box-shadow: 0 1px 3px var(--shadow); }
+    #connect-form { display: grid; gap: var(--space-3); }
+    #connect-form > label, #connect-form > p { margin: 0; }
+    #connect-form > p, .meta { color: var(--muted); font-size: 14px; }
+    .entry-card form { display: grid; gap: var(--space-3); }
+    .entry-card label { margin: var(--space-1) 0 0; font-weight: 600; }
+    label { display: block; margin: var(--space-4) 0 var(--space-2); font-size: 14px; font-weight: 600; }
+    input:not([type="checkbox"]):not([type="radio"]), textarea, select { width: 100%; min-height: var(--control-height); padding: var(--space-2) var(--space-3); border: 1px solid var(--input-border); border-radius: var(--radius-control); color: var(--text); background: var(--input); font: inherit; }
     .entry-card input, .entry-card textarea { margin: 0; }
     .entry-card button { justify-self: start; min-width: 7.5rem; }
-    .entry-card .actions { margin-top: 1.25rem; }
+    .entry-card .actions { margin-top: var(--space-6); }
     #generated-code { min-height: 8rem; }
-    input:focus, textarea:focus, select:focus, button:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+    input:focus, textarea:focus, select:focus, button:focus-visible, summary:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
     textarea { min-height: 5rem; resize: vertical; overflow-wrap: anywhere; }
-    button { min-height: 2.5rem; padding: .5rem .95rem; border: 1px solid var(--input-border); border-radius: .25rem; color: var(--text); background: var(--button); font: inherit; font-weight: 550; cursor: pointer; }
+    button { min-height: var(--control-height); padding: var(--space-2) var(--space-4); border: 1px solid var(--input-border); border-radius: var(--radius-control); color: var(--text); background: var(--button); font: 600 14px/1.3 system-ui, sans-serif; text-align: center; cursor: pointer; }
     button:hover { background: var(--button-hover); }
     button.primary { border-color: var(--primary); color: var(--primary-text); background: var(--primary); }
     button.primary:hover { border-color: var(--primary-hover); background: var(--primary-hover); }
-    dialog { width: min(38rem, calc(100% - 2rem)); border: 1px solid var(--input-border); border-radius: .4rem; padding: 1.4rem; color: var(--text); background: var(--surface); box-shadow: 0 12px 36px var(--dialog-shadow); }
-    dialog::backdrop { background: rgb(20 24 28 / 55%); }
-    .actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: 1rem; }
+    dialog { width: min(640px, calc(100vw - 32px)); max-height: 85vh; max-height: 85dvh; overflow: auto; padding: var(--space-6); border: 1px solid var(--border); border-radius: var(--radius-dialog); color: var(--text); background: var(--surface); box-shadow: 0 12px 36px var(--dialog-shadow); }
+    dialog::backdrop { background: rgb(15 23 42 / 48%); }
+    .management-dialog { max-width: 640px; }
+    .management-dialog-header { position: sticky; z-index: 1; top: calc(-1 * var(--space-6)); display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); margin: calc(-1 * var(--space-6)) calc(-1 * var(--space-6)) var(--space-4); padding: var(--space-4) var(--space-6); border-bottom: 1px solid var(--border-soft); background: var(--surface); }
+    .management-dialog-header h2 { margin: 0; font-size: 22px; }
+    .management-dialog-label { margin: 0 0 var(--space-1); color: var(--muted); font-size: 12px; }
+    .management-pane { max-width: none; margin: 0; padding: 0; border: 0; background: transparent; box-shadow: none; }
+    .management-pane[hidden] { display: none !important; }
+    .management-pane > .dashboard-card { max-width: none; margin: 0; }
+    .actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-top: var(--space-4); }
     .identity-id, .fingerprint, .invite-code { overflow-wrap: anywhere; font: .86rem/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .meta { color: var(--muted); font-size: .92rem; }
-    .panel { padding: 1rem; border: 1px solid var(--border-soft); border-radius: .25rem; background: var(--surface-muted); }
-    .conversation { display: grid; gap: .65rem; max-height: 28rem; overflow: auto; margin: 1rem 0; padding: .75rem; border: 1px solid var(--border-soft); border-radius: .25rem; background: var(--surface-muted); }
-    .history-list { display: grid; gap: .5rem; margin-top: .8rem; }
-    .history-item { display: grid; width: 100%; gap: .15rem; text-align: left; }
+    .panel { padding: var(--space-4); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--surface-muted); }
+    .conversation { display: grid; gap: var(--space-3); max-height: 28rem; overflow: auto; margin: var(--space-4) 0; padding: var(--space-3); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--surface-muted); }
+    .history-list { display: grid; gap: var(--space-2); margin-top: var(--space-3); }
+    .history-item { display: grid; width: 100%; gap: var(--space-1); text-align: center; }
     .history-item small { color: var(--muted); font-weight: 400; }
-    .field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: .75rem; margin: .75rem 0; }
-    .message-select { margin-right: .5rem; }
-    .checkbox-row { display: flex; align-items: center; gap: .55rem; }
+    .field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: var(--space-3); margin: var(--space-3) 0; }
+    .message-select { margin-right: var(--space-2); }
+    .checkbox-row { display: flex; align-items: center; gap: var(--space-2); }
     .checkbox-row input { width: auto; }
-    .entry { padding: .65rem .75rem; border: 1px solid var(--border-soft); border-radius: .25rem; background: var(--surface); overflow-wrap: anywhere; white-space: pre-wrap; }
-    .message-external-link { min-height: 0; padding: 0; border: 0; color: var(--link); background: transparent; font: inherit; font-weight: inherit; text-align: left; text-decoration: underline; overflow-wrap: anywhere; }
+    .entry { padding: var(--space-3); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--surface); overflow-wrap: anywhere; white-space: pre-wrap; }
+    .message-external-link { min-height: 0; padding: 0; border: 0; color: var(--link); background: transparent; font: inherit; text-align: center; text-decoration: underline; overflow-wrap: anywhere; }
     .message-external-link:hover { background: transparent; }
     .entry.mine { margin-left: 12%; background: var(--surface-muted); }
     .entry.system { border-style: dashed; color: var(--muted); background: var(--surface-muted); }
-    .entry time { display: block; margin-bottom: .25rem; color: var(--muted); font-size: .78rem; }
+    .entry time { display: block; margin-bottom: var(--space-1); color: var(--muted); font-size: 12px; }
+    main:has(#chat-view:not([hidden])) { display: flex; width: min(100%, 960px); min-height: 0; height: calc(100vh - 72px - var(--space-12)); height: calc(100dvh - 72px - var(--space-12)); margin: 0 auto; }
+    #chat-view { display: grid; grid-template-rows: auto auto auto minmax(0, 1fr) auto; width: 100%; max-width: none; min-width: 0; min-height: 0; margin: 0; padding: 0; overflow: visible; border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); box-shadow: 0 1px 3px var(--shadow); }
+    #chat-view[hidden] { display: none !important; }
+    .chat-header { display: flex; min-height: 72px; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) 20px; border-bottom: 1px solid var(--border-soft); }
+    .chat-heading { min-width: 0; }
+    .chat-heading h2 { margin: 0 0 var(--space-1); font-size: 18px; font-weight: 650; }
+    #chat-status { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+    .chat-header-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
+    .chat-header-actions button { min-height: 42px; }
+    .chat-status-strip { display: grid; gap: var(--space-1); padding: 0 20px; }
+    .chat-status-strip p { margin: 0; padding: var(--space-2) 0; font-size: 13px; overflow-wrap: anywhere; }
+    #delivery-status:not([hidden]), #storage-status:not([hidden]) { border-bottom: 1px solid var(--border-soft); }
+    #storage-status:not([hidden]) { color: var(--text); }
+    .chat-workflows { display: grid; gap: var(--space-3); min-width: 0; max-height: min(40vh, 360px); overflow: auto; padding: var(--space-3) 20px 0; }
+    .chat-workflows:not(:has(> :not([hidden]))) { display: none; }
+    .chat-workflows > .panel { max-width: none; margin: 0; padding: var(--space-4); }
+    .chat-workflows h3 { margin: 0 0 var(--space-2); font-size: 16px; }
+    .chat-workflows p { line-height: 1.55; overflow-wrap: anywhere; }
+    #verification { border-color: var(--focus); background: var(--surface-muted); }
+    #verification > p:first-child { margin-top: 0; color: var(--text); font-weight: 600; }
+    #verification .identity-id, #verification .fingerprint { margin: var(--space-1) 0 var(--space-3); padding: var(--space-2) var(--space-3); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--surface); overflow-wrap: anywhere; word-break: break-word; }
+    #verification .actions { margin-top: var(--space-4); }
+    #identity-transition-panel { border-color: var(--input-border); }
+    #identity-transition-choice { display: block; width: 100%; }
+    #history-restore-panel { border-color: var(--input-border); }
+    #history-restore-status { font-weight: 600; }
+    #history-restore-preview { display: grid; max-height: 12rem; gap: var(--space-2); overflow: auto; margin: var(--space-3) 0; padding: var(--space-2); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--surface); }
+    #history-restore-preview .entry { max-width: none; }
+    #chat-view #conversation { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; max-height: none; gap: 10px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; margin: 0; padding: 16px 20px; border: 0; border-radius: 0; background: var(--page); }
+    #chat-view #conversation:empty { background: var(--surface); }
+    #chat-view .entry { display: grid; width: fit-content; max-width: min(75%, 680px); min-width: 0; gap: var(--space-2); margin: 0; padding: 12px 16px; border: 1px solid var(--border-soft); border-radius: var(--radius-card); background: var(--surface-muted); overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap; }
+    #chat-view .entry.mine { align-self: flex-end; margin-left: auto; border-color: transparent; background: var(--primary); color: var(--primary-text); }
+    #chat-view .entry.system { align-self: center; width: fit-content; max-width: 90%; padding: var(--space-2) var(--space-3); border: 0; border-radius: 999px; color: var(--muted); background: var(--surface-muted); font-size: 13px; text-align: center; }
+    #chat-view .entry time { order: 2; margin: 0; color: var(--muted); font-size: 11px; line-height: 1.35; }
+    #chat-view .entry.mine time { color: inherit; opacity: .76; }
+    #chat-view .entry > div { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+    #chat-view .message-external-link { color: var(--link); }
+    #chat-view .entry.mine .message-external-link { color: inherit; }
+    #chat-view .message-select { align-self: start; }
+    #send-form { display: grid; grid-template-columns: minmax(0, 1fr) 88px; align-items: end; gap: var(--space-2); margin: 0; padding: var(--space-3) 20px; border-top: 1px solid var(--border-soft); background: var(--surface); }
+    #send-form[hidden] { display: none !important; }
+    #send-form label { grid-column: 1 / -1; margin: 0; }
+    #chat-text { width: 100%; min-width: 0; min-height: 48px; max-height: 160px; margin: 0; overflow-y: auto; resize: none; }
+    #send-form button { width: 100%; height: 48px; min-height: 48px; }
+    #chat-view > .chat-end-row { display: none; }
     #message { min-height: 1.6rem; color: var(--muted); }
     #chat-text { min-height: 5rem; }
     .theme-toggle { min-width: 7rem; }
+    .identity-header-actions { position: relative; }
+    .identity-menu { position: relative; }
+    .identity-menu > summary { display: flex; min-height: var(--control-height); align-items: center; justify-content: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border: 1px solid var(--input-border); border-radius: var(--radius-control); background: var(--button); font-size: 14px; font-weight: 500; cursor: pointer; list-style: none; }
+    .identity-menu > summary::-webkit-details-marker { display: none; }
+    .identity-menu > summary:hover { background: var(--button-hover); }
+    .hamburger-icon { display: grid; width: 1rem; gap: 3px; }
+    .hamburger-icon i { display: block; height: 2px; border-radius: 2px; background: currentColor; }
+    .identity-menu-panel { position: absolute; z-index: 10; top: calc(100% + var(--space-2)); right: 0; display: grid; width: min(240px, calc(100vw - 32px)); max-height: calc(100dvh - 88px); gap: var(--space-2); overflow: auto; padding: var(--space-2); border: 1px solid var(--border); border-radius: var(--radius-dialog); background: var(--surface); box-shadow: 0 8px 24px var(--shadow); }
+    .menu-group { display: grid; gap: var(--space-1); max-width: none; margin: 0; padding: var(--space-1); border: 0; background: transparent; box-shadow: none; }
+    .menu-group-label { margin: 0; padding: var(--space-1) var(--space-2); color: var(--muted); font-size: 12px; font-weight: 600; text-align: left; }
+    .menu-item { display: flex; width: 100%; min-height: 42px; align-items: center; justify-content: center; padding: 0 var(--space-3); border: 0; border-radius: 6px; background: transparent; font-size: 14px; font-weight: 500; }
+    .menu-item:hover { background: var(--surface-muted); }
+    .menu-divider { height: 1px; margin: var(--space-1) 0; background: var(--border-soft); }
+    main:has(.identity-dashboard:not([hidden])) { display: flex; width: min(100%, 800px); min-height: calc(100vh - 72px); min-height: calc(100dvh - 72px); align-items: center; margin: 0 auto; padding: var(--space-6) 0 var(--space-8); }
+    .identity-dashboard { display: block; width: 100%; max-width: none; margin: 0; padding: 0; border: 0; background: transparent; box-shadow: none; }
+    .dashboard-card { width: 100%; max-width: none; margin: 0; padding: var(--space-6); border-radius: var(--radius-card); background: var(--surface); }
+    .dashboard-card .eyebrow { margin: 0 0 var(--space-1); color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .04em; }
+    .identity-id-details { margin-top: var(--space-3); }
+    .identity-id-details summary, .tool-details summary { color: var(--muted); cursor: pointer; font-size: 14px; }
+    .identity-id-details p { margin: var(--space-1) 0 0; }
+    .dashboard-card-heading { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-3); }
+    .dashboard-card-heading h3 { margin: 0; font-size: 18px; }
+    .conversation-card { padding: 0; border: 0; background: transparent; box-shadow: none; }
+    .conversation-card > .meta { margin: var(--space-2) 0 var(--space-8); font-size: 15px; }
+    .dashboard-card-heading h2 { margin: 0; font-size: 28px; font-weight: 700; }
+    .conversation-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; gap: var(--space-4); }
+    .conversation-options > .conversation-option { display: grid; grid-template-rows: auto auto 1fr; min-width: 0; max-width: none; align-content: stretch; gap: var(--space-3); margin: 0; padding: var(--space-6); border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); box-shadow: none; }
+    .conversation-option h3 { margin: 0; font-size: 18px; font-weight: 600; }
+    .conversation-option p { margin: 0; color: var(--muted); font-size: 14px; }
+    .invite-option button { align-self: end; justify-self: start; min-width: 10rem; }
+    .join-form { max-width: none; }
+    .join-controls { display: grid; grid-template-columns: minmax(0, 1fr) 92px; align-self: end; gap: var(--space-2); max-width: none; }
+    .join-controls input, .join-controls button { width: 100%; height: var(--control-height); min-height: var(--control-height); }
+    .join-controls input { min-width: 0; padding: var(--space-2) var(--space-3); }
+    .join-controls button { padding: var(--space-2); }
+    .settings-card label { margin-top: var(--space-3); }
+    .settings-card details { margin: var(--space-4) 0; padding-top: var(--space-3); border-top: 1px solid var(--border-soft); }
+    .settings-card details > label { margin-top: var(--space-3); }
+    .settings-card .checkbox-row { align-items: flex-start; margin: var(--space-4) 0; font-size: 14px; }
+    .settings-card .checkbox-row input { min-height: 0; margin-top: var(--space-1); }
+    .settings-card > button { width: 100%; }
+    .identity-tools-card { display: grid; gap: var(--space-4); }
+    .identity-tools-card .dashboard-card-heading { margin-bottom: 0; }
+    .identity-tool + .identity-tool { padding-top: var(--space-4); border-top: 1px solid var(--border-soft); }
+    .identity-tool h4 { margin: 0 0 var(--space-2); font-size: 15px; }
+    .identity-tool > .meta { margin: 0; }
+    .identity-tool button { margin-top: var(--space-2); }
+    .tool-details { margin-top: var(--space-2); }
+    .tool-details p { margin: var(--space-2) 0 0; }
+    .history-tools { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: var(--space-2); margin-bottom: var(--space-3); }
+    .history-import-label { grid-column: 1 / -1; margin: var(--space-1) 0 0; }
+    .history-import-controls { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--space-2); min-width: 0; }
+    .history-import-controls input { min-width: 0; font-size: 13px; }
+    .history-import-controls button { white-space: nowrap; }
+    .history-tools > input { min-width: 0; }
+    main:has(#history-detail:not([hidden])) { width: min(100%, 960px); margin: var(--space-8) auto; }
+    #history-detail { display: grid; width: 100%; max-width: none; gap: var(--space-6); margin: 0; padding: 0; border: 0; background: transparent; box-shadow: none; }
+    #history-detail[hidden] { display: none !important; }
+    .history-detail-header { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--space-3) var(--space-4); padding: var(--space-6); border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); }
+    .history-peer-heading { min-width: 0; }
+    .history-peer-heading h2 { margin: 0 0 var(--space-2); font-size: 24px; }
+    #history-peer { margin: 0; overflow-wrap: anywhere; word-break: break-word; }
+    .history-header-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
+    .history-reconnect-note { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 14px; }
+    .history-explorer, .history-management-panel { min-width: 0; padding: var(--space-6); border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); }
+    .history-search-row { display: grid; gap: var(--space-2); }
+    .history-search-row label { margin: 0; }
+    .history-search-row input { height: var(--control-height); min-height: var(--control-height); }
+    .history-scope-note { margin: var(--space-2) 0 var(--space-4); color: var(--muted); font-size: 13px; }
+    #history-detail #history-messages { display: flex; min-width: 0; min-height: 320px; height: 58vh; max-height: 680px; flex-direction: column; gap: var(--space-3); overflow-x: hidden; overflow-y: auto; margin: 0; padding: var(--space-4); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--surface-muted); }
+    #history-detail #history-messages > .entry { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: var(--space-2) var(--space-3); width: min(100%, 760px); min-width: 0; margin: 0; padding: var(--space-3); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--surface); overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap; }
+    #history-detail #history-messages > .entry.mine { align-self: flex-end; border-color: var(--border); background: var(--surface); }
+    #history-detail #history-messages > .entry.system { align-self: center; border-style: dashed; color: var(--muted); background: transparent; }
+    #history-detail #history-messages .message-select { grid-column: 1; grid-row: 1; display: inline-flex; align-items: center; gap: var(--space-1); width: fit-content; margin: 0; color: var(--muted); font-size: 12px; font-weight: 500; cursor: pointer; }
+    #history-detail #history-messages .message-select input { width: 16px; min-height: 16px; margin: 0; }
+    #history-detail #history-messages time { grid-column: 2; grid-row: 1; margin: 0; color: var(--muted); font-size: 12px; }
+    #history-detail #history-messages > .entry > div { grid-column: 1 / -1; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+    .history-pagination { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--space-3); margin-top: var(--space-4); }
+    #history-page-status { margin: 0; }
+    .history-page-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
+    #history-page-prev, #history-page-next { min-width: 112px; }
+    #history-page-reload { background: var(--surface-muted); }
+    #history-page-prev:disabled, #history-page-next:disabled { color: var(--muted); background: var(--surface-muted); opacity: .62; cursor: not-allowed; }
+    .history-management-panel { padding: 0; overflow: hidden; }
+    .history-management-panel > summary { padding: var(--space-4) var(--space-6); font-size: 18px; font-weight: 600; cursor: pointer; list-style-position: inside; }
+    .history-management-panel[open] > summary { border-bottom: 1px solid var(--border-soft); }
+    .history-management-content { display: grid; gap: var(--space-6); padding: var(--space-6); }
+    .history-tool-section { max-width: none; margin: 0; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+    .history-tool-section h3 { margin: 0 0 var(--space-3); font-size: 18px; }
+    .history-tool-section > .meta { line-height: 1.6; }
+    .history-tool-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); }
+    .history-tool-card { display: grid; align-content: start; gap: var(--space-3); min-width: 0; padding: var(--space-4); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--surface-muted); }
+    .history-tool-card h4 { margin: 0; font-size: 15px; }
+    .history-tool-card p { margin: 0; line-height: 1.6; overflow-wrap: anywhere; }
+    .history-tool-card label { margin: 0; }
+    .history-tool-card input:not([type="checkbox"]):not([type="radio"]) { min-width: 0; }
+    .history-tool-card input[type="file"] { max-width: 100%; padding: var(--space-2); font-size: 13px; }
+    .history-import-card { max-width: 100%; }
+    .history-reprotect-card { max-width: 100%; }
+    .history-reprotect-steps { display: flex; flex-wrap: wrap; gap: var(--space-2); color: var(--muted); font-size: 12px; }
+    .history-reprotect-steps span { padding: var(--space-1) var(--space-2); border: 1px solid var(--border-soft); border-radius: 999px; background: var(--surface); }
+    .history-delete-row, .history-retention-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: var(--space-3); }
+    .history-delete-row > p { margin: 0; }
+    .history-date-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); margin-bottom: var(--space-3); }
+    .history-date-grid label, .history-retention-row label { margin: 0 0 var(--space-2); }
+    .history-retention-row > div { min-width: 0; }
+    .history-retention-row input { width: 100%; }
+    .history-delete-all { padding-top: var(--space-4); border-top: 1px solid var(--border-soft); }
+    .danger-button { border-color: var(--danger); color: var(--danger-text); background: var(--danger); }
+    .danger-button:hover { border-color: var(--danger-hover); background: var(--danger-hover); }
+    .history-danger-panel { border-color: var(--danger-border); }
+    .history-danger-panel > summary { color: var(--danger); }
+    .history-danger-panel .history-delete-all { padding: var(--space-4); border: 1px solid var(--danger-border); border-radius: var(--radius-control); background: var(--danger-surface); }
+    #message-filter::placeholder { color: var(--muted); opacity: .85; }
+    .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; clip-path: inset(50%); }
+    @media (max-width: 900px) {
+      body { padding-right: var(--space-6); padding-left: var(--space-6); }
+      main:has(#chat-view:not([hidden])) { width: 100%; }
+      main:has(#history-detail:not([hidden])) { width: 100%; }
+    }
+    @media (max-width: 680px) {
+      .conversation-options { grid-template-columns: minmax(0, 1fr); }
+      .conversation-options > .conversation-option { grid-template-rows: auto auto auto; padding: 20px; }
+      .conversation-option p { min-height: 0; }
+      .invite-option button, .join-controls { align-self: start; }
+      .chat-header { align-items: flex-start; flex-direction: column; gap: var(--space-2); padding: var(--space-3) 16px; }
+      .chat-header-actions { width: 100%; justify-content: flex-start; }
+      .chat-header-actions button { flex: 1 1 auto; }
+      .chat-workflows { max-height: 44vh; padding-right: 16px; padding-left: 16px; }
+      #chat-view #conversation { padding-right: 16px; padding-left: 16px; }
+      #chat-view .entry { max-width: 88%; }
+      #send-form { padding-right: 16px; padding-left: 16px; }
+      .history-detail-header { grid-template-columns: minmax(0, 1fr); padding: var(--space-4); }
+      .history-header-actions { justify-content: flex-start; }
+      .history-reconnect-note { grid-column: 1; }
+      .history-tool-grid { grid-template-columns: minmax(0, 1fr); }
+      .history-pagination { grid-template-columns: minmax(0, 1fr); }
+      .history-page-actions { justify-content: flex-start; }
+      .history-page-actions button { flex: 1 1 110px; }
+    }
+    @media (max-width: 560px) {
+      body { padding: 0 var(--space-4) var(--space-8); }
+      h1 { font-size: 16px; letter-spacing: .02em; }
+      .site-header-controls { gap: var(--space-2); }
+      .identity-menu > summary, .theme-toggle { min-width: 0; padding: var(--space-2); font-size: 13px; white-space: nowrap; }
+      main:has(.identity-dashboard:not([hidden])) { align-items: flex-start; padding-top: var(--space-8); }
+      .management-dialog { width: calc(100vw - 24px); max-height: 90dvh; padding: 20px; }
+      .management-dialog-header { top: -20px; margin: -20px -20px var(--space-4); padding: var(--space-3) 20px; }
+      main:has(#chat-view:not([hidden])) { height: calc(100vh - 72px - var(--space-8)); height: calc(100dvh - 72px - var(--space-8)); }
+      #chat-view { min-height: 320px; }
+      .chat-header { padding: var(--space-3); }
+      .chat-header-actions button { min-width: 0; padding-right: var(--space-2); padding-left: var(--space-2); font-size: 13px; }
+      .chat-status-strip { padding: 0 var(--space-3); }
+      .chat-workflows { max-height: 42vh; padding-right: var(--space-3); padding-left: var(--space-3); }
+      #chat-view #conversation { gap: var(--space-2); padding: var(--space-3); }
+      #chat-view .entry { max-width: 92%; padding: var(--space-3); }
+      #send-form { grid-template-columns: minmax(0, 1fr) 76px; gap: var(--space-2); padding: var(--space-2) var(--space-3); }
+      #chat-text { min-height: 44px; }
+      #send-form button { height: 44px; min-height: 44px; padding: var(--space-2); }
+      #identity-transition-panel .actions, #history-restore-panel .actions { align-items: stretch; flex-direction: column; }
+      #identity-transition-panel .actions button, #history-restore-panel .actions button { width: 100%; }
+      main:has(#history-detail:not([hidden])) { margin: var(--space-4) auto; }
+      #history-detail { gap: var(--space-4); }
+      .history-detail-header, .history-explorer { padding: var(--space-4); }
+      .history-header-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .history-header-actions button { min-width: 0; padding-right: var(--space-2); padding-left: var(--space-2); }
+      #history-detail #history-messages { min-height: 260px; height: 52vh; padding: var(--space-2); }
+      #history-detail #history-messages > .entry { width: 100%; padding: var(--space-2); }
+      .history-pagination { gap: var(--space-2); }
+      .history-page-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      #history-page-reload { grid-column: 1 / -1; }
+      .history-management-panel > summary { padding: var(--space-3) var(--space-4); }
+      .history-management-content { gap: var(--space-4); padding: var(--space-4); }
+      .history-date-grid, .history-delete-row, .history-retention-row { grid-template-columns: minmax(0, 1fr); }
+      .history-delete-row, .history-retention-row { align-items: stretch; }
+      .history-delete-row button, .history-retention-row button { width: 100%; }
+      .history-reprotect-steps { display: grid; }
+      .dashboard-card { padding: 20px; }
+      .conversation-card { padding: 0; }
+      .join-controls { grid-template-columns: minmax(0, 1fr) 88px; }
+      .history-tools, .history-import-controls { grid-template-columns: minmax(0, 1fr); }
+      .menu-account-actions { grid-template-columns: minmax(0, 1fr); }
+    }
+    @media (max-height: 600px) {
+      main:has(.identity-dashboard:not([hidden])) { align-items: flex-start; }
+      main:has(#chat-view:not([hidden])) { min-height: 0; }
+      #chat-view .chat-workflows { max-height: 36vh; }
+      #history-detail #history-messages { min-height: 240px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
+    }
     [hidden] { display: none !important; }
   </style>
   <script src="/reprotect-work.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <header><h1>Another Dimension</h1><button id="theme-toggle" class="theme-toggle" type="button" aria-label="테마 변경">다크 모드</button></header>
+  <header class="site-header">
+    <h1>Another Dimension</h1>
+    <div class="site-header-controls">
+      <button id="theme-toggle" class="theme-toggle" type="button" aria-label="테마 변경">다크 모드</button>
+      <div class="identity-header-actions">
+        <details id="identity-menu" class="identity-menu">
+          <summary id="identity-menu-toggle" aria-label="관리 메뉴 열기"><span class="hamburger-icon" aria-hidden="true"><i></i><i></i><i></i></span><span>메뉴</span></summary>
+          <div class="identity-menu-panel">
+            <nav class="menu-group" aria-label="관리">
+              <p class="menu-group-label">관리</p>
+              <button id="menu-open-settings" class="menu-item" type="button" data-management-view="settings">연결 설정</button>
+              <button id="menu-open-identity" class="menu-item" type="button" data-management-view="identity">신원 관리</button>
+              <button id="menu-open-history" class="menu-item" type="button" data-management-view="history">대화 기록 관리</button>
+            </nav>
+            <div class="menu-divider" role="separator"></div>
+            <section class="menu-group menu-account" aria-labelledby="menu-account-heading">
+              <p id="menu-account-heading" class="menu-group-label">계정</p>
+              <button id="logout" class="menu-item" type="button">로그아웃</button>
+              <button class="disconnect menu-item" type="button">로컬 연결 해제</button>
+            </section>
+          </div>
+        </details>
+      </div>
+    </div>
+  </header>
+  <dialog id="management-dialog" class="management-dialog" aria-labelledby="management-dialog-title">
+    <header class="management-dialog-header">
+      <div>
+        <p class="management-dialog-label">관리</p>
+        <h2 id="management-dialog-title" tabindex="-1">연결 설정</h2>
+      </div>
+      <button id="close-management-dialog" type="button" aria-label="관리 창 닫기">닫기</button>
+    </header>
+    <section id="management-settings-pane" class="management-pane" hidden>
+<section class="dashboard-card settings-card" aria-labelledby="settings-heading">
+                <div class="dashboard-card-heading"><div><p class="eyebrow">CONNECTION</p><h3 id="settings-heading">연결 설정</h3></div></div>
+                <p id="network-mode" class="meta" role="status"></p>
+                <details class="identity-id-details">
+                  <summary>신원 ID 보기</summary>
+                  <p id="identity-id" class="identity-id"></p>
+                </details>
+                <label for="network-mode-choice">연결 모드</label>
+                <select id="network-mode-choice">
+                  <option value="general">일반 연결</option>
+                  <option value="tor">Tor SOCKS 연결</option>
+                </select>
+                <div id="tor-settings" hidden>
+                  <label for="tor-socks-address">로컬 Tor SOCKS 주소</label>
+                  <input id="tor-socks-address" type="text" value="127.0.0.1:9050" autocomplete="off" spellcheck="false">
+                  <p class="meta">Tor 서비스를 별도로 실행하세요. 예: 127.0.0.1:9050 또는 127.0.0.1:9150. 앱은 SOCKS 서비스가 실제 Tor인지 확인하지 않으며 외부 브라우저의 네트워크 경로도 제어하지 않습니다.</p>
+                </div>
+                <details id="relay-settings">
+                  <summary>고급 relay 설정</summary>
+                  <label for="relay-list">Relay 주소 (한 줄에 하나씩)</label>
+                  <textarea id="relay-list" rows="4" spellcheck="false" autocomplete="off"></textarea>
+                  <p class="meta">wss:// 주소를 입력하세요. 연결 가능한 relay 경로를 함께 사용하며 상대와 공통 relay가 있어야 연결됩니다. 변경 사항은 프로그램을 다시 실행한 뒤 적용됩니다.</p>
+                  <p id="active-relay" class="meta" role="status"></p>
+                </details>
+                <label class="checkbox-row" for="notifications-enabled">
+                  <input id="notifications-enabled" type="checkbox">
+                  메시지 수신 시 내용 없는 macOS 알림 표시
+                </label>
+                <button id="save-settings" type="button" class="primary">설정 저장</button>
+                <p id="settings-status" class="meta" role="status"></p>
+              </section>
+    </section>
+    <section id="management-identity-pane" class="management-pane" hidden>
+<section class="dashboard-card identity-tools-card" aria-labelledby="identity-tools-heading">
+                <div class="dashboard-card-heading"><div><p class="eyebrow">IDENTITY</p><h3 id="identity-tools-heading">신원 관리</h3></div></div>
+                <div class="identity-tool">
+                  <h4>추가 개인 접속 코드</h4>
+                  <p class="meta">같은 신원과 대화 기록을 사용하는 로그인 코드를 발급합니다.</p>
+                  <details class="tool-details">
+                    <summary>기존 코드 관련 안내</summary>
+                    <p class="meta">기존 백업도 그대로 열 수 있습니다. 이 기능은 유출된 코드를 무효화하지 않습니다. 서버 없이 기존 코드의 복사본을 폐기할 수 없으므로 이전 코드는 계속 유효하며, 이전 코드를 가진 사람도 이 신원에 로그인할 수 있습니다.</p>
+                  </details>
+                  <button id="add-code" type="button">새 코드 추가 발급</button>
+                </div>
+                <div class="identity-tool">
+                  <h4>새 신원으로 교체</h4>
+                  <details class="tool-details">
+                    <summary>교체 전 확인 사항</summary>
+                    <p class="meta">현재 기기의 대화 기록과 확인된 상대 정보를 새 신원 키로 복사합니다. 새 초대에서 상대와 지문을 다시 비교한 뒤, 상대 기기에 일치하는 이전 확인 기록이 있으면 상대가 직접 선택해 기존 대화를 연결할 수 있습니다. 이전 신원 ID 주장은 동일 인물의 증명이 아니므로 별도 연락 수단으로 새 지문을 확인하세요. 다른 기기와 기존 백업은 바뀌지 않으며 이전 코드는 계속 유효합니다.</p>
+                  </details>
+                  <button id="replace-identity" type="button">새 신원 코드 발급</button>
+                </div>
+              </section>
+<section id="added-code-view" class="dashboard-card" hidden>
+                <h3>새 개인 접속 코드</h3>
+                <p>새 코드를 별도로 저장하세요. 화면을 닫으면 다시 표시할 수 없습니다. 이전 코드도 계속 유효합니다.</p>
+                <label for="added-code">개인 접속 코드</label>
+                <textarea id="added-code" readonly spellcheck="false"></textarea>
+                <div class="actions">
+                  <button id="copy-added-code" type="button">코드 복사</button>
+                  <button id="save-added-code" type="button">TXT 저장</button>
+                  <button id="close-added-code" type="button">닫기</button>
+                </div>
+              </section>
+      <dialog id="replace-identity-dialog" aria-labelledby="replace-identity-title" aria-describedby="replace-identity-warning">
+        <h2 id="replace-identity-title">새 신원으로 교체할까요?</h2>
+        <p id="replace-identity-warning">현재 기기의 기록과 확인 상대 정보를 새 코드로 복사합니다. 새 코드를 저장하고 각 상대와 새 초대·지문을 별도 연락 수단으로 다시 비교해야 합니다. 일치하는 이전 대화를 상대가 선택해 연결해야 기록이 이어집니다. 다른 기기와 백업은 바뀌지 않으며, 이전 코드는 계속 유효합니다.</p>
+        <div class="actions">
+          <button id="cancel-identity-replacement" type="button">취소</button>
+          <button id="confirm-identity-replacement" type="button" class="primary">새 신원으로 교체</button>
+        </div>
+      </dialog>
+    </section>
+    <section id="management-history-pane" class="management-pane" hidden>
+<section class="dashboard-card history-card" aria-labelledby="history-heading">
+                <div class="dashboard-card-heading">
+                  <div><p class="eyebrow">SAVED LOCALLY</p><h3 id="history-heading">대화 기록</h3></div>
+                  <button id="history-bundle-export" type="button">선택 백업</button>
+                </div>
+                <div class="history-tools">
+                  <label class="history-import-label" for="contact-file">상대 확인 백업 가져오기</label>
+                  <div class="history-import-controls">
+                    <input id="contact-file" type="file" accept=".adcontact,application/octet-stream">
+                    <button id="contact-import" type="button">상대 확인 복원</button>
+                  </div>
+                  <label class="visually-hidden" for="history-filter">상대 ID 검색</label>
+                  <input id="history-filter" type="search" autocomplete="off" placeholder="상대 ID 검색">
+                </div>
+                <div id="history-list" class="history-list" aria-live="polite"></div>
+              </section>
+    </section>
+  </dialog>
+
   <main>
     <form id="connect-form" class="entry-card">
       <label for="bridge-code">로컬 연결 코드</label>
@@ -107,86 +527,30 @@
       <textarea id="generated-code" readonly spellcheck="false"></textarea>
       <div class="actions"><button id="copy-code" type="button">코드 복사</button><button id="save-code" type="button">TXT 저장</button><button id="continue" type="button" class="primary">계속</button></div>
     </section>
-    <section id="identity-active" hidden>
-      <h2>로그인됨</h2>
-      <p>신원 ID</p><p id="identity-id" class="identity-id"></p>
-      <p id="network-mode" class="meta" role="status"></p>
-      <section aria-labelledby="settings-heading">
-        <h3 id="settings-heading">연결 및 알림 설정</h3>
-        <label for="network-mode-choice">연결 모드</label>
-        <select id="network-mode-choice">
-          <option value="general">일반 연결</option>
-          <option value="tor">Tor SOCKS 연결</option>
-        </select>
-        <div id="tor-settings" hidden>
-          <label for="tor-socks-address">로컬 Tor SOCKS 주소</label>
-          <input id="tor-socks-address" type="text" value="127.0.0.1:9050" autocomplete="off" spellcheck="false">
-          <p class="meta">Tor 서비스를 별도로 실행하세요. 예: 127.0.0.1:9050 또는 127.0.0.1:9150. 앱은 SOCKS 서비스가 실제 Tor인지 확인하지 않으며 외부 브라우저의 네트워크 경로도 제어하지 않습니다.</p>
+    <section id="identity-active" class="identity-dashboard" hidden>
+      <section class="dashboard-card conversation-card" aria-labelledby="conversation-heading">
+        <div class="dashboard-card-heading">
+          <div><h2 id="conversation-heading">대화 시작</h2></div>
         </div>
-        <details id="relay-settings">
-          <summary>고급 relay 설정</summary>
-          <label for="relay-list">Relay 주소 (한 줄에 하나씩)</label>
-          <textarea id="relay-list" rows="4" spellcheck="false" autocomplete="off"></textarea>
-          <p class="meta">wss:// 주소를 입력하세요. 연결 가능한 relay 경로를 함께 사용하며 상대와 공통 relay가 있어야 연결됩니다. 변경 사항은 프로그램을 다시 실행한 뒤 적용됩니다.</p>
-          <p id="active-relay" class="meta" role="status"></p>
-        </details>
-        <label class="checkbox-row" for="notifications-enabled">
-          <input id="notifications-enabled" type="checkbox">
-          메시지 수신 시 내용 없는 macOS 알림 표시
-        </label>
-        <div class="actions"><button id="save-settings" type="button">설정 저장</button></div>
-        <p id="settings-status" class="meta" role="status"></p>
-      </section>
-      <div class="panel">
-        <h3>추가 개인 접속 코드 발급</h3>
-        <p class="meta">새 코드는 같은 신원과 대화 기록을 사용합니다. 기존 백업도 그대로 열 수 있습니다. 이 기능은 유출된 코드를 무효화하지 않습니다. 서버 없이 기존 코드의 복사본을 폐기할 수 없으므로 이전 코드는 계속 유효하며, 이전 코드를 가진 사람도 이 신원에 로그인할 수 있습니다.</p>
-        <button id="add-code" type="button">새 코드 추가 발급</button>
-      </div>
-      <div class="panel">
-        <h3>새 신원으로 교체</h3>
-        <p class="meta">현재 기기의 대화 기록과 확인된 상대 정보를 새 신원 키로 복사합니다. 새 초대에서 상대와 지문을 다시 비교한 뒤, 상대 기기에 일치하는 이전 확인 기록이 있으면 상대가 직접 선택해 기존 대화를 연결할 수 있습니다. 이전 신원 ID 주장은 동일 인물의 증명이 아니므로 별도 연락 수단으로 새 지문을 확인하세요. 다른 기기와 기존 백업은 바뀌지 않으며 이전 코드는 계속 유효합니다.</p>
-        <button id="replace-identity" type="button">새 신원 코드 발급</button>
-      </div>
-      <dialog id="replace-identity-dialog" aria-labelledby="replace-identity-title" aria-describedby="replace-identity-warning">
-        <h2 id="replace-identity-title">새 신원으로 교체할까요?</h2>
-        <p id="replace-identity-warning">현재 기기의 기록과 상대 확인 정보를 새 코드로 복사합니다. 새 코드를 저장하고 각 상대와 새 초대·지문을 별도 연락 수단으로 다시 비교해야 합니다. 일치하는 이전 대화를 상대가 선택해 연결해야 기록이 이어집니다. 다른 기기와 백업은 바뀌지 않으며, 이전 코드는 계속 유효합니다.</p>
-        <div class="actions">
-          <button id="cancel-identity-replacement" type="button">취소</button>
-          <button id="confirm-identity-replacement" type="button" class="primary">새 신원으로 교체</button>
-        </div>
-      </dialog>
-      <section id="added-code-view" hidden>
-        <h3>새 개인 접속 코드</h3>
-        <p>새 코드를 별도로 저장하세요. 화면을 닫으면 다시 표시할 수 없습니다. 이전 코드도 계속 유효합니다.</p>
-        <label for="added-code">개인 접속 코드</label>
-        <textarea id="added-code" readonly spellcheck="false"></textarea>
-        <div class="actions">
-          <button id="copy-added-code" type="button">코드 복사</button>
-          <button id="save-added-code" type="button">TXT 저장</button>
-          <button id="close-added-code" type="button">닫기</button>
+        <p class="meta">새로운 대화를 만들거나 초대 코드로 참여하세요.</p>
+        <div class="conversation-options">
+          <section class="conversation-option invite-option" aria-labelledby="invite-option-heading">
+            <h3 id="invite-option-heading">새 대화 만들기</h3>
+            <p>초대 코드를 생성하고 상대방과 공유하세요.</p>
+            <button id="create-invite" type="button" class="primary">초대 코드 만들기</button>
+          </section>
+          <form id="join-form" class="conversation-option join-form" aria-labelledby="join-option-heading">
+            <h3 id="join-option-heading">초대 코드로 참여</h3>
+            <p>상대방에게 받은 초대 코드를 입력하세요.</p>
+            <label class="visually-hidden" for="join-code">초대 코드</label>
+            <div class="join-controls">
+              <input id="join-code" type="password" autocomplete="off" spellcheck="false" placeholder="초대 코드 입력" required>
+              <button type="submit">참여</button>
+            </div>
+          </form>
         </div>
       </section>
-      <div class="panel">
-        <h3>대화 연결</h3>
-        <p class="meta">상대와 초대 코드를 별도 경로로 공유하세요. 초대 코드를 가진 사람은 방에 참가할 수 있습니다.</p>
-        <div class="actions"><button id="create-invite" type="button" class="primary">초대 코드 생성</button></div>
-        <form id="join-form">
-          <label for="join-code">초대 코드 입력</label>
-          <input id="join-code" type="password" autocomplete="off" spellcheck="false" required>
-          <div class="actions"><button type="submit">방 입장</button></div>
-        </form>
-      </div>
-      <div class="actions"><button id="logout" type="button">로그아웃</button><button class="disconnect" type="button">로컬 연결 해제</button></div>
-      <section aria-labelledby="history-heading">
-        <h3 id="history-heading">대화 기록</h3>
-        <label for="contact-file">상대 확인 백업 가져오기</label>
-        <input id="contact-file" type="file" accept=".adcontact,application/octet-stream">
-        <button id="contact-import" type="button">상대 확인 복원</button>
-        <label for="history-filter">상대 ID 검색</label>
-        <input id="history-filter" type="search" autocomplete="off">
-        <div class="actions"><button id="history-bundle-export" type="button">선택 대화 암호화 백업</button></div>
-        <div id="history-list" class="history-list" aria-live="polite"></div>
-      </section>
+
     </section>
     <section id="invite-view" hidden>
       <h2>초대 코드</h2>
@@ -202,110 +566,186 @@
       </div>
     </section>
     <section id="chat-view" hidden>
-      <h2 id="chat-title">대화 연결</h2>
-      <p id="chat-status" role="status" aria-live="polite">연결을 시작합니다.</p>
-      <p id="delivery-status" class="meta" role="status" aria-live="polite" hidden></p>
-      <p id="storage-status" class="meta" role="status" aria-live="polite" hidden></p>
-      <div id="verification" class="panel" hidden>
-        <p>상대 공개 키와 전체 채널 지문을 별도 경로로 비교하세요. 일치하지 않으면 확인하지 마세요.</p>
-        <h3>상대 공개 키</h3><p id="peer-id" class="identity-id"></p>
-        <h3>채널 지문</h3><p id="fingerprint" class="fingerprint"></p>
-        <div class="actions"><button id="confirm-peer" type="button" class="primary">비교했고 상대를 확인했습니다</button></div>
+      <header class="chat-header">
+        <div class="chat-heading">
+          <h2 id="chat-title">대화 연결</h2>
+          <p id="chat-status" role="status" aria-live="polite">연결을 시작합니다.</p>
+        </div>
+        <div class="chat-header-actions">
+          <button id="history-restore-request" type="button">상대 기록 확인</button>
+          <button id="close-chat" type="button">연결 종료</button>
+        </div>
+      </header>
+      <div class="chat-status-strip" aria-label="메시지 상태">
+        <p id="delivery-status" class="meta" role="status" aria-live="polite" hidden></p>
+        <p id="storage-status" class="meta" role="status" aria-live="polite" hidden></p>
       </div>
-      <div id="identity-transition-panel" class="panel" hidden>
-        <h3>이전 신원 대화 연결 요청</h3>
-        <p id="identity-transition-copy" class="meta"></p>
-        <label for="identity-transition-choice">기존에 확인한 대화</label>
-        <select id="identity-transition-choice"></select>
-        <div class="actions">
-          <button id="identity-transition-accept" type="button" class="primary">기존 기록을 이 대화에 연결</button>
-          <button id="identity-transition-dismiss" type="button">별도 대화로 유지</button>
+      <div class="chat-workflows">
+        <div id="verification" class="panel" hidden>
+          <h3>상대 신원 확인</h3>
+          <p>상대 공개 키와 전체 채널 지문을 별도 경로로 비교하세요. 일치하지 않으면 확인하지 마세요.</p>
+          <h3>상대 공개 키</h3><p id="peer-id" class="identity-id"></p>
+          <h3>채널 지문</h3><p id="fingerprint" class="fingerprint"></p>
+          <div class="actions"><button id="confirm-peer" type="button" class="primary">비교했고 상대를 확인했습니다</button></div>
+        </div>
+        <div id="identity-transition-panel" class="panel" hidden>
+          <h3>이전 신원 대화 연결 요청</h3>
+          <p id="identity-transition-copy" class="meta"></p>
+          <label for="identity-transition-choice">기존에 확인한 대화</label>
+          <select id="identity-transition-choice"></select>
+          <div class="actions">
+            <button id="identity-transition-accept" type="button" class="primary">기존 기록을 이 대화에 연결</button>
+            <button id="identity-transition-dismiss" type="button">별도 대화로 유지</button>
+          </div>
+        </div>
+        <div id="history-restore-panel" class="panel" hidden>
+          <h3>상대 기록 복원</h3>
+          <p id="history-restore-status" class="meta"></p>
+          <p class="meta">먼저 개수와 전송량 추정치를 확인합니다. 전송 동의 후 서명 검증된 항목을 암호화 임시 저장소에 받고, 미리 보기 후 최종 병합 동의를 별도로 받습니다.</p>
+          <p class="meta">서명은 해당 키가 기록에 서명했다는 것만 확인합니다. 실제 인물이나 기록의 완전성은 증명하지 않습니다. 서명 없는 기존 기록은 검증되지 않습니다. 삭제 표식이 없어 의도적 삭제와 단순 누락을 구분할 수 없습니다.</p>
+          <div id="history-restore-preview" class="conversation"></div>
+          <div class="actions">
+            <button id="history-restore-accept" type="button" class="primary">전송 동의</button>
+            <button id="history-restore-decline" type="button">복원 거부</button>
+          </div>
         </div>
       </div>
-      <div id="history-restore-panel" class="panel" hidden>
-        <h3>상대 기록 복원</h3>
-        <p id="history-restore-status" class="meta"></p>
-        <p class="meta">먼저 개수와 전송량 추정치를 확인합니다. 전송 동의 후 서명 검증된 항목을 암호화 임시 저장소에 받고, 미리 보기 후 최종 병합 동의를 별도로 받습니다.</p>
-        <p class="meta">서명은 해당 키가 기록에 서명했다는 것만 확인합니다. 실제 인물이나 기록의 완전성은 증명하지 않습니다. 서명 없는 기존 기록은 검증되지 않습니다. 삭제 표식이 없어 의도적 삭제와 단순 누락을 구분할 수 없습니다.</p>
-        <div id="history-restore-preview" class="conversation"></div>
-        <div class="actions">
-          <button id="history-restore-accept" type="button" class="primary">전송 동의</button>
-          <button id="history-restore-decline" type="button">복원 거부</button>
-        </div>
-      </div>
-      <div class="actions"><button id="history-restore-request" type="button">상대 기록 확인</button></div>
-      <div id="conversation" class="conversation" aria-live="polite"></div>
+      <div id="conversation" class="conversation" aria-live="polite" aria-label="대화 메시지"></div>
       <form id="send-form" hidden>
-        <label for="chat-text">메시지</label>
-        <textarea id="chat-text" maxlength="4078" required></textarea>
-        <div class="actions"><button type="submit" class="primary">전송</button></div>
+        <label class="visually-hidden" for="chat-text">메시지</label>
+        <textarea id="chat-text" maxlength="4078" required placeholder="메시지를 입력하세요."></textarea>
+        <button type="submit" class="primary">전송</button>
       </form>
-      <div class="actions"><button id="close-chat" type="button">연결 종료</button></div>
     </section>
     <section id="history-detail" hidden>
-      <h2>대화 기록</h2>
-      <p id="history-peer" class="identity-id"></p>
-      <button id="contact-reconnect" type="button">상대와 다시 연결</button>
-      <p class="meta">현재는 양쪽에서 다시 연결을 선택해야 합니다.</p>
-      <p class="meta">상대 확인 백업은 이 개인 접속 코드로 보호됩니다. 대화 내용 백업과 별도로 저장하세요. 오래된 백업의 최신 여부는 확인할 수 없습니다.</p>
-      <button id="contact-export" type="button">상대 확인 백업 저장</button>
-      <div class="actions">
-        <button id="history-back" type="button">대화 목록</button>
-        <button id="history-export" type="button">현재 페이지 TXT 저장</button>
-        <button id="history-backup-export" type="button">암호화 백업 저장</button>
-      </div>
-      <label for="history-backup-export-password">백업 비밀번호 (선택, 12자 이상)</label>
-      <input id="history-backup-export-password" type="password" autocomplete="new-password" maxlength="1024">
-      <label for="history-backup-export-password-confirm">백업 비밀번호 확인</label>
-      <input id="history-backup-export-password-confirm" type="password" autocomplete="new-password" maxlength="1024">
-      <p class="meta">새 백업은 개인 접속 코드에서 만든 키로 암호화합니다. 비밀번호를 설정하면 코드와 비밀번호가 모두 있어야 복호화할 수 있고, 둘 중 하나라도 잃으면 복구할 수 없습니다. 비밀번호를 비우면 코드만 사용합니다. 이전 ADBACK2는 암호화 키를 백업 비밀번호로 만들지만 파일 인증은 이전 신원 공개키에도 묶여 있어 이전 코드가 필요합니다. 새 보호는 이전 파일에 소급 적용되지 않습니다.</p>
-      <label for="history-backup-file">암호화 백업 가져오기</label>
-      <input id="history-backup-file" type="file" accept=".adbak,application/octet-stream">
-      <label for="history-backup-import-password">백업 비밀번호</label>
-      <input id="history-backup-import-password" type="password" autocomplete="current-password" maxlength="1024">
-      <button id="history-backup-import" type="button">파일 가져오기</button>
-      <label for="message-filter">현재 페이지 검색</label>
-      <input id="message-filter" type="search" autocomplete="off">
-      <div class="actions">
-        <button id="history-page-prev" type="button" disabled>이전 페이지</button>
-        <button id="history-page-next" type="button" disabled>다음 페이지</button>
-        <button id="history-page-reload" type="button">기록 다시 불러오기</button>
-      </div>
-      <p id="history-page-status" class="meta" role="status"></p>
-      <div class="panel">
-        <h3>이전 신원 백업 재보호</h3>
-        <p class="meta">이전 신원 코드와 필요한 백업 비밀번호로 파일을 복호화해 현재 신원용 새 파일을 만듭니다. 새 파일을 저장 위치에서 다시 읽어 확인하기 전까지 원본은 보존됩니다. 확인 후 원본 삭제는 사용자가 직접 선택하고 Finder에서 처리합니다.</p>
-        <button id="history-reprotect-choose" type="button">이전 백업 파일 선택</button>
-        <p id="history-reprotect-source" class="meta">선택한 파일 없음</p>
-        <label for="history-reprotect-previous-code">이전 개인 접속 코드</label>
-        <input id="history-reprotect-previous-code" type="password" autocomplete="off" maxlength="190">
-        <label for="history-reprotect-previous-password">이전 백업 비밀번호 (파일에 설정한 경우)</label>
-        <input id="history-reprotect-previous-password" type="password" autocomplete="current-password" maxlength="1024">
-        <label for="history-reprotect-new-password">새 백업 비밀번호 (선택, 12자 이상)</label>
-        <input id="history-reprotect-new-password" type="password" autocomplete="new-password" maxlength="1024">
-        <label for="history-reprotect-new-password-confirm">새 백업 비밀번호 확인</label>
-        <input id="history-reprotect-new-password-confirm" type="password" autocomplete="new-password" maxlength="1024">
-        <button id="history-reprotect" type="button">새 백업 만들기</button>
-        <button id="history-reprotect-save" type="button" disabled>새 파일 저장 및 확인</button>
-      </div>
-      <label for="message-filter">메시지 검색</label>
-      <input id="message-filter" type="search" autocomplete="off">
-      <div class="panel">
-        <h3>메시지 삭제</h3>
-        <p id="selection-count" class="meta">선택한 메시지 없음</p>
-        <button id="delete-selected" type="button">선택 삭제</button>
-        <div class="field-grid">
-          <div><label for="delete-from">시작일</label><input id="delete-from" type="date"></div>
-          <div><label for="delete-to">종료일</label><input id="delete-to" type="date"></div>
+      <header class="history-detail-header">
+        <div class="history-peer-heading">
+          <h2>대화 기록</h2>
+          <p id="history-peer" class="identity-id"></p>
         </div>
-        <button id="delete-range" type="button">기간 삭제</button>
-        <div class="field-grid">
-          <div><label for="keep-days">최근 며칠 보관</label><input id="keep-days" type="number" min="1" max="36500" value="3"></div>
+        <div class="history-header-actions">
+          <button id="history-back" type="button">대화 목록</button>
+          <button id="contact-reconnect" type="button">상대와 다시 연결</button>
         </div>
-        <button id="keep-recent" type="button">기간 외 삭제</button>
-        <button id="delete-conversation" type="button">대화 전체 삭제</button>
+        <p class="history-reconnect-note">현재는 양쪽에서 다시 연결을 선택해야 합니다.</p>
+      </header>
+
+      <div class="history-explorer">
+        <div class="history-search-row">
+          <label for="message-filter">현재 페이지 검색</label>
+          <input id="message-filter" type="search" autocomplete="off" placeholder="현재 불러온 페이지에서 검색">
+        </div>
+        <p class="history-scope-note">검색과 TXT 저장은 현재 불러온 페이지를 대상으로 합니다.</p>
+        <div id="history-messages" class="history-message-list" aria-live="polite"></div>
+        <div class="history-pagination">
+          <p id="history-page-status" class="meta" role="status"></p>
+          <div class="history-page-actions">
+            <button id="history-page-prev" type="button" disabled>이전 페이지</button>
+            <button id="history-page-next" type="button" disabled>다음 페이지</button>
+            <button id="history-page-reload" type="button">기록 다시 불러오기</button>
+          </div>
+        </div>
       </div>
-      <div id="history-messages" class="conversation" aria-live="polite"></div>
+
+      <details class="history-management-panel">
+        <summary>백업 및 복원</summary>
+        <div class="history-management-content">
+          <section class="history-tool-section">
+            <h3>내보내기</h3>
+            <div class="history-tool-grid">
+              <div class="history-tool-card">
+                <h4>현재 페이지 TXT 저장</h4>
+                <p class="meta">현재 불러온 페이지의 메시지를 평문 텍스트 파일로 저장합니다. 파일은 암호화되지 않습니다.</p>
+                <button id="history-export" type="button">현재 페이지 TXT 저장</button>
+              </div>
+              <div class="history-tool-card">
+                <h4>암호화 백업</h4>
+                <p class="meta">새 백업은 개인 접속 코드에서 만든 키로 암호화합니다. 비밀번호는 선택 사항입니다. 설정하면 코드와 비밀번호가 모두 있어야 복호화할 수 있고, 둘 중 하나라도 잃으면 복구할 수 없습니다. 비밀번호를 비우면 코드만 사용합니다. 이전 ADBACK2는 암호화 키를 백업 비밀번호로 만들지만 파일 인증은 이전 신원 공개키에도 묶여 있어 이전 코드가 필요합니다. 새 보호는 이전 파일에 소급 적용되지 않습니다.</p>
+                <label for="history-backup-export-password">백업 비밀번호 (선택, 12자 이상)</label>
+                <input id="history-backup-export-password" type="password" autocomplete="new-password" maxlength="1024">
+                <label for="history-backup-export-password-confirm">백업 비밀번호 확인</label>
+                <input id="history-backup-export-password-confirm" type="password" autocomplete="new-password" maxlength="1024">
+                <button id="history-backup-export" type="button">암호화 백업 저장</button>
+              </div>
+              <div class="history-tool-card">
+                <h4>상대 확인 백업</h4>
+                <p class="meta">상대 확인 백업은 이 개인 접속 코드로 보호됩니다. 대화 내용 백업과 별도로 저장하세요. 오래된 백업의 최신 여부는 확인할 수 없습니다.</p>
+                <button id="contact-export" type="button">상대 확인 백업 저장</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="history-tool-section">
+            <h3>백업 가져오기</h3>
+            <div class="history-tool-card history-import-card">
+              <label for="history-backup-file">암호화 백업 파일</label>
+              <input id="history-backup-file" type="file" accept=".adbak,application/octet-stream">
+              <label for="history-backup-import-password">백업 비밀번호</label>
+              <input id="history-backup-import-password" type="password" autocomplete="current-password" maxlength="1024">
+              <button id="history-backup-import" type="button">파일 가져오기</button>
+            </div>
+          </section>
+
+          <section class="history-tool-section">
+            <h3>이전 신원 백업 재보호</h3>
+            <p class="meta">이전 신원 코드와 필요한 백업 비밀번호로 파일을 복호화해 현재 신원용 새 파일을 만듭니다. 새 파일을 저장 위치에서 다시 읽어 확인하기 전까지 원본은 보존됩니다. 확인 후 원본 삭제는 사용자가 직접 선택하고 Finder에서 처리합니다.</p>
+            <div class="history-tool-card history-reprotect-card">
+              <div class="history-reprotect-steps" aria-label="재보호 순서">
+                <span>1. 파일 선택</span><span>2. 이전 코드·비밀번호</span><span>3. 새 비밀번호 설정</span><span>4. 새 백업 생성</span><span>5. 저장 후 파일 확인</span>
+              </div>
+              <button id="history-reprotect-choose" type="button">이전 백업 파일 선택</button>
+              <p id="history-reprotect-source" class="meta">선택한 파일 없음</p>
+              <label for="history-reprotect-previous-code">이전 개인 접속 코드</label>
+              <input id="history-reprotect-previous-code" type="password" autocomplete="off" maxlength="190">
+              <label for="history-reprotect-previous-password">이전 백업 비밀번호 (파일에 설정한 경우)</label>
+              <input id="history-reprotect-previous-password" type="password" autocomplete="current-password" maxlength="1024">
+              <label for="history-reprotect-new-password">새 백업 비밀번호 (선택, 12자 이상)</label>
+              <input id="history-reprotect-new-password" type="password" autocomplete="new-password" maxlength="1024">
+              <label for="history-reprotect-new-password-confirm">새 백업 비밀번호 확인</label>
+              <input id="history-reprotect-new-password-confirm" type="password" autocomplete="new-password" maxlength="1024">
+              <div class="actions">
+                <button id="history-reprotect" type="button">새 백업 만들기</button>
+                <button id="history-reprotect-save" type="button" disabled>새 파일 저장 및 확인</button>
+              </div>
+            </div>
+          </section>
+        </div>
+      </details>
+
+      <details class="history-management-panel history-danger-panel">
+        <summary>데이터 삭제 및 보관</summary>
+        <div class="history-management-content">
+          <p class="meta">삭제는 이 기기의 대화 기록에 적용됩니다. 상대방 기록과 백업은 삭제되지 않습니다.</p>
+          <section class="history-tool-section">
+            <h3>선택한 메시지 삭제</h3>
+            <div class="history-delete-row">
+              <p id="selection-count" class="meta">선택한 메시지 없음</p>
+              <button id="delete-selected" type="button">선택 삭제</button>
+            </div>
+          </section>
+          <section class="history-tool-section">
+            <h3>날짜 범위 삭제</h3>
+            <div class="history-date-grid">
+              <div><label for="delete-from">시작일</label><input id="delete-from" type="date"></div>
+              <div><label for="delete-to">종료일</label><input id="delete-to" type="date"></div>
+            </div>
+            <button id="delete-range" type="button">기간 삭제</button>
+          </section>
+          <section class="history-tool-section">
+            <h3>최근 기간 보관</h3>
+            <p class="meta">입력한 일수보다 오래된 메시지를 삭제합니다. 기본 보관 기간은 3일입니다.</p>
+            <div class="history-retention-row">
+              <div><label for="keep-days">최근 며칠 보관</label><input id="keep-days" type="number" min="1" max="36500" value="3"></div>
+              <button id="keep-recent" type="button">기간 외 삭제</button>
+            </div>
+          </section>
+          <section class="history-tool-section history-delete-all">
+            <h3>대화 전체 삭제</h3>
+            <p class="meta">이 동작은 이 기기의 현재 대화 기록 전체를 삭제합니다. 상대방 기록과 별도로 저장한 백업에는 영향을 주지 않습니다.</p>
+            <button id="delete-conversation" class="danger-button" type="button">대화 전체 삭제</button>
+          </section>
+        </div>
+      </details>
     </section>
     <p id="message" role="status" aria-live="polite"></p>
   </main>

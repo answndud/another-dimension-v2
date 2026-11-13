@@ -7,6 +7,13 @@ const created = document.querySelector('#created');
 const generatedCode = document.querySelector('#generated-code');
 const createdNote = document.querySelector('#created-note');
 const active = document.querySelector('#identity-active');
+const managementDialog = document.querySelector('#management-dialog');
+const managementDialogTitle = document.querySelector('#management-dialog-title');
+const managementPanes = {
+  settings: document.querySelector('#management-settings-pane'),
+  identity: document.querySelector('#management-identity-pane'),
+  history: document.querySelector('#management-history-pane'),
+};
 const identityId = document.querySelector('#identity-id');
 const inviteView = document.querySelector('#invite-view');
 const inviteCode = document.querySelector('#invite-code');
@@ -78,6 +85,33 @@ document.querySelector('#theme-toggle').addEventListener('click', () => {
   applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
 });
 
+const identityMenu = document.querySelector('#identity-menu');
+const identityMenuToggle = document.querySelector('#identity-menu-toggle');
+document.addEventListener('click', (event) => {
+  if (identityMenu.open && !identityMenu.contains(event.target)) identityMenu.open = false;
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') identityMenu.open = false;
+});
+
+function openManagementView(view, title) {
+  const pane = managementPanes[view];
+  if (!pane) return;
+  identityMenu.open = false;
+  for (const [name, candidate] of Object.entries(managementPanes)) candidate.hidden = name !== view;
+  managementDialogTitle.textContent = title;
+  if (!managementDialog.open) managementDialog.showModal();
+  managementDialogTitle.focus();
+}
+
+document.querySelector('#menu-open-settings').addEventListener('click', () => openManagementView('settings', '연결 설정'));
+document.querySelector('#menu-open-identity').addEventListener('click', () => openManagementView('identity', '신원 관리'));
+document.querySelector('#menu-open-history').addEventListener('click', () => openManagementView('history', '대화 기록 관리'));
+document.querySelector('#close-management-dialog').addEventListener('click', () => managementDialog.close());
+managementDialog.addEventListener('close', () => {
+  if (!active.hidden) identityMenuToggle.focus();
+});
+
 function appendMessageBody(container, text) {
   const source = String(text);
   const urlPattern = /https?:\/\/[^\s<>"']+/gi;
@@ -144,6 +178,7 @@ function clearReprotectState() {
 }
 
 function show(view) {
+  identityMenu.open = false;
   bridgeForm.hidden = view !== 'bridge';
   entry.hidden = view !== 'entry';
   created.hidden = view !== 'created';
@@ -151,6 +186,7 @@ function show(view) {
   inviteView.hidden = view !== 'invite';
   chatView.hidden = view !== 'chat';
   historyDetail.hidden = view !== 'history';
+  if (managementDialog.open) managementDialog.close();
   if (view !== 'active') {
     document.querySelector('#added-code').value = '';
     document.querySelector('#added-code-view').hidden = true;
@@ -520,6 +556,8 @@ function formatTime(seconds) {
 }
 
 function appendMessages(items) {
+  const distanceFromBottom = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight;
+  const followLatest = conversation.scrollHeight === 0 || distanceFromBottom <= 80;
   for (const item of items) {
     const card = document.createElement('article');
     card.className = `entry${item.sender === '나' ? ' mine' : ''}${item.sender === '신원 변경' ? ' system' : ''}`;
@@ -532,7 +570,7 @@ function appendMessages(items) {
     conversation.append(card);
     messageCursor += 1;
   }
-  if (items.length) conversation.scrollTop = conversation.scrollHeight;
+  if (items.length && followLatest) conversation.scrollTop = conversation.scrollHeight;
 }
 
 function updateChatView(snapshot) {

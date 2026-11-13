@@ -52,15 +52,21 @@ function createHarness(options = {}) {
   const element = (selector) => {
     if (!elements.has(selector)) {
       const target = {
-        value: '', textContent: '', hidden: false, disabled: false, checked: false,
+        value: '', textContent: '', hidden: false, disabled: false, checked: false, open: false,
         dataset: {}, style: {}, listeners: {}, children: [],
         addEventListener(type, callback) { this.listeners[type] = callback; },
+        contains(node) { return (this.containsNodes || []).includes(node); },
         querySelector(selector) { return element(`${selector} inside ${selector}`); },
         querySelectorAll() { return []; },
         replaceChildren(...children) { this.children = children; },
         append(...children) { this.children.push(...children); },
         appendChild(child) { this.children.push(child); return child; },
-        focus() {}, click() {}, remove() {}, setAttribute() {},
+        focus() { this.focused = true; }, click() {}, remove() {}, setAttribute() {},
+        showModal() { this.open = true; },
+        close() {
+          this.open = false;
+          if (this.listeners.close) this.listeners.close();
+        },
         classList: { add() {}, remove() {}, toggle() {} },
       };
       elements.set(selector, target);
@@ -69,6 +75,8 @@ function createHarness(options = {}) {
   };
   const document = {
     documentElement: { dataset: {}, setAttribute() {} },
+    listeners: {},
+    addEventListener(type, callback) { this.listeners[type] = callback; },
     querySelector: element,
     querySelectorAll: () => [],
     createElement: (tag) => element(`created:${tag}:${elements.size}`),
@@ -121,6 +129,167 @@ function createHarness(options = {}) {
   const requestFor = (path) => requests.findLast((item) => item.path === path);
   return { element, window, click, requests, requestFor, evaluate, themeStorage, document };
 }
+
+test('dashboard menu closes on outside click and Escape; management dialog reuses the selected pane and restores focus', async () => {
+  const harness = createHarness();
+  const menu = harness.element('#identity-menu');
+  harness.element('#identity-active').hidden = false;
+  menu.open = true;
+  harness.document.listeners.click({ target: {} });
+  assert.equal(menu.open, false);
+
+  const inside = {};
+  menu.containsNodes = [inside];
+  menu.open = true;
+  harness.document.listeners.click({ target: inside });
+  assert.equal(menu.open, true);
+  harness.document.listeners.keydown({ key: 'Escape' });
+  assert.equal(menu.open, false);
+
+  const settings = harness.element('#management-settings-pane');
+  const identity = harness.element('#management-identity-pane');
+  const history = harness.element('#management-history-pane');
+  await harness.click('#menu-open-settings');
+  assert.equal(menu.open, false);
+  assert.equal(harness.element('#management-dialog').open, true);
+  assert.equal(harness.element('#management-dialog-title').textContent, '연결 설정');
+  assert.equal(settings.hidden, false);
+  assert.equal(identity.hidden, true);
+  assert.equal(history.hidden, true);
+  assert.equal(harness.element('#management-dialog-title').focused, true);
+
+  await harness.click('#menu-open-identity');
+  assert.equal(settings.hidden, true);
+  assert.equal(identity.hidden, false);
+  assert.equal(history.hidden, true);
+  await harness.click('#menu-open-history');
+  assert.equal(settings.hidden, true);
+  assert.equal(identity.hidden, true);
+  assert.equal(history.hidden, false);
+  await harness.click('#menu-open-identity');
+  const replaceDialog = harness.element('#replace-identity-dialog');
+  await harness.click('#replace-identity');
+  assert.equal(replaceDialog.open, true);
+  await harness.click('#cancel-identity-replacement');
+  assert.equal(replaceDialog.open, false);
+  assert.equal(harness.element('#management-dialog').open, true);
+
+  const addedCodeView = harness.element('#added-code-view');
+  addedCodeView.hidden = true;
+  const addCode = harness.click('#add-code');
+  harness.requestFor('/api/identity/add-code').resolve(response('issued-code'));
+  await addCode;
+  assert.equal(harness.element('#added-code').value, 'issued-code');
+  assert.equal(addedCodeView.hidden, false);
+  assert.equal(identity.hidden, false);
+  assert.equal(harness.element('#management-dialog').open, true);
+
+  await harness.click('#close-management-dialog');
+  assert.equal(harness.element('#management-dialog').open, false);
+  assert.equal(harness.element('#identity-menu-toggle').focused, true);
+
+  const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
+  const menuPanel = html.slice(html.indexOf('id="identity-menu"'), html.indexOf('id="management-dialog"'));
+  assert.ok(menuPanel.indexOf('class="menu-group-label">관리') < menuPanel.indexOf('class="menu-group menu-account"'));
+  assert.match(html, /\.identity-menu-panel\s*\{[^}]*width:\s*min\(240px/);
+  assert.match(html, /\.menu-group-label\s*\{[^}]*text-align:\s*left/);
+  assert.ok(html.indexOf('id="theme-toggle"') < html.indexOf('id="identity-menu"'));
+  assert.match(html, /\.join-controls input, \.join-controls button\s*\{[^}]*height:\s*var\(--control-height\);[^}]*min-height:\s*var\(--control-height\);/);
+  assert.match(html, /--control-height:\s*44px/);
+  assert.match(html, /\.conversation-options\s*\{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/);
+  assert.match(html, /@media\s*\(max-width:\s*680px\)\s*\{\s*\.conversation-options\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\)/);
+
+  const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]);
+  const duplicateIds = ids.filter((id, index) => ids.indexOf(id) !== index);
+  assert.deepEqual([...new Set(duplicateIds)], []);
+  for (const [, labelledId] of html.matchAll(/<label\b[^>]*\bfor="([^"]+)"/g)) {
+    assert.ok(ids.includes(labelledId), `label points to missing id: ${labelledId}`);
+  }
+  for (const requiredId of [
+    'theme-toggle', 'identity-menu', 'logout', 'save-settings', 'add-code',
+    'replace-identity', 'history-bundle-export', 'identity-active', 'create-invite',
+    'join-form', 'join-code', 'connect-form', 'identity-entry', 'created', 'invite-view',
+    'chat-view', 'history-detail', 'added-code-view',
+  ]) {
+    assert.ok(ids.includes(requiredId), `required feature id missing: ${requiredId}`);
+  }
+});
+
+test('chat UI keeps the message DOM safe and follows new messages only when already near the bottom', () => {
+  const harness = createHarness();
+  const conversation = harness.element('#conversation');
+  conversation.clientHeight = 200;
+  conversation.scrollHeight = 1000;
+  conversation.scrollTop = 800;
+  harness.evaluate(`appendMessages([{ sender: '나', time: 1700000000, text: 'hello\\nhttps://example.test' }])`);
+  assert.equal(conversation.scrollTop, 1000);
+  const firstMessage = conversation.children[0];
+  assert.equal(firstMessage.className, 'entry mine');
+  assert.equal(firstMessage.children.length, 2);
+  assert.match(firstMessage.children[0].dateTime, /^\d{4}-/);
+
+  conversation.scrollHeight = 1200;
+  conversation.scrollTop = 200;
+  harness.evaluate(`appendMessages([{ sender: '상대', time: 1700000001, text: 'older message' }])`);
+  assert.equal(conversation.scrollTop, 200);
+
+  const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
+  assert.match(html, /main:has\(#chat-view:\s*not\(\[hidden\]\)\)[^{]*\{[^}]*width:\s*min\(100%,\s*960px\)/);
+  assert.match(html, /#chat-view\s+#conversation\s*\{[^}]*min-height:\s*0;[^}]*max-height:\s*none;[^}]*overflow-y:\s*auto/s);
+  assert.match(html, /#chat-view\s+\.entry\.mine\s*\{[^}]*align-self:\s*flex-end;[^}]*margin-left:\s*auto/s);
+  assert.match(html, /#send-form\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+88px/s);
+  assert.match(html, /#chat-text\s*\{[^}]*max-height:\s*160px/s);
+  for (const id of [
+    'chat-view', 'chat-title', 'chat-status', 'delivery-status', 'storage-status',
+    'verification', 'confirm-peer', 'identity-transition-panel', 'history-restore-panel',
+    'history-restore-preview', 'history-restore-request', 'conversation', 'send-form',
+    'chat-text', 'close-chat',
+  ]) assert.match(html, new RegExp(`id="${id}"`));
+});
+
+test('history detail separates browsing, backup and deletion without replacing feature controls', () => {
+  const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
+  const detailStart = html.indexOf('<section id="history-detail"');
+  const detail = html.slice(detailStart, html.indexOf('<p id="message"', detailStart));
+  const ids = [...html.matchAll(/\bid="([^\"]+)"/g)].map((match) => match[1]);
+  const required = [
+    'history-peer', 'contact-reconnect', 'history-back', 'contact-export', 'history-export',
+    'history-backup-export', 'history-backup-export-password', 'history-backup-export-password-confirm',
+    'history-backup-file', 'history-backup-import-password', 'history-backup-import',
+    'history-reprotect-choose', 'history-reprotect-source', 'history-reprotect-previous-code',
+    'history-reprotect-previous-password', 'history-reprotect-new-password',
+    'history-reprotect-new-password-confirm', 'history-reprotect', 'history-reprotect-save',
+    'message-filter', 'history-messages', 'history-page-prev', 'history-page-next',
+    'history-page-reload', 'history-page-status', 'selection-count', 'delete-selected',
+    'delete-from', 'delete-to', 'delete-range', 'keep-days', 'keep-recent', 'delete-conversation',
+  ];
+  for (const id of required) assert.equal(ids.filter((candidate) => candidate === id).length, 1, `${id} remains unique`);
+  assert.ok(detail.indexOf('history-detail-header') < detail.indexOf('message-filter'));
+  assert.ok(detail.indexOf('message-filter') < detail.indexOf('history-messages'));
+  assert.ok(detail.indexOf('history-messages') < detail.indexOf('백업 및 복원'));
+  assert.ok(detail.indexOf('백업 및 복원') < detail.indexOf('데이터 삭제 및 보관'));
+  assert.match(detail, /현재 불러온 페이지의 메시지를 평문 텍스트 파일로 저장합니다\. 파일은 암호화되지 않습니다\./);
+  assert.match(detail, /비밀번호는 선택 사항입니다/);
+  assert.match(detail, /현재 페이지 검색/);
+  assert.match(detail, /검색과 TXT 저장은 현재 불러온 페이지를 대상으로 합니다/);
+  assert.equal((detail.match(/class="history-reprotect-steps"[\s\S]*?<\/div>/) || [''])[0].match(/<span>/g).length, 5);
+  assert.match(detail, /id="keep-days"[^>]*value="3"/);
+  assert.match(html, /#history-detail #history-messages\s*\{[^}]*overflow-y:\s*auto/s);
+  assert.match(html, /#history-detail #history-messages\s*\{[^}]*max-height:\s*680px/s);
+  assert.match(html, /@media\s*\(max-width:\s*680px\)[\s\S]*?\.history-tool-grid\s*\{\s*grid-template-columns:\s*minmax\(0,\s*1fr\)/);
+  assert.match(html, /\.danger-button\s*\{[^}]*background:\s*var\(--danger\)/);
+});
+
+test('whole-conversation deletion remains explicitly confirmed and locally scoped', async () => {
+  const h = createHarness();
+  let prompt = '';
+  h.window.confirm = (value) => { prompt = value; return false; };
+  h.evaluate("selectedHistoryPeer = 'peer-to-delete'");
+  await h.click('#delete-conversation');
+  assert.match(prompt, /이 대화의 모든 기록을 이 기기에서 삭제할까요\?/);
+  assert.match(prompt, /상대방 기록과 백업은 삭제되지 않습니다/);
+  assert.equal(h.requests.some((item) => item.path === '/api/history/delete-conversation'), false);
+});
 
 async function chooseSource(harness, sourceHandle) {
   const picker = deferred();
