@@ -33,10 +33,18 @@
     main { width: min(100%, 50.625rem); margin: 5rem auto; }
     form, section { max-width: 42rem; }
     section { margin: 0 0 1rem; padding: 1.75rem; border: 1px solid var(--border); border-radius: .4rem; background: var(--surface); box-shadow: 0 2px 8px var(--shadow); }
-    #connect-form, #identity-entry, #created { max-width: 42rem; margin: 0 auto 1rem; }
-    #connect-form { padding: 1.75rem; border: 1px solid var(--border); border-radius: .4rem; background: var(--surface); box-shadow: 0 2px 8px var(--shadow); }
+    .entry-card { max-width: 42rem; margin: 0 auto 1rem; padding: 2rem; border: 1px solid var(--border); border-radius: .4rem; background: var(--surface); box-shadow: 0 2px 8px var(--shadow); }
+    #connect-form { display: grid; gap: .8rem; }
+    #connect-form > label { margin: 0; }
+    #connect-form > p { margin: 0; color: var(--muted); }
+    .entry-card form { display: grid; gap: .75rem; }
+    .entry-card label { margin: .15rem 0 0; font-weight: 600; }
     label { display: block; margin: 1rem 0 .45rem; font-weight: 600; }
     input, textarea, select { width: 100%; padding: .7rem .8rem; border: 1px solid var(--input-border); border-radius: .25rem; color: var(--text); background: var(--input); font: inherit; }
+    .entry-card input, .entry-card textarea { margin: 0; }
+    .entry-card button { justify-self: start; min-width: 7.5rem; }
+    .entry-card .actions { margin-top: 1.25rem; }
+    #generated-code { min-height: 8rem; }
     input:focus, textarea:focus, select:focus, button:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
     textarea { min-height: 5rem; resize: vertical; overflow-wrap: anywhere; }
     button { min-height: 2.5rem; padding: .5rem .95rem; border: 1px solid var(--input-border); border-radius: .25rem; color: var(--text); background: var(--button); font: inherit; font-weight: 550; cursor: pointer; }
@@ -66,7 +74,7 @@
     #message { min-height: 1.6rem; color: var(--muted); }
     #chat-text { min-height: 5rem; }
     .theme-toggle { min-width: 7rem; }
-    [hidden] { display: none; }
+    [hidden] { display: none !important; }
   </style>
   <script src="/reprotect-work.js" defer></script>
   <script src="/app.js" defer></script>
@@ -74,30 +82,30 @@
 <body>
   <header><h1>Another Dimension</h1><button id="theme-toggle" class="theme-toggle" type="button" aria-label="테마 변경">다크 모드</button></header>
   <main>
-    <form id="connect-form">
+    <form id="connect-form" class="entry-card">
       <label for="bridge-code">로컬 연결 코드</label>
       <p>터미널에 표시된 코드를 입력하세요.</p>
       <input id="bridge-code" type="password" autocomplete="off" required>
-      <button type="submit">연결</button>
+      <button type="submit" class="primary">연결</button>
     </form>
-    <section id="identity-entry" hidden>
+    <section id="identity-entry" class="entry-card" hidden>
       <h2>개인 신원</h2>
       <p>개인 접속 코드로 로그인하거나 새 코드를 생성하세요.</p>
       <form id="login-form">
         <label for="identity-code">개인 접속 코드</label>
         <input id="identity-code" type="password" autocomplete="off" spellcheck="false" required>
-        <button type="submit">로그인</button>
+        <button type="submit" class="primary">로그인</button>
       </form>
       <p>형식이 맞는 다른 코드를 입력하면 다른 신원이 열립니다.</p>
       <div class="actions"><button id="create" type="button">새 코드 생성</button><button class="disconnect" type="button">로컬 연결 해제</button></div>
     </section>
-    <section id="created" hidden>
+    <section id="created" class="entry-card" hidden>
       <h2>개인 접속 코드</h2>
       <p>코드를 따로 보관하세요. 이 화면을 벗어나면 다시 보여드릴 수 없습니다. 코드를 아는 사람은 이 신원을 사용할 수 있습니다.</p>
       <p id="created-note" class="meta" role="status"></p>
       <label for="generated-code">생성된 코드</label>
       <textarea id="generated-code" readonly spellcheck="false"></textarea>
-      <div class="actions"><button id="copy-code" type="button">코드 복사</button><button id="save-code" type="button">TXT 저장</button><button id="continue" type="button">계속</button></div>
+      <div class="actions"><button id="copy-code" type="button">코드 복사</button><button id="save-code" type="button">TXT 저장</button><button id="continue" type="button" class="primary">계속</button></div>
     </section>
     <section id="identity-active" hidden>
       <h2>로그인됨</h2>
