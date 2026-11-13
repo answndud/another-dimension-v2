@@ -131,7 +131,9 @@ function createHarness(options = {}) {
         transferFiles.set(transferId, Buffer.from('exported backup'));
         pending.resolve(response(JSON.stringify({ transferId, size: transferFiles.get(transferId).length })));
       } else if (payload.action === 'import') {
-        pending.resolve(response(JSON.stringify({ peerId: 'ab'.repeat(32), messageCount: 1, linkedIdentityRestored: false })));
+        pending.resolve(options.importFailure
+          ? response(options.importFailure, 400)
+          : response(JSON.stringify({ peerId: 'ab'.repeat(32), messageCount: 1, linkedIdentityRestored: false })));
       }
     }
     return pending.promise;
@@ -480,6 +482,30 @@ test('backup restore asks before applying authenticated linked identity data', a
   await h.click('#history-backup-import');
   assert.match(prompt, /이전 신원 연결 정보/);
   assert.equal(h.requests.some((item) => item.path === '/api/history/backup-transfer' && JSON.parse(item.init.body).action === 'import'), false);
+});
+
+test('legacy streaming backup formats warn about their integrity and privacy limits', async () => {
+  for (const magic of ['ADBACK6\0', 'ADPACK2\0']) {
+    const h = createHarness();
+    h.element('#history-backup-file').files = [file('legacy.adbak', `${magic}payload`)];
+    let warning = '';
+    h.window.confirm = (text) => { warning = text; return false; };
+    await h.click('#history-backup-import');
+    assert.match(warning, /이전 형식/);
+    if (magic === 'ADBACK6\0') assert.match(warning, /상대 공개 ID가 평문/);
+    else assert.match(warning, /묶음 인증이 없습니다/);
+    assert.equal(h.requests.some((item) => item.path === '/api/history/backup-transfer'
+      && JSON.parse(item.init.body).action === 'upload-start'), false);
+  }
+});
+
+test('backup import presents the server-reported partial bundle count', async () => {
+  const detail = 'backup bundle failed after applying 1 conversation(s): backup bundle authentication failed';
+  const h = createHarness({ importFailure: detail });
+  h.element('#history-backup-file').files = [file('bundle.adbak', 'ADPACK3\0payload')];
+  h.window.confirm = () => true;
+  await h.click('#history-backup-import');
+  assert.equal(h.element('#message').textContent, detail);
 });
 
 function createOutputHandle() {

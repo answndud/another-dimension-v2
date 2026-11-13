@@ -26,10 +26,14 @@ const BACKUP_PASSWORD_MAGIC: &[u8; 8] = b"ADBACK2\0";
 const BACKUP_COMBINED_MAGIC: &[u8; 8] = b"ADBACK3\0";
 const BACKUP_SIGNED_MAGIC: &[u8; 8] = b"ADBACK4\0";
 const BACKUP_LINKED_MAGIC: &[u8; 8] = b"ADBACK5\0";
-const BACKUP_STREAM_MAGIC: &[u8; 8] = b"ADBACK6\0";
+const BACKUP_STREAM_V6_MAGIC: &[u8; 8] = b"ADBACK6\0";
+const BACKUP_STREAM_MAGIC: &[u8; 8] = b"ADBACK7\0";
 const BACKUP_LINKS_TRAILER: &[u8; 8] = b"ADLNK1\0\0";
 const BACKUP_BUNDLE_MAGIC: &[u8; 8] = b"ADPACK1\0";
-const BACKUP_STREAM_BUNDLE_MAGIC: &[u8; 8] = b"ADPACK2\0";
+const BACKUP_STREAM_BUNDLE_V2_MAGIC: &[u8; 8] = b"ADPACK2\0";
+const BACKUP_STREAM_BUNDLE_MAGIC: &[u8; 8] = b"ADPACK3\0";
+const BACKUP_PEER_METADATA: &[u8; 8] = b"ADPEER1\0";
+const BACKUP_BUNDLE_TAG_BYTES: usize = 32;
 const LINKED_KEYS_MAGIC: &[u8; 8] = b"ADLKEY1\0";
 const RESTORE_STAGING_MAGIC: &[u8; 8] = b"ADRSTG1\0";
 const TRANSFER_MAGIC: &[u8; 6] = b"ADREC1";
@@ -1845,8 +1849,17 @@ impl History {
         let suffix = hex_encode(&random_nonce()?);
         let child_path = directory.join(format!("bundle-child-{suffix}.tmp"));
         let result = (|| {
-            output.write_all(BACKUP_STREAM_BUNDLE_MAGIC)?;
-            output.write_all(&(peer_ids.len() as u32).to_be_bytes())?;
+            let mut bundle_id = [0; 16];
+            File::open("/dev/urandom")?.read_exact(&mut bundle_id)?;
+            let mut header = Vec::with_capacity(8 + bundle_id.len() + 4);
+            header.extend_from_slice(BACKUP_STREAM_BUNDLE_MAGIC);
+            header.extend_from_slice(&bundle_id);
+            header.extend_from_slice(&(peer_ids.len() as u32).to_be_bytes());
+            output.write_all(&header)?;
+            let bundle_key = derive_backup_bundle_key(identity, &bundle_id)?;
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(bundle_key.as_ref())
+                .map_err(|_| invalid_data("backup bundle authentication key unavailable"))?;
+            mac.update(&header);
             for peer_id in peer_ids {
                 let mut child = OpenOptions::new()
                     .create_new(true)
@@ -1858,12 +1871,23 @@ impl History {
                 child.flush()?;
                 child.sync_all()?;
                 let length = child.metadata()?.len();
-                output.write_all(&length.to_be_bytes())?;
+                let length_bytes = length.to_be_bytes();
+                output.write_all(&length_bytes)?;
+                mac.update(&length_bytes);
                 child.seek(SeekFrom::Start(0))?;
-                io::copy(&mut child, output)?;
+                let mut buffer = [0; 64 * 1024];
+                loop {
+                    let read = child.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    output.write_all(&buffer[..read])?;
+                    mac.update(&buffer[..read]);
+                }
                 drop(child);
                 std::fs::remove_file(&child_path)?;
             }
+            output.write_all(&mac.finalize().into_bytes())?;
             output.flush()
         })();
         if result.is_err() {
@@ -1890,9 +1914,12 @@ impl History {
         let mut magic = [0; 8];
         file.read_exact(&mut magic)?;
         file.seek(SeekFrom::Start(0))?;
-        if &magic == BACKUP_STREAM_MAGIC {
-            let (peer_id, mut staging, links) =
-                decode_backup_stream(identity, &mut file, password)?;
+        if &magic == BACKUP_STREAM_MAGIC || &magic == BACKUP_STREAM_V6_MAGIC {
+            let (peer_id, mut staging, links) = if &magic == BACKUP_STREAM_MAGIC {
+                decode_backup_stream(identity, &mut file, password)?
+            } else {
+                decode_backup_stream_v6(identity, &mut file, password)?
+            };
             ensure_stream_eof(&mut file)?;
             let count = staging.count();
             import_verified_staging(identity, &peer_id, &mut staging, &links)?;
@@ -1905,6 +1932,9 @@ impl History {
         }
         if &magic == BACKUP_STREAM_BUNDLE_MAGIC {
             return import_backup_bundle_stream(identity, &mut file);
+        }
+        if &magic == BACKUP_STREAM_BUNDLE_V2_MAGIC {
+            return import_backup_bundle_stream_v2(identity, &mut file);
         }
         let length = file.metadata()?.len();
         if length > MAX_LEGACY_BACKUP_BYTES as u64 {
@@ -1931,8 +1961,12 @@ impl History {
         let mut magic = [0; 8];
         file.read_exact(&mut magic)?;
         file.seek(SeekFrom::Start(0))?;
-        if &magic == BACKUP_STREAM_MAGIC {
-            let (peer_id, staging, _) = decode_backup_stream(identity, &mut file, password)?;
+        if &magic == BACKUP_STREAM_MAGIC || &magic == BACKUP_STREAM_V6_MAGIC {
+            let (peer_id, staging, _) = if &magic == BACKUP_STREAM_MAGIC {
+                decode_backup_stream(identity, &mut file, password)?
+            } else {
+                decode_backup_stream_v6(identity, &mut file, password)?
+            };
             ensure_stream_eof(&mut file)?;
             let result = (peer_id, staging.count());
             staging.cleanup()?;
@@ -1962,7 +1996,7 @@ impl History {
         let mut magic = [0; 8];
         input.read_exact(&mut magic)?;
         input.seek(SeekFrom::Start(0))?;
-        if &magic != BACKUP_STREAM_MAGIC {
+        if &magic != BACKUP_STREAM_MAGIC && &magic != BACKUP_STREAM_V6_MAGIC {
             let length = input.metadata()?.len();
             if length > MAX_LEGACY_BACKUP_BYTES as u64 {
                 return Err(invalid_data(
@@ -1981,8 +2015,11 @@ impl History {
             output.write_all(&bytes)?;
             return Ok(0);
         }
-        let (peer_id, mut staging, mut links) =
-            decode_backup_stream(previous_identity, &mut input, previous_password)?;
+        let (peer_id, mut staging, mut links) = if &magic == BACKUP_STREAM_MAGIC {
+            decode_backup_stream(previous_identity, &mut input, previous_password)?
+        } else {
+            decode_backup_stream_v6(previous_identity, &mut input, previous_password)?
+        };
         ensure_stream_eof(&mut input)?;
         let previous_id = previous_identity.public_id();
         let replacement_id = replacement_identity.public_id();
@@ -2454,16 +2491,18 @@ impl<'a, W: Write> BackupStreamWriter<'a, W> {
         }
         let peer = decode_peer_id(peer_id)?;
         let mut salt = [0; BACKUP_SALT_BYTES];
+        let mut file_id = [0; 16];
+        File::open("/dev/urandom")?.read_exact(&mut file_id)?;
         if password.is_some() {
             File::open("/dev/urandom")?.read_exact(&mut salt)?;
         }
-        let mut header = Vec::with_capacity(8 + 1 + BACKUP_SALT_BYTES + 32);
+        let mut header = Vec::with_capacity(8 + 1 + 16 + BACKUP_SALT_BYTES);
         header.extend_from_slice(BACKUP_STREAM_MAGIC);
         header.push(u8::from(password.is_some()));
+        header.extend_from_slice(&file_id);
         if password.is_some() {
             header.extend_from_slice(&salt);
         }
-        header.extend_from_slice(&peer);
         output.write_all(&header)?;
         let key = match password {
             Some(password) => {
@@ -2478,19 +2517,28 @@ impl<'a, W: Write> BackupStreamWriter<'a, W> {
             password.is_some().then_some(&salt),
         );
         aad.push(u8::from(password.is_some()));
-        aad.extend_from_slice(&peer);
-        Ok(Self {
+        aad.extend_from_slice(&file_id);
+        let mut writer = Self {
             peer,
             key,
             aad,
             output,
             count: 0,
-        })
+        };
+        let mut metadata = Vec::with_capacity(BACKUP_PEER_METADATA.len() + peer.len());
+        metadata.extend_from_slice(BACKUP_PEER_METADATA);
+        metadata.extend_from_slice(&peer);
+        writer.write_frame(2, 0, &metadata)?;
+        Ok(writer)
     }
 
     fn write_message(&mut self, message: &StoredMessage) -> io::Result<()> {
         let plain = encode_history_plain(message)?;
-        self.write_frame(1, self.count, &plain)?;
+        let index = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("backup message count overflow"))?;
+        self.write_frame(1, index, &plain)?;
         self.count = self
             .count
             .checked_add(1)
@@ -2505,7 +2553,11 @@ impl<'a, W: Write> BackupStreamWriter<'a, W> {
         let peer_id = hex_encode(&self.peer);
         validate_backup_links(&peer_id, links)?;
         let trailer = encode_backup_links(links)?;
-        self.write_frame(0, self.count, &trailer)?;
+        let trailer_index = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("backup message count overflow"))?;
+        self.write_frame(0, trailer_index, &trailer)?;
         self.output.flush()
     }
 
@@ -2619,14 +2671,14 @@ fn decode_backup_links(
     Ok(links)
 }
 
-fn decode_backup_stream<R: Read>(
+fn decode_backup_stream_v6<R: Read>(
     identity: &Identity,
     input: &mut R,
     password: Option<&str>,
 ) -> io::Result<(String, RestoreStaging, BackupLinks)> {
     let mut magic = [0; 8];
     input.read_exact(&mut magic)?;
-    if &magic != BACKUP_STREAM_MAGIC {
+    if &magic != BACKUP_STREAM_V6_MAGIC {
         return Err(invalid_data("unsupported backup format"));
     }
     let mut flags = [0; 1];
@@ -2655,7 +2707,7 @@ fn decode_backup_stream<R: Read>(
         (None, None) => derive_backup_key(&identity.storage_key()),
         _ => return Err(invalid_data("invalid backup password header")),
     };
-    let mut base_aad = backup_aad(identity, BACKUP_STREAM_MAGIC, salt.as_ref());
+    let mut base_aad = backup_aad(identity, BACKUP_STREAM_V6_MAGIC, salt.as_ref());
     base_aad.push(flags[0]);
     base_aad.extend_from_slice(&peer);
     let request_id = format!(
@@ -2705,6 +2757,135 @@ fn decode_backup_stream<R: Read>(
                     .ok_or_else(|| invalid_data("backup message count overflow"))?;
             }
             0 if index == count => break decode_backup_links(&plain, &peer_id, identity)?,
+            _ => return Err(invalid_data("backup frame order is invalid")),
+        }
+    };
+    staging.finish()?;
+    verify_stream_staged_proofs(identity, &peer_id, &mut staging, &links)?;
+    Ok((peer_id, staging, links))
+}
+
+fn decode_backup_stream<R: Read>(
+    identity: &Identity,
+    input: &mut R,
+    password: Option<&str>,
+) -> io::Result<(String, RestoreStaging, BackupLinks)> {
+    let mut magic = [0; 8];
+    input.read_exact(&mut magic)?;
+    if &magic != BACKUP_STREAM_MAGIC {
+        return Err(invalid_data("unsupported backup format"));
+    }
+    let mut flags = [0; 1];
+    input.read_exact(&mut flags)?;
+    if flags[0] > 1 || (flags[0] == 1) != password.is_some() {
+        return Err(invalid_data("backup password does not match format"));
+    }
+    let mut file_id = [0; 16];
+    input.read_exact(&mut file_id)?;
+    let salt = if flags[0] == 1 {
+        let mut salt = [0; BACKUP_SALT_BYTES];
+        input.read_exact(&mut salt)?;
+        Some(salt)
+    } else {
+        None
+    };
+    if let Some(password) = password {
+        validate_backup_password(password)?;
+    }
+    let key = match (password, salt.as_ref()) {
+        (Some(password), Some(salt)) => {
+            let password_key = derive_password_backup_key(password, salt)?;
+            derive_combined_backup_key(&identity.storage_key(), &password_key)
+        }
+        (None, None) => derive_backup_key(&identity.storage_key()),
+        _ => return Err(invalid_data("invalid backup password header")),
+    };
+    let mut base_aad = backup_aad(identity, BACKUP_STREAM_MAGIC, salt.as_ref());
+    base_aad.push(flags[0]);
+    base_aad.extend_from_slice(&file_id);
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
+        .map_err(|_| invalid_data("invalid backup key"))?;
+
+    let mut metadata_header = [0; 1 + 8 + NONCE_BYTES + 4];
+    input.read_exact(&mut metadata_header)?;
+    let metadata_kind = metadata_header[0];
+    let metadata_index = u64::from_be_bytes(metadata_header[1..9].try_into().expect("fixed slice"));
+    let metadata_nonce = &metadata_header[9..9 + NONCE_BYTES];
+    let metadata_len = u32::from_be_bytes(
+        metadata_header[9 + NONCE_BYTES..]
+            .try_into()
+            .expect("fixed slice"),
+    ) as usize;
+    if metadata_kind != 2 || metadata_index != 0 || metadata_len != 8 + 32 + 16 {
+        return Err(invalid_data("invalid encrypted backup metadata frame"));
+    }
+    let mut encrypted_metadata = vec![0; metadata_len];
+    input.read_exact(&mut encrypted_metadata)?;
+    let metadata = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(metadata_nonce),
+                Payload {
+                    msg: &encrypted_metadata,
+                    aad: &backup_stream_frame_aad(&base_aad, metadata_kind, metadata_index),
+                },
+            )
+            .map_err(|_| invalid_data("backup metadata authentication failed"))?,
+    );
+    if metadata.len() != BACKUP_PEER_METADATA.len() + 32
+        || !metadata.starts_with(BACKUP_PEER_METADATA)
+    {
+        return Err(invalid_data("invalid encrypted backup metadata"));
+    }
+    let peer_id = hex_encode(&metadata[BACKUP_PEER_METADATA.len()..]);
+    let request_id = format!(
+        "{}{}{}",
+        hex_encode(&random_nonce()?),
+        hex_encode(&random_nonce()?),
+        hex_encode(&random_nonce()?)
+    )[..64]
+        .to_owned();
+    let mut staging = RestoreStaging::create(identity, &peer_id, &request_id)?;
+    let mut count = 0u64;
+    let links = loop {
+        let mut frame_header = [0; 1 + 8 + NONCE_BYTES + 4];
+        input.read_exact(&mut frame_header)?;
+        let kind = frame_header[0];
+        let index = u64::from_be_bytes(frame_header[1..9].try_into().expect("fixed slice"));
+        let nonce = &frame_header[9..9 + NONCE_BYTES];
+        let length = u32::from_be_bytes(
+            frame_header[9 + NONCE_BYTES..]
+                .try_into()
+                .expect("fixed slice"),
+        ) as usize;
+        if length < 16 || length > MAX_MESSAGE_BYTES + 256 {
+            return Err(invalid_data("invalid backup frame length"));
+        }
+        let mut encrypted = vec![0; length];
+        input.read_exact(&mut encrypted)?;
+        let plain = Zeroizing::new(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(nonce),
+                    Payload {
+                        msg: &encrypted,
+                        aad: &backup_stream_frame_aad(&base_aad, kind, index),
+                    },
+                )
+                .map_err(|_| invalid_data("backup frame authentication failed"))?,
+        );
+        let expected_index = count
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("backup message count overflow"))?;
+        match kind {
+            1 if index == expected_index => {
+                let message = decode_history_plain(&plain, false)?;
+                staging.append_verified(&message)?;
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("backup message count overflow"))?;
+            }
+            0 if index == expected_index => break decode_backup_links(&plain, &peer_id, identity)?,
             _ => return Err(invalid_data("backup frame order is invalid")),
         }
     };
@@ -2802,50 +2983,169 @@ fn import_verified_staging(
     Ok(())
 }
 
+fn import_backup_bundle_stream_v2<R: Read>(
+    identity: &Identity,
+    input: &mut R,
+) -> io::Result<Vec<(String, usize, bool)>> {
+    let mut imported = Vec::new();
+    let result = (|| {
+        let mut magic = [0; 8];
+        input.read_exact(&mut magic)?;
+        if &magic != BACKUP_STREAM_BUNDLE_V2_MAGIC {
+            return Err(invalid_data("invalid backup bundle"));
+        }
+        let mut count_bytes = [0; 4];
+        input.read_exact(&mut count_bytes)?;
+        let count = u32::from_be_bytes(count_bytes) as usize;
+        if count == 0 || count > 128 {
+            return Err(invalid_data("invalid backup bundle count"));
+        }
+        let mut unique = HashSet::new();
+        for _ in 0..count {
+            let mut len_bytes = [0; 8];
+            input.read_exact(&mut len_bytes)?;
+            let length = u64::from_be_bytes(len_bytes);
+            if length < 8 + 1 + 32 + 1 + 8 + NONCE_BYTES as u64 + 4 + 27 {
+                return Err(invalid_data("truncated backup bundle child"));
+            }
+            let mut child = input.take(length);
+            let (peer_id, mut staging, links) =
+                decode_backup_stream_v6(identity, &mut child, None)?;
+            if child.limit() != 0 {
+                return Err(invalid_data("unexpected data in backup bundle child"));
+            }
+            if !unique.insert(peer_id.clone()) {
+                return Err(invalid_data("duplicate conversation in backup bundle"));
+            }
+            let message_count = staging.count() as usize;
+            let has_links = !links.local.is_empty() || !links.peer.is_empty();
+            import_verified_staging(identity, &peer_id, &mut staging, &links)?;
+            imported.push((peer_id, message_count, has_links));
+            staging.cleanup()?;
+        }
+        ensure_stream_eof(input)?;
+        Ok(())
+    })();
+    result.map_err(|error| partial_bundle_error(imported.len(), error))?;
+    Ok(imported)
+}
+
+fn partial_bundle_error(applied: usize, error: io::Error) -> io::Error {
+    if applied == 0 {
+        error
+    } else {
+        io::Error::other(format!(
+            "backup bundle failed after applying {applied} conversation(s): {error}"
+        ))
+    }
+}
+
 fn import_backup_bundle_stream<R: Read>(
     identity: &Identity,
     input: &mut R,
 ) -> io::Result<Vec<(String, usize, bool)>> {
-    let mut magic = [0; 8];
-    input.read_exact(&mut magic)?;
-    if &magic != BACKUP_STREAM_BUNDLE_MAGIC {
-        return Err(invalid_data("invalid backup bundle"));
-    }
-    let mut count_bytes = [0; 4];
-    input.read_exact(&mut count_bytes)?;
-    let count = u32::from_be_bytes(count_bytes) as usize;
-    if count == 0 || count > 128 {
-        return Err(invalid_data("invalid backup bundle count"));
-    }
-    let mut imported = Vec::with_capacity(count);
-    let mut unique = HashSet::new();
-    for _ in 0..count {
-        let mut len_bytes = [0; 8];
-        input.read_exact(&mut len_bytes)?;
-        let length = u64::from_be_bytes(len_bytes);
-        if length < 8 + 1 + 32 + 1 + 8 + NONCE_BYTES as u64 + 4 + 27 {
-            return Err(invalid_data("truncated backup bundle child"));
+    let mut imported = Vec::new();
+    let result = (|| {
+        let mut magic = [0; 8];
+        input.read_exact(&mut magic)?;
+        if &magic != BACKUP_STREAM_BUNDLE_MAGIC {
+            return Err(invalid_data("invalid backup bundle"));
         }
-        let mut child = input.take(length);
-        let (peer_id, mut staging, links) = decode_backup_stream(identity, &mut child, None)?;
-        if child.limit() != 0 {
-            return Err(invalid_data("unexpected data in backup bundle child"));
+        let mut bundle_id = [0; 16];
+        input.read_exact(&mut bundle_id)?;
+        let mut count_bytes = [0; 4];
+        input.read_exact(&mut count_bytes)?;
+        let count = u32::from_be_bytes(count_bytes) as usize;
+        if count == 0 || count > 128 {
+            return Err(invalid_data("invalid backup bundle count"));
         }
-        if !unique.insert(peer_id.clone()) {
-            return Err(invalid_data("duplicate conversation in backup bundle"));
+        let mut header = Vec::with_capacity(8 + bundle_id.len() + count_bytes.len());
+        header.extend_from_slice(&magic);
+        header.extend_from_slice(&bundle_id);
+        header.extend_from_slice(&count_bytes);
+        let bundle_key = derive_backup_bundle_key(identity, &bundle_id)?;
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(bundle_key.as_ref())
+            .map_err(|_| invalid_data("backup bundle authentication key unavailable"))?;
+        mac.update(&header);
+        let mut unique = HashSet::new();
+        let directory = History::backup_transfer_directory(identity)?;
+
+        for _ in 0..count {
+            let mut length_bytes = [0; 8];
+            input.read_exact(&mut length_bytes)?;
+            mac.update(&length_bytes);
+            let length = u64::from_be_bytes(length_bytes);
+            if length < 8 + 1 + 16 + 1 + NONCE_BYTES as u64 + 4 + 8 + 32 + 16 {
+                return Err(invalid_data("truncated backup bundle child"));
+            }
+            let child_path = directory.join(format!(
+                "bundle-import-child-{}.tmp",
+                hex_encode(&random_nonce()?)
+            ));
+            let child_result = (|| {
+                let mut child_file = OpenOptions::new()
+                    .create_new(true)
+                    .read(true)
+                    .write(true)
+                    .open(&child_path)?;
+                set_private_file(&child_file)?;
+                let mut remaining = length;
+                let mut buffer = [0; 64 * 1024];
+                while remaining > 0 {
+                    let size = usize::try_from(remaining.min(buffer.len() as u64))
+                        .expect("bounded to buffer length");
+                    input.read_exact(&mut buffer[..size])?;
+                    child_file.write_all(&buffer[..size])?;
+                    mac.update(&buffer[..size]);
+                    remaining -= size as u64;
+                }
+                child_file.flush()?;
+                child_file.sync_all()?;
+                child_file.seek(SeekFrom::Start(0))?;
+                let (peer_id, mut staging, links) =
+                    decode_backup_stream(identity, &mut child_file, None)?;
+                ensure_stream_eof(&mut child_file)?;
+                if !unique.insert(peer_id.clone()) {
+                    return Err(invalid_data("duplicate conversation in backup bundle"));
+                }
+                let message_count = usize::try_from(staging.count())
+                    .map_err(|_| invalid_data("backup conversation count is too large"))?;
+                let has_links = !links.local.is_empty() || !links.peer.is_empty();
+                import_verified_staging(identity, &peer_id, &mut staging, &links)?;
+                imported.push((peer_id, message_count, has_links));
+                staging
+                    .cleanup()
+                    .map_err(|error| partial_bundle_error(imported.len(), error))?;
+                Ok(())
+            })();
+            let cleanup = if child_path.exists() {
+                std::fs::remove_file(&child_path)
+            } else {
+                Ok(())
+            };
+            match (child_result, cleanup) {
+                (Ok(()), Ok(())) => {}
+                (Err(error), Ok(())) => return Err(error),
+                (Ok(()), Err(cleanup_error)) => {
+                    return Err(io::Error::other(format!(
+                        "backup bundle child was applied but temporary file cleanup failed: {cleanup_error}"
+                    )))
+                }
+                (Err(error), Err(cleanup_error)) => {
+                    return Err(io::Error::other(format!(
+                        "{error}; temporary bundle child cleanup failed: {cleanup_error}"
+                    )))
+                }
+            }
         }
-        let message_count = staging.count() as usize;
-        let has_links = !links.local.is_empty() || !links.peer.is_empty();
-        import_verified_staging(identity, &peer_id, &mut staging, &links).map_err(|error| {
-            io::Error::other(format!(
-                "backup bundle stopped after {} conversations; {error}",
-                imported.len()
-            ))
-        })?;
-        staging.cleanup()?;
-        imported.push((peer_id, message_count, has_links));
-    }
-    ensure_stream_eof(input)?;
+        let mut supplied_tag = [0; BACKUP_BUNDLE_TAG_BYTES];
+        input.read_exact(&mut supplied_tag)?;
+        ensure_stream_eof(input)?;
+        mac.verify_slice(&supplied_tag)
+            .map_err(|_| invalid_data("backup bundle authentication failed"))?;
+        Ok(())
+    })();
+    result.map_err(|error| partial_bundle_error(imported.len(), error))?;
     Ok(imported)
 }
 
@@ -3881,6 +4181,18 @@ fn backup_aad(
     aad
 }
 
+fn derive_backup_bundle_key(
+    identity: &Identity,
+    bundle_id: &[u8; 16],
+) -> io::Result<Zeroizing<[u8; 32]>> {
+    let mut key = Zeroizing::new([0; 32]);
+    let storage_key = identity.storage_key();
+    Hkdf::<Sha256>::new(Some(bundle_id), storage_key.as_ref())
+        .expand(b"another-dimension-v2/backup-bundle/ADPACK3", key.as_mut())
+        .map_err(|_| invalid_data("backup bundle authentication key unavailable"))?;
+    Ok(key)
+}
+
 fn encode_record(
     key: &[u8; 32],
     identity_id: &str,
@@ -4862,6 +5174,90 @@ mod tests {
             text: text.to_owned(),
             proof: None,
         }
+    }
+
+    fn encode_v6_fixture(
+        identity: &Identity,
+        peer_id: &str,
+        messages: &[StoredMessage],
+    ) -> Vec<u8> {
+        let peer = super::decode_peer_id(peer_id).unwrap();
+        let links = super::backup_links_for(identity, peer_id).unwrap();
+        let key = super::derive_backup_key(&identity.storage_key());
+        let mut aad = super::backup_aad(identity, super::BACKUP_STREAM_V6_MAGIC, None);
+        aad.push(0);
+        aad.extend_from_slice(&peer);
+        let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref()).unwrap();
+        let mut output = Vec::new();
+        output.extend_from_slice(super::BACKUP_STREAM_V6_MAGIC);
+        output.push(0);
+        output.extend_from_slice(&peer);
+        for (index, stored) in messages.iter().enumerate() {
+            write_v6_fixture_frame(
+                &mut output,
+                &cipher,
+                &aad,
+                1,
+                index as u64,
+                &super::encode_history_plain(stored).unwrap(),
+            );
+        }
+        write_v6_fixture_frame(
+            &mut output,
+            &cipher,
+            &aad,
+            0,
+            messages.len() as u64,
+            &super::encode_backup_links(&links).unwrap(),
+        );
+        output
+    }
+
+    fn write_v6_fixture_frame(
+        output: &mut Vec<u8>,
+        cipher: &ChaCha20Poly1305,
+        aad: &[u8],
+        kind: u8,
+        index: u64,
+        plaintext: &[u8],
+    ) {
+        let nonce = super::random_nonce().unwrap();
+        let encrypted = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &super::backup_stream_frame_aad(aad, kind, index),
+                },
+            )
+            .unwrap();
+        output.push(kind);
+        output.extend_from_slice(&index.to_be_bytes());
+        output.extend_from_slice(&nonce);
+        output.extend_from_slice(&(encrypted.len() as u32).to_be_bytes());
+        output.extend_from_slice(&encrypted);
+    }
+
+    fn bundle3_children(bundle: &[u8]) -> Vec<(usize, usize)> {
+        assert!(bundle.starts_with(super::BACKUP_STREAM_BUNDLE_MAGIC));
+        let count = u32::from_be_bytes(bundle[24..28].try_into().unwrap()) as usize;
+        let mut offset = 28;
+        let mut children = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length =
+                u64::from_be_bytes(bundle[offset..offset + 8].try_into().unwrap()) as usize;
+            let start = offset + 8;
+            let end = start + length;
+            children.push((offset, end));
+            offset = end;
+        }
+        assert_eq!(offset + super::BACKUP_BUNDLE_TAG_BYTES, bundle.len());
+        children
+    }
+
+    fn append_bundle3_child(output: &mut Vec<u8>, bundle: &[u8], child: (usize, usize)) {
+        output.extend_from_slice(&bundle[child.0..child.0 + 8]);
+        output.extend_from_slice(&bundle[child.0 + 8..child.1]);
     }
 
     #[test]
@@ -7052,6 +7448,318 @@ mod tests {
         assert_eq!(reader.next_record().unwrap(), Some(message(0, &long_text)));
         assert_eq!(reader.next_record().unwrap(), Some(message(1, &long_text)));
         assert_eq!(reader.next_record().unwrap(), Some(message(2, &long_text)));
+    }
+
+    #[test]
+    fn backup_stream_file_id_rejects_cross_file_frame_and_completion_swaps() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "d1".repeat(32);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history.append(&message(1, "frame one")).unwrap();
+        history.append(&message(2, "frame two")).unwrap();
+
+        let mut backups = Vec::new();
+        for _ in 0..2 {
+            let mut backup = Vec::new();
+            History::export_backup_stream(&identity, &peer, None, &mut backup).unwrap();
+            backups.push(backup);
+        }
+        assert!(backups[0].starts_with(b"ADBACK7\0"));
+        let peer_bytes = super::decode_peer_id(&peer).unwrap();
+        assert!(!backups[0][..25]
+            .windows(peer_bytes.len())
+            .any(|window| window == peer_bytes));
+        let mut password_backup = Vec::new();
+        History::export_backup_stream(
+            &identity,
+            &peer,
+            Some("correct horse battery"),
+            &mut password_backup,
+        )
+        .unwrap();
+        let password_path = History::backup_transfer_directory(&identity)
+            .unwrap()
+            .join("wrong-password.adbak");
+        std::fs::write(&password_path, password_backup).unwrap();
+        assert!(History::verify_backup_file(
+            &identity,
+            &password_path,
+            Some("incorrect horse battery")
+        )
+        .is_err());
+
+        let frames_a = super::tests::stream_frame_ranges(&backups[0]);
+        let frames_b = super::tests::stream_frame_ranges(&backups[1]);
+        for (kind, index) in [(1, 1), (0, 3)] {
+            let range_a = frames_a
+                .iter()
+                .find(|frame| frame.0 == kind && frame.1 == index)
+                .unwrap()
+                .2
+                .clone();
+            let range_b = frames_b
+                .iter()
+                .find(|frame| frame.0 == kind && frame.1 == index)
+                .unwrap()
+                .2
+                .clone();
+            assert_eq!(range_a.len(), range_b.len());
+            let mut mixed = backups[0].clone();
+            mixed[range_a].copy_from_slice(&backups[1][range_b]);
+            let path = History::backup_transfer_directory(&identity)
+                .unwrap()
+                .join(format!("swapped-{kind}-{index}.adbak"));
+            std::fs::write(&path, mixed).unwrap();
+            assert!(History::verify_backup_file(&identity, &path, None).is_err());
+        }
+    }
+
+    fn stream_frame_ranges(backup: &[u8]) -> Vec<(u8, u64, std::ops::Range<usize>)> {
+        assert!(backup.starts_with(super::BACKUP_STREAM_MAGIC));
+        let mut offset = 8 + 1 + 16;
+        if backup[8] == 1 {
+            offset += super::BACKUP_SALT_BYTES;
+        }
+        let mut frames = Vec::new();
+        loop {
+            let start = offset;
+            let kind = backup[offset];
+            let index = u64::from_be_bytes(backup[offset + 1..offset + 9].try_into().unwrap());
+            let length = u32::from_be_bytes(
+                backup[offset + 9 + super::NONCE_BYTES..offset + 13 + super::NONCE_BYTES]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            offset += 1 + 8 + super::NONCE_BYTES + 4 + length;
+            frames.push((kind, index, start..offset));
+            if kind == 0 {
+                break;
+            }
+        }
+        frames
+    }
+
+    #[test]
+    fn v6_backup_and_v2_bundle_remain_importable() {
+        let data = IsolatedData::new();
+        let (identity, code) = Identity::create().unwrap();
+        let peer = "d2".repeat(32);
+        let record = message(7, "legacy streaming backup");
+        let backup = encode_v6_fixture(&identity, &peer, std::slice::from_ref(&record));
+        let mut bundle = super::BACKUP_STREAM_BUNDLE_V2_MAGIC.to_vec();
+        bundle.extend_from_slice(&1_u32.to_be_bytes());
+        bundle.extend_from_slice(&(backup.len() as u64).to_be_bytes());
+        bundle.extend_from_slice(&backup);
+
+        let target = data.0.join("legacy-stream-target");
+        std::fs::create_dir_all(&target).unwrap();
+        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target));
+        let target_identity = Identity::from_code(&code).unwrap();
+        let backup_path = History::backup_transfer_directory(&target_identity)
+            .unwrap()
+            .join("legacy-v6.adbak");
+        std::fs::write(&backup_path, backup).unwrap();
+        assert!(
+            History::verify_backup_file(&Identity::create().unwrap().0, &backup_path, None)
+                .is_err()
+        );
+        assert_eq!(
+            History::import_backup_file(&target_identity, &backup_path, None).unwrap(),
+            vec![(peer.clone(), 1, false)]
+        );
+
+        let replacement = Identity::create().unwrap().0;
+        let reprotected_path = History::backup_transfer_directory(&target_identity)
+            .unwrap()
+            .join("reprotected-v6.adbak");
+        let mut reprotected = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&reprotected_path)
+            .unwrap();
+        History::reprotect_backup_file(
+            &target_identity,
+            &replacement,
+            &backup_path,
+            &mut reprotected,
+            None,
+            None,
+        )
+        .unwrap();
+        reprotected.flush().unwrap();
+        drop(reprotected);
+        assert!(std::fs::read(&reprotected_path)
+            .unwrap()
+            .starts_with(super::BACKUP_STREAM_MAGIC));
+        assert_eq!(
+            History::verify_backup_file(&replacement, &reprotected_path, None).unwrap(),
+            (peer.clone(), 1)
+        );
+
+        let bundle_path = History::backup_transfer_directory(&target_identity)
+            .unwrap()
+            .join("legacy-v2.adbak");
+        std::fs::write(&bundle_path, bundle).unwrap();
+        let bundle_target = data.0.join("legacy-v2-target");
+        std::fs::create_dir_all(&bundle_target).unwrap();
+        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(bundle_target));
+        let bundle_identity = Identity::from_code(&code).unwrap();
+        assert_eq!(
+            History::import_backup_file(&bundle_identity, &bundle_path, None).unwrap(),
+            vec![(peer.clone(), 1, false)]
+        );
+        let mut reader = History::reader_for_identity_copy(&bundle_identity, &peer).unwrap();
+        assert_eq!(reader.next_record().unwrap(), Some(record));
+        assert_eq!(reader.next_record().unwrap(), None);
+    }
+
+    #[test]
+    fn bundle3_authenticates_membership_and_reports_partial_application() {
+        let data = IsolatedData::new();
+        let (identity, code) = Identity::create().unwrap();
+        let peers = ["d3".repeat(32), "d4".repeat(32), "d5".repeat(32)];
+        for (index, peer) in peers.iter().enumerate() {
+            History::open(&identity, peer)
+                .unwrap()
+                .0
+                .append(&message(index as u64 + 1, "bundle member"))
+                .unwrap();
+        }
+        let directory = History::backup_transfer_directory(&identity).unwrap();
+        let bundle_path = directory.join("members.adbak");
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&bundle_path)
+            .unwrap();
+        History::export_backup_bundle_stream(&identity, &peers[..2], &mut output).unwrap();
+        output.flush().unwrap();
+        drop(output);
+        let bundle = std::fs::read(&bundle_path).unwrap();
+        let children = bundle3_children(&bundle);
+
+        let replacement_path = directory.join("replacement-member.adbak");
+        let mut replacement_output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&replacement_path)
+            .unwrap();
+        History::export_backup_bundle_stream(&identity, &peers[2..], &mut replacement_output)
+            .unwrap();
+        replacement_output.flush().unwrap();
+        drop(replacement_output);
+        let replacement = std::fs::read(&replacement_path).unwrap();
+        let replacement_child = bundle3_children(&replacement)[0];
+
+        let mut removed = bundle[..24].to_vec();
+        removed.extend_from_slice(&1_u32.to_be_bytes());
+        append_bundle3_child(&mut removed, &bundle, children[0]);
+        removed.extend_from_slice(&bundle[bundle.len() - super::BACKUP_BUNDLE_TAG_BYTES..]);
+
+        let mut replaced = bundle[..24].to_vec();
+        replaced.extend_from_slice(&2_u32.to_be_bytes());
+        append_bundle3_child(&mut replaced, &bundle, children[0]);
+        append_bundle3_child(&mut replaced, &replacement, replacement_child);
+        replaced.extend_from_slice(&bundle[bundle.len() - super::BACKUP_BUNDLE_TAG_BYTES..]);
+
+        let mut reordered = bundle[..24].to_vec();
+        reordered.extend_from_slice(&2_u32.to_be_bytes());
+        append_bundle3_child(&mut reordered, &bundle, children[1]);
+        append_bundle3_child(&mut reordered, &bundle, children[0]);
+        reordered.extend_from_slice(&bundle[bundle.len() - super::BACKUP_BUNDLE_TAG_BYTES..]);
+
+        let target_a = data.0.join("bundle-removed-target");
+        std::fs::create_dir_all(&target_a).unwrap();
+        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target_a));
+        let target_identity = Identity::from_code(&code).unwrap();
+        let removed_path = History::backup_transfer_directory(&target_identity)
+            .unwrap()
+            .join("removed.adbak");
+        std::fs::write(&removed_path, removed).unwrap();
+        let error = History::import_backup_file(&target_identity, &removed_path, None).unwrap_err();
+        assert!(
+            error.to_string().contains("applying 1 conversation"),
+            "{error}"
+        );
+
+        let target_b = data.0.join("bundle-replaced-target");
+        std::fs::create_dir_all(&target_b).unwrap();
+        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target_b));
+        let target_identity = Identity::from_code(&code).unwrap();
+        let replaced_path = History::backup_transfer_directory(&target_identity)
+            .unwrap()
+            .join("replaced.adbak");
+        std::fs::write(&replaced_path, replaced).unwrap();
+        let error =
+            History::import_backup_file(&target_identity, &replaced_path, None).unwrap_err();
+        assert!(
+            error.to_string().contains("applying 2 conversation"),
+            "{error}"
+        );
+
+        let target_c = data.0.join("bundle-reordered-target");
+        std::fs::create_dir_all(&target_c).unwrap();
+        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target_c));
+        let target_identity = Identity::from_code(&code).unwrap();
+        let reordered_path = History::backup_transfer_directory(&target_identity)
+            .unwrap()
+            .join("reordered.adbak");
+        std::fs::write(&reordered_path, reordered).unwrap();
+        let error =
+            History::import_backup_file(&target_identity, &reordered_path, None).unwrap_err();
+        assert!(
+            error.to_string().contains("applying 2 conversation"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn bundle3_late_child_authentication_error_reports_applied_count() {
+        let data = IsolatedData::new();
+        let (identity, code) = Identity::create().unwrap();
+        let peers = ["d6".repeat(32), "d7".repeat(32)];
+        for peer in &peers {
+            History::open(&identity, peer)
+                .unwrap()
+                .0
+                .append(&message(1, "verified child"))
+                .unwrap();
+        }
+        let directory = History::backup_transfer_directory(&identity).unwrap();
+        let path = directory.join("late-error-source.adbak");
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        History::export_backup_bundle_stream(&identity, &peers, &mut output).unwrap();
+        output.flush().unwrap();
+        drop(output);
+        let mut bundle = std::fs::read(&path).unwrap();
+        let children = bundle3_children(&bundle);
+        let second_child = children[1];
+        bundle[second_child.1 - 1] ^= 1;
+
+        let target = data.0.join("late-error-target");
+        std::fs::create_dir_all(&target).unwrap();
+        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target));
+        let target_identity = Identity::from_code(&code).unwrap();
+        let damaged_path = History::backup_transfer_directory(&target_identity)
+            .unwrap()
+            .join("late-error.adbak");
+        std::fs::write(&damaged_path, bundle).unwrap();
+        let error = History::import_backup_file(&target_identity, &damaged_path, None).unwrap_err();
+        assert!(
+            error.to_string().contains("applying 1 conversation"),
+            "{error}"
+        );
+        let mut reader = History::reader_for_identity_copy(&target_identity, &peers[0]).unwrap();
+        assert_eq!(
+            reader.next_record().unwrap(),
+            Some(message(1, "verified child"))
+        );
     }
 
     #[test]

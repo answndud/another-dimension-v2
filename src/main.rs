@@ -831,7 +831,7 @@ mod send_tests {
             serde_json::from_str(downloaded.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(chunk["size"].as_u64(), Some(export_size));
         let backup = BASE64.decode(chunk["data"].as_str().unwrap()).unwrap();
-        assert!(backup.starts_with(b"ADBACK6\0"));
+        assert!(backup.starts_with(b"ADBACK7\0"));
         assert_eq!(backup.len() as u64, export_size);
 
         let upload = call_test_api(

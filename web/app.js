@@ -1399,8 +1399,14 @@ document.querySelector('#history-backup-import').addEventListener('click', async
   let transferId = null;
     const header = new Uint8Array(await file.slice(0, 8).arrayBuffer());
     const backupMagic = new TextDecoder().decode(header);
-    if ((backupMagic === 'ADBACK5\0' || backupMagic === 'ADBACK6\0'
-      || backupMagic === 'ADPACK1\0' || backupMagic === 'ADPACK2\0')
+    const hasLinkedIdentityData = backupMagic === 'ADBACK5\0' || backupMagic === 'ADBACK7\0'
+      || backupMagic === 'ADBACK6\0' || backupMagic === 'ADPACK1\0'
+      || backupMagic === 'ADPACK2\0' || backupMagic === 'ADPACK3\0';
+    if (backupMagic === 'ADBACK6\0' || backupMagic === 'ADPACK2\0') {
+      const kind = backupMagic === 'ADBACK6\0' ? 'ADBACK6 백업' : 'ADPACK2 묶음';
+      if (!window.confirm(`${kind}은 이전 형식입니다. ADBACK6은 상대 공개 ID가 평문이며 비밀번호가 없는 경우 서로 다른 파일의 동일 순번 프레임을 구분하지 못할 수 있습니다. ADPACK2는 대화 순서·구성에 대한 묶음 인증이 없습니다. 새 형식보다 변조 탐지 범위가 제한됩니다. 이 한계를 이해하고 가져오시겠습니까?`)) return;
+    }
+    if (hasLinkedIdentityData
       && !window.confirm('이 백업에는 이전 신원 연결 정보가 포함될 수 있습니다. 파일 인증에 성공한 경우에만 해당 관계를 이 기기에 복원합니다. 계속할까요?')) return;
     transferId = await uploadBackupFile(file);
     const response = await request('/api/history/backup-transfer', JSON.stringify({ action: 'import', transferId, password }));
