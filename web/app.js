@@ -227,6 +227,13 @@ function show(view) {
   return true;
 }
 
+document.querySelector('#brand-home').addEventListener('click', () => {
+  const view = identityId.textContent.trim() ? 'active' : (token ? 'entry' : 'bridge');
+  if (!show(view)) return;
+  message.textContent = '';
+  if (typeof window.scrollTo === 'function') window.scrollTo({ top: 0, behavior: 'auto' });
+});
+
 async function request(path, body = '', session = token) {
   const headers = { 'Content-Type': 'text/plain;charset=UTF-8' };
   if (session) headers.Authorization = `Bearer ${session}`;
@@ -1383,20 +1390,31 @@ document.querySelector('#history-bundle-export').addEventListener('click', async
 });
 
 document.querySelector('#history-backup-import').addEventListener('click', async () => {
+  const importStatus = document.querySelector('#history-backup-import-result');
+  const setImportResult = (result) => {
+    importStatus.dataset.result = result;
+    importStatus.textContent = result === 'success' ? '백업 가져오기 성공' : '백업 가져오기 실패';
+    importStatus.hidden = false;
+  };
+  importStatus.hidden = true;
+  importStatus.textContent = '';
   const file = document.querySelector('#history-backup-file').files[0];
   const passwordField = document.querySelector('#history-backup-import-password');
   const password = passwordField.value;
   if (!file) {
     passwordField.value = '';
+    setImportResult('failure');
     message.textContent = '가져올 백업 파일을 선택하세요.';
     return;
   }
   if (password && [...password].length < 12) {
     passwordField.value = '';
+    setImportResult('failure');
     message.textContent = '백업 비밀번호는 12자 이상이어야 합니다.';
     return;
   }
   let transferId = null;
+  let imported = false;
   try {
     const header = new Uint8Array(await file.slice(0, 8).arrayBuffer());
     const backupMagic = new TextDecoder().decode(header);
@@ -1412,9 +1430,11 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     transferId = await uploadBackupFile(file);
     const response = await request('/api/history/backup-transfer', JSON.stringify({ action: 'import', transferId, password }));
     transferId = null;
-    if (response.status === 409) { message.textContent = '먼저 모든 대화 연결을 종료한 뒤 다시 시도하세요.'; return; }
-    if (!response.ok) { message.textContent = (await response.text()) || '백업을 검증하거나 저장하지 못했습니다.'; return; }
+    if (response.status === 409) { setImportResult('failure'); message.textContent = '먼저 모든 대화 연결을 종료한 뒤 다시 시도하세요.'; return; }
+    if (!response.ok) { setImportResult('failure'); message.textContent = (await response.text()) || '백업을 검증하거나 저장하지 못했습니다.'; return; }
     const result = await response.json();
+    imported = true;
+    setImportResult('success');
     document.querySelector('#history-backup-file').value = '';
     await refreshHistoryList();
     if (Array.isArray(result.conversations)) {
@@ -1427,7 +1447,12 @@ document.querySelector('#history-backup-import').addEventListener('click', async
         : '백업을 확인해 기존 기록과 병합했습니다.';
     }
   } catch (_) {
-    message.textContent = '백업 파일을 읽거나 검증·저장하지 못했습니다. 기존 기록과 선택한 원본 파일은 보존됩니다.';
+    if (imported) {
+      message.textContent = '백업은 가져왔지만 화면을 갱신하지 못했습니다. 기록을 다시 불러오세요.';
+    } else {
+      setImportResult('failure');
+      message.textContent = '백업 파일을 읽거나 검증·저장하지 못했습니다. 기존 기록과 선택한 원본 파일은 보존됩니다.';
+    }
   } finally {
     if (transferId) await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId })).catch(() => {});
     passwordField.value = '';

@@ -133,7 +133,8 @@ function createHarness(options = {}) {
       } else if (payload.action === 'import') {
         pending.resolve(options.importFailure
           ? response(options.importFailure, 400)
-          : response(JSON.stringify({ peerId: 'ab'.repeat(32), messageCount: 1, linkedIdentityRestored: false })));
+          : response(options.importResult
+            || JSON.stringify({ peerId: 'ab'.repeat(32), messageCount: 1, linkedIdentityRestored: false })));
       }
     }
     return pending.promise;
@@ -295,6 +296,26 @@ test('dashboard menu closes on outside click and Escape; management dialog reuse
   ]) {
     assert.ok(ids.includes(requiredId), `required feature id missing: ${requiredId}`);
   }
+});
+
+test('brand button returns to the dashboard and global status has consistent separation', async () => {
+  const h = createHarness();
+  h.element('#identity-id').textContent = 'test-identity';
+  h.element('#chat-view').hidden = false;
+  h.element('#history-detail').hidden = false;
+  h.element('#message').textContent = '이전 오류';
+
+  await h.click('#brand-home');
+
+  assert.equal(h.element('#identity-active').hidden, false);
+  assert.equal(h.element('#chat-view').hidden, true);
+  assert.equal(h.element('#history-detail').hidden, true);
+  assert.equal(h.element('#message').textContent, '');
+  const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
+  assert.match(html, /<h1><button id="brand-home"[^>]*>Another Dimension<\/button><\/h1>/);
+  assert.match(html, /main\s*>\s*#message\s*\{[^}]*margin-top:\s*var\(--space-4\)/);
+  assert.match(html, /main\s*>\s*:not\(\[hidden\]\):has\(\+ #message:not\(:empty\)\)\s*\{[^}]*margin-bottom:\s*0/);
+  assert.match(html, /main:has\(\.identity-dashboard:not\(\[hidden\]\)\) #message, main:has\(#chat-view:not\(\[hidden\]\)\) #message\s*\{[^}]*margin:\s*var\(--space-4\) 0 0/);
 });
 
 test('chat UI keeps the message DOM safe and follows new messages only when already near the bottom', () => {
@@ -507,6 +528,21 @@ test('backup import presents the server-reported partial bundle count', async ()
   h.window.confirm = () => true;
   await h.click('#history-backup-import');
   assert.equal(h.element('#message').textContent, detail);
+  assert.equal(h.element('#history-backup-import-result').textContent, '백업 가져오기 실패');
+  assert.equal(h.element('#history-backup-import-result').dataset.result, 'failure');
+  assert.equal(h.element('#history-backup-import-result').hidden, false);
+});
+
+test('backup import exposes success on the import control after a successful response', async () => {
+  const h = createHarness({ importResult: JSON.stringify({ conversations: [] }) });
+  h.element('#history-backup-file').files = [file('backup.adbak', 'ADBACK4\0payload')];
+  const task = h.click('#history-backup-import');
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/history/list').resolve(response('[]'));
+  await task;
+  assert.equal(h.element('#history-backup-import-result').textContent, '백업 가져오기 성공');
+  assert.equal(h.element('#history-backup-import-result').dataset.result, 'success');
+  assert.equal(h.element('#history-backup-import-result').hidden, false);
 });
 
 function createOutputHandle() {
