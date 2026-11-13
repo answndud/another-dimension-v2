@@ -10,7 +10,7 @@ use identity::Identity;
 use relay::{InviteCode, RelayError, RelayRendezvous, RelaySession, RelayUpdate, DEFAULT_RELAY};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{create_dir_all, rename, File, OpenOptions};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Read, Seek, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
@@ -26,7 +26,8 @@ const PAGE: &[u8] = include_bytes!("../web/index.html");
 const SCRIPT: &[u8] = include_bytes!("../web/app.js");
 const REPROTECT_WORK_SCRIPT: &[u8] = include_bytes!("../web/reprotect-work.js");
 const MAX_HEADER: usize = 8192;
-const MAX_BODY: usize = 24 * 1024 * 1024;
+// Full backups use the chunked transfer API; regular JSON bodies stay bounded.
+const MAX_BODY: usize = 2 * 1024 * 1024;
 const CHAT_CONTROL_PREFIX: &[u8] = b"[AD2-CONTROL/1] ";
 const CODE_LIFETIME: Duration = Duration::from_secs(300);
 const MAX_ATTEMPTS: u8 = 5;
@@ -778,6 +779,103 @@ fn rejected_message(pending_events: &mut HashSet<String>, event_id: &str) -> boo
 mod send_tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn backup_transfer_api_uses_small_authenticated_chunks_for_export_and_import() {
+        let _data = TestDataDirectory::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "ab".repeat(32);
+        let (mut history, _, _) = history::History::open(&identity, &peer).unwrap();
+        history
+            .append(&history::StoredMessage {
+                unix_time: 1,
+                sender: history::MessageSender::Me,
+                text: "chunked backup".to_owned(),
+                proof: None,
+            })
+            .unwrap();
+        let state = Arc::new(Mutex::new(State {
+            code: String::new(),
+            issued: Instant::now(),
+            attempts: 0,
+            sessions: vec!["test-session".to_owned()],
+            identity: Some(Arc::new(identity)),
+            chats: HashMap::new(),
+            history_deletions: HashMap::new(),
+            active_history_deletions: HashSet::new(),
+            tor_socks: None,
+            active_relays: vec![DEFAULT_RELAY.to_owned()],
+            settings: AppSettings::default(),
+            notifications_enabled: Arc::new(AtomicBool::new(false)),
+            last_notification: Arc::new(Mutex::new(None)),
+        }));
+        let exported = call_test_api(
+            &state,
+            "/api/history/backup-transfer",
+            &serde_json::json!({ "action": "export", "peerId": peer, "password": "" }).to_string(),
+            "test-session",
+        );
+        assert!(exported.starts_with("HTTP/1.1 200 OK"), "{exported}");
+        let export: serde_json::Value =
+            serde_json::from_str(exported.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let export_id = export["transferId"].as_str().unwrap();
+        let export_size = export["size"].as_u64().unwrap();
+        let downloaded = call_test_api(
+            &state,
+            "/api/history/backup-transfer",
+            &serde_json::json!({ "action": "read", "transferId": export_id, "offset": 0 })
+                .to_string(),
+            "test-session",
+        );
+        let chunk: serde_json::Value =
+            serde_json::from_str(downloaded.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(chunk["size"].as_u64(), Some(export_size));
+        let backup = BASE64.decode(chunk["data"].as_str().unwrap()).unwrap();
+        assert!(backup.starts_with(b"ADBACK6\0"));
+        assert_eq!(backup.len() as u64, export_size);
+
+        let upload = call_test_api(
+            &state,
+            "/api/history/backup-transfer",
+            r#"{"action":"upload-start"}"#,
+            "test-session",
+        );
+        let upload: serde_json::Value =
+            serde_json::from_str(upload.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let upload_id = upload["transferId"].as_str().unwrap();
+        let written = call_test_api(
+            &state,
+            "/api/history/backup-transfer",
+            &serde_json::json!({
+                "action": "upload-chunk", "transferId": upload_id,
+                "offset": 0, "data": BASE64.encode(&backup)
+            })
+            .to_string(),
+            "test-session",
+        );
+        assert!(written.starts_with("HTTP/1.1 200 OK"), "{written}");
+        let restored = call_test_api(
+            &state,
+            "/api/history/backup-transfer",
+            &serde_json::json!({ "action": "import", "transferId": upload_id, "password": "" })
+                .to_string(),
+            "test-session",
+        );
+        assert!(restored.starts_with("HTTP/1.1 200 OK"), "{restored}");
+        let (messages, _) = history::History::read_for_identity_copy(
+            state.lock().unwrap().identity.as_ref().unwrap(),
+            &peer,
+        )
+        .unwrap();
+        assert_eq!(messages.len(), 1);
+        let cleaned = call_test_api(
+            &state,
+            "/api/history/backup-transfer",
+            &serde_json::json!({ "action": "cleanup", "transferId": export_id }).to_string(),
+            "test-session",
+        );
+        assert!(cleaned.starts_with("HTTP/1.1 200 OK"));
+    }
 
     #[test]
     fn settings_relay_defaults_and_legacy_fields_are_preserved() {
@@ -4488,11 +4586,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             | "POST /api/history/delete-range HTTP/1.1"
             | "POST /api/history/delete-status HTTP/1.1"
             | "POST /api/history/delete-conversation HTTP/1.1"
-            | "POST /api/history/export-backup HTTP/1.1"
-            | "POST /api/history/export-backup-bundle HTTP/1.1"
-            | "POST /api/history/import-backup HTTP/1.1"
-            | "POST /api/history/reprotect-backup HTTP/1.1"
-            | "POST /api/history/verify-backup HTTP/1.1"
+            | "POST /api/history/backup-transfer HTTP/1.1"
             | "POST /api/contacts/export-backup HTTP/1.1"
             | "POST /api/contacts/import-backup HTTP/1.1"
     ) {
@@ -5518,244 +5612,449 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         update_closed_chat_history(&state, &identity.public_id(), body, 0);
         return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
     }
-    if first == "POST /api/history/export-backup HTTP/1.1" {
+    if first == "POST /api/history/backup-transfer HTTP/1.1" {
         let Some(identity) = state.identity.as_ref() else {
             return reject(&mut stream, "401 Unauthorized");
         };
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
+        let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(body) else {
             return reject(&mut stream, "400 Bad Request");
         };
-        let Some(peer_id) = payload.get("peerId").and_then(serde_json::Value::as_str) else {
+        let Some(fields) = payload.as_object_mut() else {
             return reject(&mut stream, "400 Bad Request");
         };
-        let password = payload
-            .get("password")
-            .and_then(serde_json::Value::as_str)
-            .filter(|password| !password.is_empty());
-        if peer_chat_active(&state, peer_id)
-            || history_delete_active(&state, &identity.public_id(), peer_id)
-        {
-            return reject(&mut stream, "409 Conflict");
-        }
-        let backup = match history::History::export_backup(identity, peer_id, password) {
-            Ok(backup) => backup,
-            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
-                return reject(&mut stream, "400 Bad Request");
-            }
-            Err(_) => return reject(&mut stream, "500 Internal Server Error"),
-        };
-        return respond(
-            &mut stream,
-            "200 OK",
-            "text/plain; charset=utf-8",
-            BASE64.encode(backup).as_bytes(),
-        );
-    }
-    if first == "POST /api/history/export-backup-bundle HTTP/1.1" {
-        let Some(identity) = state.identity.as_ref() else {
-            return reject(&mut stream, "401 Unauthorized");
-        };
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let Some(peers) = payload.get("peerIds").and_then(serde_json::Value::as_array) else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let Some(peer_ids) = peers
-            .iter()
-            .map(serde_json::Value::as_str)
-            .collect::<Option<Vec<_>>>()
+        let Some(action) = fields
+            .remove("action")
+            .and_then(|v| v.as_str().map(str::to_owned))
         else {
             return reject(&mut stream, "400 Bad Request");
         };
-        if peer_ids.iter().any(|peer| {
-            peer_chat_active(&state, peer)
-                || history_delete_active(&state, &identity.public_id(), peer)
-        }) {
-            return reject(&mut stream, "409 Conflict");
-        }
-        let peer_ids: Vec<String> = peer_ids.into_iter().map(str::to_owned).collect();
-        let backup = match history::History::export_backup_bundle(identity, &peer_ids) {
-            Ok(backup) => backup,
-            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
-                return reject(&mut stream, "400 Bad Request")
-            }
+        let transfer_dir = match history::History::backup_transfer_directory(identity) {
+            Ok(path) => path,
             Err(_) => return reject(&mut stream, "500 Internal Server Error"),
         };
-        return respond(
-            &mut stream,
-            "200 OK",
-            "text/plain; charset=utf-8",
-            BASE64.encode(backup).as_bytes(),
-        );
-    }
-    if first == "POST /api/history/import-backup HTTP/1.1" {
-        let Some(identity) = state.identity.as_ref() else {
-            return reject(&mut stream, "401 Unauthorized");
-        };
-        if any_chat_active(&state) || !state.active_history_deletions.is_empty() {
-            return reject(&mut stream, "409 Conflict");
-        }
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let Some(encoded) = payload.get("backup").and_then(serde_json::Value::as_str) else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let password = payload
-            .get("password")
-            .and_then(serde_json::Value::as_str)
-            .filter(|password| !password.is_empty());
-        let backup = match BASE64.decode(encoded) {
-            Ok(backup) if backup.len() <= 16 * 1024 * 1024 => backup,
-            _ => return reject(&mut stream, "400 Bad Request"),
-        };
-        if backup.starts_with(b"ADPACK1\0") {
-            let restored = match history::History::import_backup_bundle_with_info(identity, &backup)
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    return respond(
-                        &mut stream,
-                        "400 Bad Request",
-                        "text/plain; charset=utf-8",
-                        format!("{error}").as_bytes(),
-                    )
-                }
-            };
-            for (peer_id, message_count, _) in &restored {
-                update_closed_chat_history(
-                    &state,
-                    &identity.public_id(),
-                    peer_id,
-                    *message_count as u64,
-                );
+        let get_transfer_path = |id: &str| -> Option<PathBuf> {
+            if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
             }
-            let payload = serde_json::json!({ "conversations": restored.iter().map(|(peer_id, count, linked)| serde_json::json!({ "peerId": peer_id, "messageCount": count, "linkedIdentityRestored": linked })).collect::<Vec<_>>() }).to_string();
-            return respond(
-                &mut stream,
+            Some(transfer_dir.join(format!("{}.backup", id.to_ascii_lowercase())))
+        };
+        let response_json = |stream: &mut TcpStream, value: serde_json::Value| {
+            let text = value.to_string();
+            respond(
+                stream,
                 "200 OK",
                 "application/json; charset=utf-8",
-                payload.as_bytes(),
-            );
-        }
-        let (peer_id, count, linked) =
-            match history::History::import_backup_with_info(identity, &backup, password) {
-                Ok(result) => result,
-                Err(error) => {
+                text.as_bytes(),
+            )
+        };
+        match action.as_str() {
+            "export" | "bundle-export" => {
+                let password = if action == "export" {
+                    fields.remove("password").and_then(|v| {
+                        v.as_str()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| Zeroizing::new(s.to_owned()))
+                    })
+                } else {
+                    None
+                };
+                let peer_ids: Vec<String> = if action == "export" {
+                    let Some(peer) = fields
+                        .remove("peerId")
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                    else {
+                        return reject(&mut stream, "400 Bad Request");
+                    };
+                    vec![peer]
+                } else {
+                    let Some(values) = fields.remove("peerIds").and_then(|v| v.as_array().cloned())
+                    else {
+                        return reject(&mut stream, "400 Bad Request");
+                    };
+                    let Some(peers) = values
+                        .into_iter()
+                        .map(|v| v.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return reject(&mut stream, "400 Bad Request");
+                    };
+                    peers
+                };
+                if !fields.is_empty()
+                    || peer_ids.iter().any(|peer| {
+                        peer_chat_active(&state, peer)
+                            || history_delete_active(&state, &identity.public_id(), peer)
+                    })
+                {
+                    return reject(&mut stream, "409 Conflict");
+                }
+                let id = match random_token() {
+                    Ok(id) => id,
+                    Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+                };
+                let Some(path) = get_transfer_path(&id) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let result = (|| -> io::Result<()> {
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)?;
+                    set_private_file(&file)?;
+                    if action == "export" {
+                        history::History::export_backup_stream(
+                            identity,
+                            &peer_ids[0],
+                            password.as_deref().map(String::as_str),
+                            &mut file,
+                        )?;
+                    } else {
+                        history::History::export_backup_bundle_stream(
+                            identity, &peer_ids, &mut file,
+                        )?;
+                    }
+                    file.flush()?;
+                    file.sync_all()?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    let _ = std::fs::remove_file(&path);
+                    let status = if error.kind() == io::ErrorKind::InvalidInput {
+                        "400 Bad Request"
+                    } else {
+                        "500 Internal Server Error"
+                    };
                     return respond(
+                        &mut stream,
+                        status,
+                        "text/plain; charset=utf-8",
+                        error.to_string().as_bytes(),
+                    );
+                }
+                let size = match std::fs::metadata(&path) {
+                    Ok(meta) => meta.len(),
+                    Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+                };
+                return response_json(
+                    &mut stream,
+                    serde_json::json!({"transferId": id, "size": size}),
+                );
+            }
+            "upload-start" => {
+                if !fields.is_empty() {
+                    return reject(&mut stream, "400 Bad Request");
+                }
+                let id = match random_token() {
+                    Ok(id) => id,
+                    Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+                };
+                let Some(path) = get_transfer_path(&id) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+                    Ok(file) => file,
+                    Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+                };
+                if set_private_file(&file).is_err() {
+                    let _ = std::fs::remove_file(path);
+                    return reject(&mut stream, "500 Internal Server Error");
+                }
+                return response_json(&mut stream, serde_json::json!({"transferId": id}));
+            }
+            "upload-chunk" => {
+                let Some(id) = fields
+                    .remove("transferId")
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let Some(offset) = fields.remove("offset").and_then(|v| v.as_u64()) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let Some(encoded) = fields
+                    .remove("data")
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                if !fields.is_empty() {
+                    return reject(&mut stream, "400 Bad Request");
+                }
+                let bytes = match BASE64.decode(encoded) {
+                    Ok(bytes) if !bytes.is_empty() && bytes.len() <= 256 * 1024 => bytes,
+                    _ => return reject(&mut stream, "400 Bad Request"),
+                };
+                let Some(path) = get_transfer_path(&id) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let mut file = match OpenOptions::new().read(true).append(true).open(path) {
+                    Ok(file) => file,
+                    Err(_) => return reject(&mut stream, "404 Not Found"),
+                };
+                if file
+                    .metadata()
+                    .map_or(true, |metadata| metadata.len() != offset)
+                {
+                    return reject(&mut stream, "409 Conflict");
+                }
+                if file.write_all(&bytes).and_then(|_| file.flush()).is_err() {
+                    return reject(&mut stream, "507 Insufficient Storage");
+                }
+                return response_json(
+                    &mut stream,
+                    serde_json::json!({"offset": offset + bytes.len() as u64}),
+                );
+            }
+            "read" => {
+                let Some(id) = fields
+                    .remove("transferId")
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let Some(offset) = fields.remove("offset").and_then(|v| v.as_u64()) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                if !fields.is_empty() {
+                    return reject(&mut stream, "400 Bad Request");
+                }
+                let Some(path) = get_transfer_path(&id) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let mut file = match File::open(path) {
+                    Ok(file) => file,
+                    Err(_) => return reject(&mut stream, "404 Not Found"),
+                };
+                let size = match file.metadata() {
+                    Ok(metadata) => metadata.len(),
+                    Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+                };
+                if offset > size {
+                    return reject(&mut stream, "416 Range Not Satisfiable");
+                }
+                if file.seek(io::SeekFrom::Start(offset)).is_err() {
+                    return reject(&mut stream, "500 Internal Server Error");
+                }
+                let mut chunk = vec![0; 256 * 1024];
+                let read = match file.read(&mut chunk) {
+                    Ok(read) => read,
+                    Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+                };
+                chunk.truncate(read);
+                return response_json(
+                    &mut stream,
+                    serde_json::json!({"transferId": id, "offset": offset, "size": size, "data": BASE64.encode(&chunk), "done": offset + read as u64 == size}),
+                );
+            }
+            "import" => {
+                let Some(id) = fields
+                    .remove("transferId")
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let password = fields
+                    .remove("password")
+                    .and_then(|v| v.as_str().map(|s| Zeroizing::new(s.to_owned())))
+                    .filter(|v| !v.is_empty());
+                if !fields.is_empty()
+                    || any_chat_active(&state)
+                    || !state.active_history_deletions.is_empty()
+                {
+                    return reject(&mut stream, "409 Conflict");
+                }
+                let Some(path) = get_transfer_path(&id) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let result = history::History::import_backup_file(
+                    identity,
+                    &path,
+                    password.as_deref().map(String::as_str),
+                );
+                let cleanup = std::fs::remove_file(&path);
+                let restored = match (result, cleanup) {
+                    (Ok(restored), Ok(())) => restored,
+                    (Err(error), Ok(())) => return respond(&mut stream, "400 Bad Request", "text/plain; charset=utf-8", error.to_string().as_bytes()),
+                    (Ok(_), Err(error)) => return respond(&mut stream, "500 Internal Server Error", "text/plain; charset=utf-8", format!("backup import completed but temporary upload cleanup failed ({error})").as_bytes()),
+                    (Err(error), Err(cleanup)) => return respond(&mut stream, "500 Internal Server Error", "text/plain; charset=utf-8", format!("backup import failed ({error}); temporary upload cleanup failed ({cleanup})").as_bytes()),
+                };
+                for (peer_id, message_count, _) in &restored {
+                    update_closed_chat_history(
+                        &state,
+                        &identity.public_id(),
+                        peer_id,
+                        *message_count as u64,
+                    );
+                }
+                let response = if restored.len() == 1 {
+                    let (peer_id, count, linked) = &restored[0];
+                    serde_json::json!({"peerId": peer_id, "messageCount": count, "linkedIdentityRestored": linked})
+                } else {
+                    serde_json::json!({"conversations": restored.iter().map(|(peer_id,count,linked)| serde_json::json!({"peerId":peer_id,"messageCount":count,"linkedIdentityRestored":linked})).collect::<Vec<_>>()})
+                };
+                return response_json(&mut stream, response);
+            }
+            "verify" => {
+                let Some(id) = fields
+                    .remove("transferId")
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let password = fields
+                    .remove("password")
+                    .and_then(|v| v.as_str().map(|s| Zeroizing::new(s.to_owned())))
+                    .filter(|v| !v.is_empty());
+                if !fields.is_empty() {
+                    return reject(&mut stream, "400 Bad Request");
+                }
+                let Some(path) = get_transfer_path(&id) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                return match history::History::verify_backup_file(
+                    identity,
+                    &path,
+                    password.as_deref().map(String::as_str),
+                ) {
+                    Ok((peer_id, count)) => response_json(
+                        &mut stream,
+                        serde_json::json!({"peerId": peer_id, "messageCount": count}),
+                    ),
+                    Err(error) => respond(
                         &mut stream,
                         "400 Bad Request",
                         "text/plain; charset=utf-8",
                         error.to_string().as_bytes(),
-                    )
+                    ),
+                };
+            }
+            "reprotect" => {
+                let Some(id) = fields
+                    .remove("transferId")
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let Some(previous_code) = fields
+                    .remove("previousCode")
+                    .and_then(|v| v.as_str().map(|s| Zeroizing::new(s.to_owned())))
+                else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let previous_password = fields
+                    .remove("previousPassword")
+                    .and_then(|v| v.as_str().map(|s| Zeroizing::new(s.to_owned())))
+                    .filter(|v| !v.is_empty());
+                let replacement_password = fields
+                    .remove("replacementPassword")
+                    .and_then(|v| v.as_str().map(|s| Zeroizing::new(s.to_owned())))
+                    .filter(|v| !v.is_empty());
+                if !fields.is_empty() {
+                    return reject(&mut stream, "400 Bad Request");
                 }
-            };
-        update_closed_chat_history(&state, &identity.public_id(), &peer_id, count as u64);
-        let payload = serde_json::json!({ "peerId": peer_id, "messageCount": count, "linkedIdentityRestored": linked }).to_string();
-        return respond(
-            &mut stream,
-            "200 OK",
-            "application/json; charset=utf-8",
-            payload.as_bytes(),
-        );
-    }
-    if first == "POST /api/history/reprotect-backup HTTP/1.1" {
-        let Some(identity) = state.identity.as_ref() else {
-            return reject(&mut stream, "401 Unauthorized");
-        };
-        let Ok(mut request) = serde_json::from_str::<serde_json::Value>(body) else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let Some(fields) = request.as_object_mut() else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let Some(backup_text) = fields
-            .remove("backup")
-            .and_then(|value| value.as_str().map(str::to_owned))
-        else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let Some(previous_code) = fields
-            .remove("previousCode")
-            .and_then(|value| value.as_str().map(|value| Zeroizing::new(value.to_owned())))
-        else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let previous_password = fields
-            .remove("previousPassword")
-            .and_then(|value| value.as_str().map(|value| Zeroizing::new(value.to_owned())))
-            .filter(|password| !password.is_empty());
-        let replacement_password = fields
-            .remove("replacementPassword")
-            .and_then(|value| value.as_str().map(|value| Zeroizing::new(value.to_owned())))
-            .filter(|password| !password.is_empty());
-        if !fields.is_empty() {
-            return reject(&mut stream, "400 Bad Request");
+                let Some(previous_identity) = Identity::from_code(&previous_code) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let Some(source_path) = get_transfer_path(&id) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let output_id = match random_token() {
+                    Ok(id) => id,
+                    Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+                };
+                let Some(output_path) = get_transfer_path(&output_id) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                let mut output = match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&output_path)
+                {
+                    Ok(file) => file,
+                    Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+                };
+                if let Err(error) = set_private_file(&output) {
+                    drop(output);
+                    let _ = std::fs::remove_file(&output_path);
+                    return respond(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "text/plain; charset=utf-8",
+                        error.to_string().as_bytes(),
+                    );
+                }
+                let result = history::History::reprotect_backup_file(
+                    &previous_identity,
+                    identity,
+                    &source_path,
+                    &mut output,
+                    previous_password.as_deref().map(String::as_str),
+                    replacement_password.as_deref().map(String::as_str),
+                );
+                let result = result.and_then(|count| {
+                    output.flush()?;
+                    output.sync_all()?;
+                    Ok(count)
+                });
+                drop(output);
+                let cleanup_source = std::fs::remove_file(&source_path);
+                let count = match (result, cleanup_source) {
+                    (Ok(count), Ok(())) => count,
+                    (Err(error), Ok(())) => {
+                        let _ = std::fs::remove_file(&output_path);
+                        return respond(
+                            &mut stream,
+                            "400 Bad Request",
+                            "text/plain; charset=utf-8",
+                            error.to_string().as_bytes(),
+                        );
+                    }
+                    (Ok(_), Err(error)) => {
+                        let _ = std::fs::remove_file(&output_path);
+                        return respond(&mut stream, "500 Internal Server Error", "text/plain; charset=utf-8", format!("reprotection completed but temporary upload cleanup failed ({error})").as_bytes());
+                    }
+                    (Err(error), Err(cleanup)) => {
+                        let _ = std::fs::remove_file(&output_path);
+                        return respond(&mut stream, "500 Internal Server Error", "text/plain; charset=utf-8", format!("reprotection failed ({error}); temporary upload cleanup failed ({cleanup})").as_bytes());
+                    }
+                };
+                let size = match std::fs::metadata(&output_path) {
+                    Ok(meta) => meta.len(),
+                    Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+                };
+                return response_json(
+                    &mut stream,
+                    serde_json::json!({"transferId": output_id, "size": size, "messageCount": count}),
+                );
+            }
+            "cleanup" => {
+                let Some(id) = fields
+                    .remove("transferId")
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                if !fields.is_empty() {
+                    return reject(&mut stream, "400 Bad Request");
+                }
+                let Some(path) = get_transfer_path(&id) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
+                return match std::fs::remove_file(path) {
+                    Ok(()) => response_json(&mut stream, serde_json::json!({"ok": true})),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        response_json(&mut stream, serde_json::json!({"ok": true}))
+                    }
+                    Err(error) => respond(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "text/plain; charset=utf-8",
+                        error.to_string().as_bytes(),
+                    ),
+                };
+            }
+            _ => return reject(&mut stream, "400 Bad Request"),
         }
-        let Some(previous_identity) = Identity::from_code(&previous_code) else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let Ok(backup) = BASE64.decode(backup_text) else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let Ok(reprotected) = history::History::reprotect_backup(
-            &previous_identity,
-            identity,
-            &backup,
-            previous_password.as_deref().map(String::as_str),
-            replacement_password.as_deref().map(String::as_str),
-        ) else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        return respond(
-            &mut stream,
-            "200 OK",
-            "text/plain; charset=utf-8",
-            BASE64.encode(reprotected).as_bytes(),
-        );
-    }
-    if first == "POST /api/history/verify-backup HTTP/1.1" {
-        let Some(identity) = state.identity.as_ref() else {
-            return reject(&mut stream, "401 Unauthorized");
-        };
-        let Ok(mut request) = serde_json::from_str::<serde_json::Value>(body) else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let Some(fields) = request.as_object_mut() else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let Some(backup_text) = fields
-            .remove("backup")
-            .and_then(|value| value.as_str().map(str::to_owned))
-        else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let password = fields
-            .remove("password")
-            .and_then(|value| value.as_str().map(|value| Zeroizing::new(value.to_owned())))
-            .filter(|password| !password.is_empty());
-        if !fields.is_empty() {
-            return reject(&mut stream, "400 Bad Request");
-        }
-        let Ok(backup) = BASE64.decode(backup_text) else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let Ok((peer_id, message_count)) = history::History::verify_backup(
-            identity,
-            &backup,
-            password.as_deref().map(String::as_str),
-        ) else {
-            return reject(&mut stream, "400 Bad Request");
-        };
-        let response =
-            serde_json::json!({ "peerId": peer_id, "messageCount": message_count }).to_string();
-        return respond(
-            &mut stream,
-            "200 OK",
-            "application/json; charset=utf-8",
-            response.as_bytes(),
-        );
     }
     match first.as_str() {
         "POST /api/identity/create HTTP/1.1" => {

@@ -37,16 +37,24 @@ function deferredJsonResponse(status = 200) {
 }
 
 function file(name, contents) {
+  const bytes = Buffer.from(contents);
   return {
     name,
-    size: contents.length,
+    size: bytes.length,
     dataUrl: `data:application/octet-stream;base64,${Buffer.from(contents).toString('base64')}`,
+    slice(start = 0, end = bytes.length) {
+      const selected = bytes.subarray(start, end);
+      return { arrayBuffer: async () => selected.buffer.slice(selected.byteOffset, selected.byteOffset + selected.byteLength) };
+    },
+    arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
   };
 }
 
 function createHarness(options = {}) {
   const elements = new Map();
   const requests = [];
+  const transferFiles = new Map();
+  let transferSequence = 0;
   const storage = new Map();
   const themeStorage = options.themeStorage || new Map();
   const element = (selector) => {
@@ -92,8 +100,40 @@ function createHarness(options = {}) {
   };
   const fetch = (path, init) => {
     const pending = deferred();
-    requests.push({ path, init, ...pending });
+    const item = { path, init, ...pending };
+    requests.push(item);
     if (path === '/api/identity/logout') pending.resolve(response('ok'));
+    if (path === '/api/history/backup-transfer') {
+      const payload = JSON.parse(init.body);
+      if (payload.action === 'upload-start') {
+        const transferId = `upload-${++transferSequence}`;
+        transferFiles.set(transferId, Buffer.alloc(0));
+        pending.resolve(response(JSON.stringify({ transferId })));
+      } else if (payload.action === 'upload-chunk') {
+        const prior = transferFiles.get(payload.transferId) || Buffer.alloc(0);
+        const bytes = Buffer.from(payload.data, 'base64');
+        transferFiles.set(payload.transferId, Buffer.concat([prior, bytes]));
+        pending.resolve(response(JSON.stringify({ offset: prior.length + bytes.length })));
+      } else if (payload.action === 'cleanup') {
+        transferFiles.delete(payload.transferId);
+        pending.resolve(response('{"ok":true}'));
+      } else if (payload.action === 'read') {
+        const bytes = transferFiles.get(payload.transferId) || Buffer.alloc(0);
+        const chunk = bytes.subarray(payload.offset, payload.offset + 256 * 1024);
+        pending.resolve(response(JSON.stringify({
+          transferId: payload.transferId, offset: payload.offset, size: bytes.length,
+          data: chunk.toString('base64'), done: payload.offset + chunk.length === bytes.length,
+        })));
+      } else if (payload.action === 'verify') {
+        pending.resolve(response(JSON.stringify({ peerId: 'ab'.repeat(32), messageCount: 1 })));
+      } else if (payload.action === 'export' || payload.action === 'bundle-export') {
+        const transferId = `export-${++transferSequence}`;
+        transferFiles.set(transferId, Buffer.from('exported backup'));
+        pending.resolve(response(JSON.stringify({ transferId, size: transferFiles.get(transferId).length })));
+      } else if (payload.action === 'import') {
+        pending.resolve(response(JSON.stringify({ peerId: 'ab'.repeat(32), messageCount: 1, linkedIdentityRestored: false })));
+      }
+    }
     return pending.promise;
   };
   class FileReader {
@@ -114,8 +154,9 @@ function createHarness(options = {}) {
     setItem: (key, value) => themeStorage.set(key, value),
   };
   const context = {
-    window, document, fetch, sessionStorage, localStorage, FileReader, Uint8Array,
+    window, document, fetch, sessionStorage, localStorage, FileReader, Uint8Array, TextDecoder,
     atob: (value) => Buffer.from(value, 'base64').toString('binary'),
+    btoa: (value) => Buffer.from(value, 'binary').toString('base64'),
     Blob, URL, console, setTimeout, clearTimeout, setInterval, clearInterval,
     queueMicrotask, Date, Math, Set, Map, Promise, Error, JSON,
   };
@@ -127,7 +168,9 @@ function createHarness(options = {}) {
     return callback({ preventDefault() {} });
   };
   const requestFor = (path) => requests.findLast((item) => item.path === path);
-  return { element, window, click, requests, requestFor, evaluate, themeStorage, document };
+  const requestForAction = (action) => requests.findLast((item) => item.path === '/api/history/backup-transfer' && JSON.parse(item.init.body).action === action);
+  const addTransferFile = (id, bytes) => transferFiles.set(id, Buffer.from(bytes));
+  return { element, window, click, requests, requestFor, requestForAction, addTransferFile, evaluate, themeStorage, document };
 }
 
 test('dashboard menu closes on outside click and Escape; management dialog reuses the selected pane and restores focus', async () => {
@@ -348,6 +391,12 @@ function sourceHandle(name, contents) {
 }
 
 function enterSecrets(harness, suffix) {
+function reprotectResponse(harness, encoded, transferId = `result-${harness.requests.length}`) {
+  const bytes = Buffer.from(encoded, 'base64');
+  harness.addTransferFile(transferId, bytes);
+  return response(JSON.stringify({ transferId, size: bytes.length, messageCount: 1 }));
+}
+
   harness.element('#history-reprotect-previous-code').value = `code-${suffix}`;
   harness.element('#history-reprotect-previous-password').value = `old-${suffix}`;
   harness.element('#history-reprotect-new-password').value = `replacement-${suffix}-secret`;
@@ -384,7 +433,7 @@ test('actual UI: request A then B, and B completes before A', async () => {
   enterSecrets(h, 'A');
   const taskA = h.click('#history-reprotect');
   await new Promise((resolve) => setImmediate(resolve));
-  const requestA = h.requestFor('/api/history/reprotect-backup');
+  const requestA = h.requestForAction('reprotect');
   assert.equal(JSON.parse(requestA.init.body).previousCode, 'code-A');
   assert.deepEqual([
     h.element('#history-reprotect-previous-code').value,
@@ -396,13 +445,13 @@ test('actual UI: request A then B, and B completes before A', async () => {
   enterSecrets(h, 'B');
   const taskB = h.click('#history-reprotect');
   await new Promise((resolve) => setImmediate(resolve));
-  const requestB = h.requests.filter((item) => item.path === '/api/history/reprotect-backup')[1];
-  requestB.resolve(response('QmFja3VwQg=='));
+  const requestB = h.requests.filter((item) => item.path === '/api/history/backup-transfer' && JSON.parse(item.init.body).action === 'reprotect')[1];
+  requestB.resolve(reprotectResponse(h, 'QmFja3VwQg==', 'result-B'));
   await taskB;
   assert.equal(h.element('#history-reprotect-save').disabled, false);
   assert.match(h.element('#message').textContent, /새 백업을 만들었습니다/);
 
-  requestA.resolve(response('QmFja3VwQQ=='));
+  requestA.resolve(reprotectResponse(h, 'QmFja3VwQQ==', 'result-A'));
   await taskA;
   assert.equal(h.element('#history-reprotect-save').disabled, false);
 
@@ -411,11 +460,8 @@ test('actual UI: request A then B, and B completes before A', async () => {
   h.window.showSaveFilePicker = async (options) => { pickerOptions = options; return output; };
   const saveTask = h.click('#history-reprotect-save');
   await new Promise((resolve) => setImmediate(resolve));
-  const verifyRequest = h.requestFor('/api/history/verify-backup');
-  assert.deepEqual(JSON.parse(verifyRequest.init.body), {
-    backup: 'QmFja3VwQg==', password: 'replacement-B-secret',
-  });
-  verifyRequest.resolve(response(JSON.stringify({ messageCount: 1 })));
+  const verifyRequest = h.requestForAction('verify');
+  assert.equal(JSON.parse(verifyRequest.init.body).password, 'replacement-B-secret');
   await saveTask;
   assert.equal(pickerOptions.suggestedName, 'source.new-identity.adbak');
   assert.equal(output.written, 'BackupB');
@@ -433,7 +479,7 @@ test('backup restore asks before applying authenticated linked identity data', a
   h.window.confirm = (message) => { prompt = message; return false; };
   await h.click('#history-backup-import');
   assert.match(prompt, /이전 신원 연결 정보/);
-  assert.equal(h.requests.some((item) => item.path === '/api/history/import-backup'), false);
+  assert.equal(h.requests.some((item) => item.path === '/api/history/backup-transfer' && JSON.parse(item.init.body).action === 'import'), false);
 });
 
 function createOutputHandle() {
@@ -457,7 +503,7 @@ test('actual UI: file chooser and cancellation invalidate an earlier request', a
       enterSecrets(h, 'pending');
       const pendingTask = h.click('#history-reprotect');
       await new Promise((resolve) => setImmediate(resolve));
-      const oldRequest = h.requestFor('/api/history/reprotect-backup');
+        const oldRequest = h.requestForAction('reprotect');
 
       const picker = deferred();
       h.window.showOpenFilePicker = () => picker.promise;
@@ -472,7 +518,7 @@ test('actual UI: file chooser and cancellation invalidate an earlier request', a
       await chooseTask;
       const statusAfterPicker = h.element('#message').textContent;
       h.element('#history-reprotect-previous-code').value = 'new-session-input';
-      oldRequest.resolve(response('U1RBTEU='));
+      oldRequest.resolve(reprotectResponse(h, 'U1RBTEU=', 'stale-output'));
       await pendingTask;
 
       assert.equal(h.element('#history-reprotect-previous-code').value, 'new-session-input');
@@ -502,14 +548,14 @@ test('actual UI: logout clears state and invalidates picker and request completi
         enterSecrets(h, 'logout');
         pendingTask = h.click('#history-reprotect');
         await new Promise((resolve) => setImmediate(resolve));
-        oldRequest = h.requestFor('/api/history/reprotect-backup');
+        oldRequest = h.requestForAction('reprotect');
       }
       await h.click('#logout');
       assert.equal(h.element('#history-reprotect-source').textContent, '선택한 파일 없음');
       assert.equal(h.element('#history-reprotect-save').disabled, true);
       const logoutStatus = h.element('#message').textContent;
       if (picker) picker.resolve([sourceHandle('late.adbak', 'late encrypted')]);
-      if (oldRequest) oldRequest.resolve(response('T0xE'));
+      if (oldRequest) oldRequest.resolve(reprotectResponse(h, 'T0xE', 'logout-output'));
       await pendingTask;
       h.element('#history-reprotect-previous-code').value = 'new-session-code';
       assert.equal(h.element('#history-reprotect-previous-code').value, 'new-session-code');
@@ -529,8 +575,8 @@ test('actual UI: save snapshots its source, output and password; stale writes ab
       enterSecrets(h, 'save');
       const reprotectTask = h.click('#history-reprotect');
       await new Promise((resolve) => setImmediate(resolve));
-      const reprotect = h.requestFor('/api/history/reprotect-backup');
-      reprotect.resolve(response('U0FWRQ=='));
+      const reprotect = h.requestForAction('reprotect');
+      reprotect.resolve(reprotectResponse(h, 'U0FWRQ==', 'save-output'));
       await reprotectTask;
 
       const write = deferred();
@@ -559,7 +605,7 @@ test('actual UI: save snapshots its source, output and password; stale writes ab
       assert.equal(output.aborted, true);
       assert.equal(output.closed, false);
       assert.equal(original.file.dataUrl, file('original.adbak', 'original bytes').dataUrl);
-      assert.equal(h.requests.filter((item) => item.path === '/api/history/verify-backup').length, 0);
+      assert.equal(h.requests.filter((item) => item.path === '/api/history/backup-transfer' && JSON.parse(item.init.body).action === 'verify').length, 0);
       if (invalidator === 'new task') {
         assert.equal(h.element('#history-reprotect-previous-code').value, '');
         assert.equal(h.element('#history-reprotect-save').disabled, true);
@@ -577,7 +623,7 @@ test('actual UI: same-entry save target is rejected before opening a writer', as
   enterSecrets(h, 'source');
   const task = h.click('#history-reprotect');
   await new Promise((resolve) => setImmediate(resolve));
-  h.requestFor('/api/history/reprotect-backup').resolve(response('T1VUUFVU'));
+  h.requestForAction('reprotect').resolve(reprotectResponse(h, 'T1VUUFVU', 'same-entry-output'));
   await task;
   let writerOpened = false;
   original.createWritable = async () => { writerOpened = true; };
@@ -594,14 +640,14 @@ test('actual UI: failed new request invalidates the prior saved candidate', asyn
   enterSecrets(h, 'valid');
   const validTask = h.click('#history-reprotect');
   await new Promise((resolve) => setImmediate(resolve));
-  h.requestFor('/api/history/reprotect-backup').resolve(response('VkFMSUQ='));
+  h.requestForAction('reprotect').resolve(reprotectResponse(h, 'VkFMSUQ=', 'valid-output'));
   await validTask;
   assert.equal(h.element('#history-reprotect-save').disabled, false);
 
   enterSecrets(h, 'invalid');
   const failedTask = h.click('#history-reprotect');
   await new Promise((resolve) => setImmediate(resolve));
-  const failedRequest = h.requests.filter((item) => item.path === '/api/history/reprotect-backup')[1];
+  const failedRequest = h.requests.filter((item) => item.path === '/api/history/backup-transfer' && JSON.parse(item.init.body).action === 'reprotect')[1];
   assert.deepEqual([
     h.element('#history-reprotect-previous-code').value,
     h.element('#history-reprotect-previous-password').value,

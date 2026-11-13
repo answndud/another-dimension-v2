@@ -193,11 +193,10 @@ function clearReprotectSecrets() {
 
 function clearReprotectState() {
   reprotectWork.begin();
+  discardReprotectOutput();
   clearReprotectSecrets();
   reprotectSourceHandle = null;
   reprotectSourceName = '';
-  reprotectOutput = null;
-  reprotectPassword = '';
   const source = document.querySelector('#history-reprotect-source');
   if (source) source.textContent = '선택한 파일 없음';
   const save = document.querySelector('#history-reprotect-save');
@@ -205,6 +204,14 @@ function clearReprotectState() {
 }
 
 function show(view) {
+function discardReprotectOutput() {
+  if (reprotectOutput && reprotectOutput.transferId && token) {
+    request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId: reprotectOutput.transferId })).catch(() => {});
+  }
+  reprotectOutput = null;
+  reprotectPassword = '';
+}
+
   if (managementDialog.open && !confirmAddedCodeDismissal()) return false;
   identityMenu.open = false;
   bridgeForm.hidden = view !== 'bridge';
@@ -226,6 +233,89 @@ async function request(path, body = '', session = token) {
 }
 
 async function refreshIdentity() {
+const backupTransferChunkBytes = 256 * 1024;
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.length)));
+  }
+  return btoa(binary);
+}
+
+async function backupTransferRequest(payload) {
+  const response = await request('/api/history/backup-transfer', JSON.stringify(payload));
+  if (!response.ok) throw new Error((await response.text()) || 'backup transfer failed');
+  return response;
+}
+
+async function uploadBackupFile(file, isCurrent = () => true) {
+  const begin = await backupTransferRequest({ action: 'upload-start' });
+  const { transferId } = await begin.json();
+  try {
+    for (let offset = 0; offset < file.size; offset += backupTransferChunkBytes) {
+      if (!isCurrent()) throw new Error('backup transfer superseded');
+      const bytes = new Uint8Array(await file.slice(offset, offset + backupTransferChunkBytes).arrayBuffer());
+      if (!isCurrent()) throw new Error('backup transfer superseded');
+      const acknowledgement = await backupTransferRequest({
+        action: 'upload-chunk', transferId, offset, data: bytesToBase64(bytes),
+      });
+      const result = await acknowledgement.json();
+      if (result.offset !== offset + bytes.length) throw new Error('backup upload position mismatch');
+    }
+    return transferId;
+  } catch (error) {
+    await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId })).catch(() => {});
+    throw error;
+  }
+}
+
+async function writeBackupTransfer(transferId, size, writable, isCurrent = () => true) {
+  let offset = 0;
+  while (offset < size) {
+    if (!isCurrent()) throw new Error('backup transfer superseded');
+    const response = await backupTransferRequest({ action: 'read', transferId, offset });
+    const chunk = await response.json();
+    if (!isCurrent()) throw new Error('backup transfer superseded');
+    if (chunk.offset !== offset || chunk.transferId !== transferId || typeof chunk.data !== 'string') {
+      throw new Error('invalid backup transfer chunk');
+    }
+    const binary = atob(chunk.data);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    if (!bytes.length || offset + bytes.length > size) throw new Error('invalid backup transfer length');
+    await writable.write(bytes);
+    offset += bytes.length;
+    if (chunk.done !== (offset === size)) throw new Error('incomplete backup transfer');
+  }
+  if (size === 0) throw new Error('empty backup transfer');
+}
+
+async function saveBackupTransfer(action, payload, suggestedName) {
+  if (!window.showSaveFilePicker) {
+    throw new Error('이 브라우저는 대용량 백업을 제한된 메모리로 저장하는 기능을 지원하지 않습니다. Chromium 기반 브라우저에서 다시 시도하세요.');
+  }
+  const outputHandle = await window.showSaveFilePicker({
+    suggestedName,
+    types: [{ description: '암호화 대화 백업', accept: { 'application/octet-stream': ['.adbak'] } }],
+  });
+  const start = await backupTransferRequest({ action, ...payload });
+  const transfer = await start.json();
+  let writable = null;
+  try {
+    writable = await outputHandle.createWritable();
+    await writeBackupTransfer(transfer.transferId, transfer.size, writable);
+    await writable.close();
+    writable = null;
+  } catch (error) {
+    if (writable) { try { await writable.abort(); } catch (_) { /* preserve the selected source file */ } }
+    throw error;
+  } finally {
+    await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId: transfer.transferId })).catch(() => {});
+  }
+  return transfer.size;
+}
+
   const response = await request('/api/identity/status');
   if (response.status === 401) { show('entry'); return false; }
   if (!response.ok) throw new Error('status failed');
@@ -1270,21 +1360,10 @@ document.querySelector('#history-backup-export').addEventListener('click', async
     return;
   }
   try {
-    const response = await request('/api/history/export-backup', JSON.stringify({ peerId: selectedHistoryPeer, password }));
-    if (response.status === 409) { message.textContent = '먼저 해당 대화의 연결을 종료한 뒤 다시 시도하세요.'; return; }
-    if (!response.ok) { message.textContent = '암호화 백업을 만들지 못했습니다.'; return; }
-    const binary = atob(await response.text());
-    const bytes = new Uint8Array(binary.length);
-    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'another-dimension-backup.adbak';
-    link.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    await saveBackupTransfer('export', { peerId: selectedHistoryPeer, password }, 'another-dimension-backup.adbak');
     message.textContent = '암호화 백업 파일을 저장했습니다.';
   } catch (_) {
-    message.textContent = '암호화 백업을 저장하지 못했습니다.';
+    message.textContent = '백업을 저장하지 못했습니다. 저장 위치, 연결 상태와 입력값을 확인하세요.';
   } finally {
     passwordField.value = '';
     confirmationField.value = '';
@@ -1297,19 +1376,9 @@ document.querySelector('#history-bundle-export').addEventListener('click', async
   if (!peerIds.length) { message.textContent = '백업할 대화를 선택하세요.'; return; }
   if (!window.confirm(`선택한 ${peerIds.length}개 대화를 암호화 백업으로 저장할까요?`)) return;
   try {
-    const response = await request('/api/history/export-backup-bundle', JSON.stringify({ peerIds }));
-    if (response.status === 409) { message.textContent = '연결 중인 대화는 종료한 뒤 백업하세요.'; return; }
-    if (!response.ok) throw new Error('bundle export failed');
-    const binary = atob(await response.text());
-    const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
-    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'another-dimension-conversations.adbak';
-    link.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    await saveBackupTransfer('bundle-export', { peerIds }, 'another-dimension-conversations.adbak');
     message.textContent = `${peerIds.length}개 대화의 암호화 백업을 저장했습니다.`;
-  } catch (_) { message.textContent = '대화 백업을 만들지 못했습니다.'; }
+  } catch (_) { message.textContent = '대화 백업을 만들거나 저장하지 못했습니다. 저장 위치와 연결 상태를 확인하세요.'; }
 });
 
 document.querySelector('#history-backup-import').addEventListener('click', async () => {
@@ -1321,29 +1390,21 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     message.textContent = '가져올 백업 파일을 선택하세요.';
     return;
   }
-  if (file.size > 16 * 1024 * 1024) {
-    passwordField.value = '';
-    message.textContent = '백업 파일은 16 MB 이하여야 합니다.';
-    return;
-  }
   if (password && [...password].length < 12) {
     passwordField.value = '';
     message.textContent = '백업 비밀번호는 12자 이상이어야 합니다.';
     return;
   }
   try {
-    const dataUrl = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(file);
-    });
-    const encoded = String(dataUrl).slice(String(dataUrl).indexOf(',') + 1);
-    const header = atob(encoded.slice(0, 16));
-    const backupMagic = header.slice(0, 8);
-    if ((backupMagic === 'ADBACK5\0' || backupMagic === 'ADPACK1\0')
+  let transferId = null;
+    const header = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+    const backupMagic = new TextDecoder().decode(header);
+    if ((backupMagic === 'ADBACK5\0' || backupMagic === 'ADBACK6\0'
+      || backupMagic === 'ADPACK1\0' || backupMagic === 'ADPACK2\0')
       && !window.confirm('이 백업에는 이전 신원 연결 정보가 포함될 수 있습니다. 파일 인증에 성공한 경우에만 해당 관계를 이 기기에 복원합니다. 계속할까요?')) return;
-    const response = await request('/api/history/import-backup', JSON.stringify({ backup: encoded, password }));
+    transferId = await uploadBackupFile(file);
+    const response = await request('/api/history/backup-transfer', JSON.stringify({ action: 'import', transferId, password }));
+    transferId = null;
     if (response.status === 409) { message.textContent = '먼저 모든 대화 연결을 종료한 뒤 다시 시도하세요.'; return; }
     if (!response.ok) { message.textContent = (await response.text()) || '백업을 검증하거나 저장하지 못했습니다.'; return; }
     const result = await response.json();
@@ -1359,9 +1420,10 @@ document.querySelector('#history-backup-import').addEventListener('click', async
         : '백업을 확인해 기존 기록과 병합했습니다.';
     }
   } catch (_) {
-    message.textContent = '백업 파일을 읽지 못했습니다.';
+    message.textContent = '백업 파일을 읽거나 검증·저장하지 못했습니다. 기존 기록과 선택한 원본 파일은 보존됩니다.';
   } finally {
     passwordField.value = '';
+    if (transferId) await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId })).catch(() => {});
   }
 });
 
@@ -1381,14 +1443,9 @@ document.querySelector('#history-reprotect-choose').addEventListener('click', as
     if (!reprotectWork.isCurrent(generation)) return;
     const file = await handle.getFile();
     if (!reprotectWork.isCurrent(generation)) return;
-    if (file.size > 16 * 1024 * 1024) {
-      message.textContent = '백업 파일은 16 MB 이하여야 합니다.';
-      return;
-    }
     reprotectSourceHandle = handle;
     reprotectSourceName = file.name;
-    reprotectOutput = null;
-    reprotectPassword = '';
+    discardReprotectOutput();
     document.querySelector('#history-reprotect-save').disabled = true;
     document.querySelector('#history-reprotect-source').textContent = `${file.name} (${file.size.toLocaleString()} bytes)`;
     message.textContent = '이전 백업 파일을 선택했습니다.';
@@ -1410,8 +1467,7 @@ document.querySelector('#history-reprotect').addEventListener('click', async () 
   const sourceHandle = reprotectSourceHandle;
 
   // Invalidate any prior output before validation or asynchronous work.
-  reprotectOutput = null;
-  reprotectPassword = '';
+  discardReprotectOutput();
   document.querySelector('#history-reprotect-save').disabled = true;
 
   if (!sourceHandle) {
@@ -1429,25 +1485,23 @@ document.querySelector('#history-reprotect').addEventListener('click', async () 
   try {
     const file = await sourceHandle.getFile();
     if (!reprotectWork.isCurrent(generation)) return;
-    if (file.size > 16 * 1024 * 1024) throw new Error('oversized backup');
-    const dataUrl = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(file);
-    });
-    if (!reprotectWork.isCurrent(generation)) return;
-    const backup = String(dataUrl).slice(String(dataUrl).indexOf(',') + 1);
-    const response = await request('/api/history/reprotect-backup', JSON.stringify({
-      backup,
+    const transferId = await uploadBackupFile(file, () => reprotectWork.isCurrent(generation));
+    if (!reprotectWork.isCurrent(generation)) {
+      await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId })).catch(() => {});
+      return;
+    }
+    const response = await request('/api/history/backup-transfer', JSON.stringify({
+      action: 'reprotect', transferId,
       previousCode,
       previousPassword,
       replacementPassword,
     }));
-    if (!reprotectWork.isCurrent(generation)) return;
     if (!response.ok) throw new Error('reprotect failed');
-    const output = await response.text();
-    if (!reprotectWork.isCurrent(generation)) return;
+    const output = await response.json();
+    if (!reprotectWork.isCurrent(generation)) {
+      if (output.transferId) await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId: output.transferId })).catch(() => {});
+      return;
+    }
     reprotectOutput = output;
     reprotectPassword = replacementPassword;
     document.querySelector('#history-reprotect-save').disabled = false;
@@ -1488,16 +1542,13 @@ document.querySelector('#history-reprotect-save').addEventListener('click', asyn
     }
     if (!isCurrent()) return;
     saveStarted = true;
-    const binary = atob(output);
-    const bytes = new Uint8Array(binary.length);
-    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
     writable = await outputHandle.createWritable();
     if (!isCurrent()) {
       await writable.abort();
       writable = null;
       return;
     }
-    await writable.write(bytes);
+    await writeBackupTransfer(output.transferId, output.size, writable, isCurrent);
     if (!isCurrent()) {
       await writable.abort();
       writable = null;
@@ -1509,23 +1560,17 @@ document.querySelector('#history-reprotect-save').addEventListener('click', asyn
 
     const savedFile = await outputHandle.getFile();
     if (!isCurrent()) return;
-    const dataUrl = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(savedFile);
-    });
-    if (!isCurrent()) return;
-    const savedBackup = String(dataUrl).slice(String(dataUrl).indexOf(',') + 1);
-    const verification = await request('/api/history/verify-backup', JSON.stringify({
-      backup: savedBackup,
-      password,
+    const verificationId = await uploadBackupFile(savedFile, isCurrent);
+    const verification = await request('/api/history/backup-transfer', JSON.stringify({
+      action: 'verify', transferId: verificationId, password,
     }));
     if (!isCurrent()) return;
+    await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId: verificationId })).catch(() => {});
     if (!verification.ok) throw new Error('saved backup verification failed');
     const result = await verification.json();
     if (!isCurrent()) return;
     reprotectOutput = null;
+    await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId: output.transferId })).catch(() => {});
     reprotectPassword = '';
     document.querySelector('#history-reprotect-save').disabled = true;
     const removeSource = window.confirm(
@@ -1545,8 +1590,7 @@ document.querySelector('#history-reprotect-save').addEventListener('click', asyn
     if (!isCurrent()) return;
     if (error.name !== 'AbortError') {
       if (saveStarted) {
-        reprotectOutput = null;
-        reprotectPassword = '';
+        discardReprotectOutput();
         document.querySelector('#history-reprotect-save').disabled = true;
       }
       message.textContent = '새 파일을 저장하거나 다시 확인하지 못했습니다. 원본은 보존되어 있습니다. 새 파일은 확인되지 않은 상태입니다.';

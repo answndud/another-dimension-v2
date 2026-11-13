@@ -26,14 +26,16 @@ const BACKUP_PASSWORD_MAGIC: &[u8; 8] = b"ADBACK2\0";
 const BACKUP_COMBINED_MAGIC: &[u8; 8] = b"ADBACK3\0";
 const BACKUP_SIGNED_MAGIC: &[u8; 8] = b"ADBACK4\0";
 const BACKUP_LINKED_MAGIC: &[u8; 8] = b"ADBACK5\0";
+const BACKUP_STREAM_MAGIC: &[u8; 8] = b"ADBACK6\0";
 const BACKUP_LINKS_TRAILER: &[u8; 8] = b"ADLNK1\0\0";
 const BACKUP_BUNDLE_MAGIC: &[u8; 8] = b"ADPACK1\0";
+const BACKUP_STREAM_BUNDLE_MAGIC: &[u8; 8] = b"ADPACK2\0";
 const LINKED_KEYS_MAGIC: &[u8; 8] = b"ADLKEY1\0";
 const RESTORE_STAGING_MAGIC: &[u8; 8] = b"ADRSTG1\0";
 const TRANSFER_MAGIC: &[u8; 6] = b"ADREC1";
 const TRANSFER_CHUNK_MAGIC: &[u8; 5] = b"ADCH1";
 const MESSAGE_MAGIC: &[u8; 6] = b"ADMSG1";
-const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LEGACY_BACKUP_BYTES: usize = 16 * 1024 * 1024;
 const BACKUP_SALT_BYTES: usize = 16;
 pub(crate) const IDENTITY_EVENT_PREFIX: &str = "[AD2-IDENTITY-EVENT/1] ";
 static INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -977,6 +979,72 @@ impl History {
         Ok((history, messages, recovered_header || recovered_partial))
     }
 
+    fn open_for_streaming_merge(identity: &Identity, peer_id: &str) -> io::Result<Self> {
+        validate_peer_id(peer_id)?;
+        let identity_id = identity.public_id();
+        let peer_id = peer_id.to_ascii_lowercase();
+        let key = identity.storage_key();
+        let directory = data_directory()?.join(&identity_id);
+        create_dir_all(&directory)?;
+        set_private_directory(&directory)?;
+        let operation_lock = conversation_operation_lock(&identity_id, &peer_id)?;
+        let operation_guard = operation_lock
+            .lock()
+            .map_err(|_| io::Error::other("conversation lock unavailable"))?;
+        let file_lock = acquire_conversation_file_lock(identity, &peer_id)?;
+        let path = directory.join(format!(
+            "{}.adlog",
+            opaque_conversation_name(&derive_index_key(&key), &peer_id)
+        ));
+        cleanup_orphaned_restore_outputs(&directory, &path)?;
+        if !path.exists()
+            && read_index(identity, &identity_id, &directory)?
+                .iter()
+                .any(|existing| existing == &peer_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("indexed conversation file is missing: {}", path.display()),
+            ));
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
+        set_private_file(&file)?;
+        if file.metadata()?.len() == 0 {
+            file.write_all(MAGIC)?;
+            file.sync_data()?;
+        }
+        let mut reader = open_history_reader(
+            path.clone(),
+            Zeroizing::new(*key),
+            identity_id.clone(),
+            peer_id.clone(),
+        )?;
+        let mut next_index = 0u64;
+        while reader.next_record()?.is_some() {
+            next_index = next_index
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("history record index overflow"))?;
+        }
+        let file_version = history_file_version(&file)?;
+        register_conversation(identity, &identity_id, &peer_id, &directory)?;
+        unlock_conversation_file(file_lock);
+        drop(operation_guard);
+        Ok(Self {
+            file,
+            path,
+            key,
+            identity_id,
+            peer_id,
+            next_index,
+            file_version,
+            operation_lock,
+        })
+    }
+
     pub fn append(&mut self, message: &StoredMessage) -> io::Result<()> {
         let operation_lock = Arc::clone(&self.operation_lock);
         let _operation_guard = operation_lock
@@ -1717,6 +1785,7 @@ impl History {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn export_backup(
         identity: &Identity,
         peer_id: &str,
@@ -1726,8 +1795,219 @@ impl History {
         encode_backup(identity, peer_id, &messages, password)
     }
 
+    /// Write a versioned, independently authenticated backup frame by frame.
+    /// The largest plaintext buffer is one stored message plus its AEAD tag.
+    pub(crate) fn export_backup_stream<W: Write>(
+        identity: &Identity,
+        peer_id: &str,
+        password: Option<&str>,
+        output: &mut W,
+    ) -> io::Result<u64> {
+        let links = backup_links_for(identity, peer_id)?;
+        let mut reader = Self::reader_for_identity_copy(identity, peer_id)?;
+        let mut writer = BackupStreamWriter::new(identity, peer_id, password, &links, output)?;
+        let mut count = 0u64;
+        while let Some(message) = reader.next_record()? {
+            writer.write_message(&message)?;
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("backup message count overflow"))?;
+        }
+        writer.finish(count, &links)?;
+        Ok(count)
+    }
+
+    /// ADPACK2 stores independently authenticated ADBACK6 children. A child
+    /// is first written to a private temporary file so its length can be
+    /// emitted without buffering the backup in memory.
+    pub(crate) fn export_backup_bundle_stream<W: Write>(
+        identity: &Identity,
+        peer_ids: &[String],
+        output: &mut W,
+    ) -> io::Result<()> {
+        if peer_ids.is_empty() || peer_ids.len() > 128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid conversation selection",
+            ));
+        }
+        let mut unique = HashSet::new();
+        for peer_id in peer_ids {
+            validate_peer_id(peer_id)?;
+            if !unique.insert(peer_id.to_ascii_lowercase()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate conversation",
+                ));
+            }
+        }
+        let directory = Self::backup_transfer_directory(identity)?;
+        let suffix = hex_encode(&random_nonce()?);
+        let child_path = directory.join(format!("bundle-child-{suffix}.tmp"));
+        let result = (|| {
+            output.write_all(BACKUP_STREAM_BUNDLE_MAGIC)?;
+            output.write_all(&(peer_ids.len() as u32).to_be_bytes())?;
+            for peer_id in peer_ids {
+                let mut child = OpenOptions::new()
+                    .create_new(true)
+                    .read(true)
+                    .write(true)
+                    .open(&child_path)?;
+                set_private_file(&child)?;
+                Self::export_backup_stream(identity, peer_id, None, &mut child)?;
+                child.flush()?;
+                child.sync_all()?;
+                let length = child.metadata()?.len();
+                output.write_all(&length.to_be_bytes())?;
+                child.seek(SeekFrom::Start(0))?;
+                io::copy(&mut child, output)?;
+                drop(child);
+                std::fs::remove_file(&child_path)?;
+            }
+            output.flush()
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(child_path);
+        }
+        result
+    }
+
+    pub(crate) fn backup_transfer_directory(identity: &Identity) -> io::Result<PathBuf> {
+        let directory = data_directory()?
+            .join(identity.public_id())
+            .join(".backup-transfer");
+        create_dir_all(&directory)?;
+        set_private_directory(&directory)?;
+        Ok(directory)
+    }
+
+    pub(crate) fn import_backup_file(
+        identity: &Identity,
+        path: &std::path::Path,
+        password: Option<&str>,
+    ) -> io::Result<Vec<(String, usize, bool)>> {
+        let mut file = File::open(path)?;
+        let mut magic = [0; 8];
+        file.read_exact(&mut magic)?;
+        file.seek(SeekFrom::Start(0))?;
+        if &magic == BACKUP_STREAM_MAGIC {
+            let (peer_id, mut staging, links) =
+                decode_backup_stream(identity, &mut file, password)?;
+            ensure_stream_eof(&mut file)?;
+            let count = staging.count();
+            import_verified_staging(identity, &peer_id, &mut staging, &links)?;
+            staging.cleanup()?;
+            return Ok(vec![(
+                peer_id,
+                count as usize,
+                !links.local.is_empty() || !links.peer.is_empty(),
+            )]);
+        }
+        if &magic == BACKUP_STREAM_BUNDLE_MAGIC {
+            return import_backup_bundle_stream(identity, &mut file);
+        }
+        let length = file.metadata()?.len();
+        if length > MAX_LEGACY_BACKUP_BYTES as u64 {
+            return Err(invalid_data(
+                "legacy backup exceeds the supported 16 MiB format limit",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(length as usize);
+        file.read_to_end(&mut bytes)?;
+        if bytes.starts_with(BACKUP_BUNDLE_MAGIC) {
+            return Self::import_backup_bundle_with_info(identity, &bytes);
+        }
+        Ok(vec![Self::import_backup_with_info(
+            identity, &bytes, password,
+        )?])
+    }
+
+    pub(crate) fn verify_backup_file(
+        identity: &Identity,
+        path: &std::path::Path,
+        password: Option<&str>,
+    ) -> io::Result<(String, u64)> {
+        let mut file = File::open(path)?;
+        let mut magic = [0; 8];
+        file.read_exact(&mut magic)?;
+        file.seek(SeekFrom::Start(0))?;
+        if &magic == BACKUP_STREAM_MAGIC {
+            let (peer_id, staging, _) = decode_backup_stream(identity, &mut file, password)?;
+            ensure_stream_eof(&mut file)?;
+            let result = (peer_id, staging.count());
+            staging.cleanup()?;
+            return Ok(result);
+        }
+        let length = file.metadata()?.len();
+        if length > MAX_LEGACY_BACKUP_BYTES as u64 {
+            return Err(invalid_data(
+                "legacy backup exceeds the supported 16 MiB format limit",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(length as usize);
+        file.read_to_end(&mut bytes)?;
+        let (peer_id, count) = Self::verify_backup(identity, &bytes, password)?;
+        Ok((peer_id, count as u64))
+    }
+
+    pub(crate) fn reprotect_backup_file(
+        previous_identity: &Identity,
+        replacement_identity: &Identity,
+        source: &std::path::Path,
+        output: &mut File,
+        previous_password: Option<&str>,
+        replacement_password: Option<&str>,
+    ) -> io::Result<u64> {
+        let mut input = File::open(source)?;
+        let mut magic = [0; 8];
+        input.read_exact(&mut magic)?;
+        input.seek(SeekFrom::Start(0))?;
+        if &magic != BACKUP_STREAM_MAGIC {
+            let length = input.metadata()?.len();
+            if length > MAX_LEGACY_BACKUP_BYTES as u64 {
+                return Err(invalid_data(
+                    "legacy backup exceeds the supported 16 MiB format limit",
+                ));
+            }
+            let mut bytes = Vec::with_capacity(length as usize);
+            input.read_to_end(&mut bytes)?;
+            let bytes = Self::reprotect_backup(
+                previous_identity,
+                replacement_identity,
+                &bytes,
+                previous_password,
+                replacement_password,
+            )?;
+            output.write_all(&bytes)?;
+            return Ok(0);
+        }
+        let (peer_id, mut staging, mut links) =
+            decode_backup_stream(previous_identity, &mut input, previous_password)?;
+        ensure_stream_eof(&mut input)?;
+        let previous_id = previous_identity.public_id();
+        let replacement_id = replacement_identity.public_id();
+        if previous_id != replacement_id {
+            if !links.origins.contains(&previous_id) {
+                links.origins.push(previous_id.clone());
+            }
+            links.local.insert(previous_id);
+        }
+        let count = staging.count();
+        export_staging_stream(
+            replacement_identity,
+            &peer_id,
+            replacement_password,
+            &links,
+            &mut staging,
+            output,
+        )?;
+        staging.cleanup()?;
+        Ok(count)
+    }
+
     /// Bundle separately authenticated conversation backups. Each child stays
     /// encrypted with the existing backup format, preserving import compatibility.
+    #[cfg(test)]
     pub fn export_backup_bundle(identity: &Identity, peer_ids: &[String]) -> io::Result<Vec<u8>> {
         if peer_ids.is_empty() || peer_ids.len() > 128 {
             return Err(io::Error::new(
@@ -1750,7 +2030,7 @@ impl History {
             let backup = Self::export_backup(identity, peer_id, None)?;
             let backup_len = u32::try_from(backup.len())
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "backup is too large"))?;
-            if bundle.len().saturating_add(4 + backup.len()) > MAX_BACKUP_BYTES {
+            if bundle.len().saturating_add(4 + backup.len()) > MAX_LEGACY_BACKUP_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "backup bundle is too large",
@@ -1776,7 +2056,7 @@ impl History {
         identity: &Identity,
         bundle: &[u8],
     ) -> io::Result<Vec<(String, usize, bool)>> {
-        if bundle.len() > MAX_BACKUP_BYTES
+        if bundle.len() > MAX_LEGACY_BACKUP_BYTES
             || !bundle.starts_with(BACKUP_BUNDLE_MAGIC)
             || bundle.len() < 12
         {
@@ -1797,7 +2077,7 @@ impl History {
                 u32::from_be_bytes(bundle[cursor..cursor + 4].try_into().expect("fixed slice"))
                     as usize;
             cursor += 4;
-            if len > MAX_BACKUP_BYTES || bundle.len().saturating_sub(cursor) < len {
+            if len > MAX_LEGACY_BACKUP_BYTES || bundle.len().saturating_sub(cursor) < len {
                 return Err(invalid_data("truncated backup bundle"));
             }
             let (peer_id, messages, _) =
@@ -2152,6 +2432,423 @@ fn encode_backup(
     encode_backup_with_links(identity, peer_id, messages, password, &links)
 }
 
+struct BackupStreamWriter<'a, W> {
+    peer: [u8; 32],
+    key: Zeroizing<[u8; 32]>,
+    aad: Vec<u8>,
+    output: &'a mut W,
+    count: u64,
+}
+
+impl<'a, W: Write> BackupStreamWriter<'a, W> {
+    fn new(
+        identity: &'a Identity,
+        peer_id: &str,
+        password: Option<&str>,
+        links: &BackupLinks,
+        output: &'a mut W,
+    ) -> io::Result<Self> {
+        validate_backup_links(peer_id, links)?;
+        if let Some(password) = password {
+            validate_backup_password(password)?;
+        }
+        let peer = decode_peer_id(peer_id)?;
+        let mut salt = [0; BACKUP_SALT_BYTES];
+        if password.is_some() {
+            File::open("/dev/urandom")?.read_exact(&mut salt)?;
+        }
+        let mut header = Vec::with_capacity(8 + 1 + BACKUP_SALT_BYTES + 32);
+        header.extend_from_slice(BACKUP_STREAM_MAGIC);
+        header.push(u8::from(password.is_some()));
+        if password.is_some() {
+            header.extend_from_slice(&salt);
+        }
+        header.extend_from_slice(&peer);
+        output.write_all(&header)?;
+        let key = match password {
+            Some(password) => {
+                let password_key = derive_password_backup_key(password, &salt)?;
+                derive_combined_backup_key(&identity.storage_key(), &password_key)
+            }
+            None => derive_backup_key(&identity.storage_key()),
+        };
+        let mut aad = backup_aad(
+            identity,
+            BACKUP_STREAM_MAGIC,
+            password.is_some().then_some(&salt),
+        );
+        aad.push(u8::from(password.is_some()));
+        aad.extend_from_slice(&peer);
+        Ok(Self {
+            peer,
+            key,
+            aad,
+            output,
+            count: 0,
+        })
+    }
+
+    fn write_message(&mut self, message: &StoredMessage) -> io::Result<()> {
+        let plain = encode_history_plain(message)?;
+        self.write_frame(1, self.count, &plain)?;
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("backup message count overflow"))?;
+        Ok(())
+    }
+
+    fn finish(&mut self, expected_count: u64, links: &BackupLinks) -> io::Result<()> {
+        if expected_count != self.count {
+            return Err(invalid_data("backup snapshot count changed"));
+        }
+        let peer_id = hex_encode(&self.peer);
+        validate_backup_links(&peer_id, links)?;
+        let trailer = encode_backup_links(links)?;
+        self.write_frame(0, self.count, &trailer)?;
+        self.output.flush()
+    }
+
+    fn write_frame(&mut self, kind: u8, index: u64, plain: &[u8]) -> io::Result<()> {
+        let nonce = random_nonce()?;
+        let cipher = ChaCha20Poly1305::new_from_slice(self.key.as_ref())
+            .map_err(|_| io::Error::other("backup key unavailable"))?;
+        let encrypted = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plain,
+                    aad: &backup_stream_frame_aad(&self.aad, kind, index),
+                },
+            )
+            .map_err(|_| io::Error::other("backup frame encryption failed"))?;
+        let length = u32::try_from(encrypted.len())
+            .map_err(|_| invalid_data("backup frame is too large"))?;
+        self.output.write_all(&[kind])?;
+        self.output.write_all(&index.to_be_bytes())?;
+        self.output.write_all(&nonce)?;
+        self.output.write_all(&length.to_be_bytes())?;
+        self.output.write_all(&encrypted)
+    }
+}
+
+fn backup_stream_frame_aad(base: &[u8], kind: u8, index: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(base.len() + 9);
+    aad.extend_from_slice(base);
+    aad.push(kind);
+    aad.extend_from_slice(&index.to_be_bytes());
+    aad
+}
+
+fn validate_backup_links(peer_id: &str, links: &BackupLinks) -> io::Result<()> {
+    if links.local.len() > 32 || links.peer.len() > 32 || links.origins.len() > 32 {
+        return Err(invalid_data("too many linked identity records"));
+    }
+    if links.peer.iter().any(|id| id.eq_ignore_ascii_case(peer_id))
+        || links.local.iter().any(|id| !links.origins.contains(id))
+        || !links.local.is_disjoint(&links.peer)
+    {
+        return Err(invalid_data("invalid linked identity backup relationships"));
+    }
+    Ok(())
+}
+
+fn encode_backup_links(links: &BackupLinks) -> io::Result<Vec<u8>> {
+    if links.local.len() > 32
+        || links.peer.len() > 32
+        || links.origins.len() > 32
+        || links.local.iter().any(|id| !links.origins.contains(id))
+        || !links.local.is_disjoint(&links.peer)
+    {
+        return Err(invalid_data("invalid linked identity backup relationships"));
+    }
+    let mut encoded =
+        Vec::with_capacity(11 + (links.local.len() + links.peer.len() + links.origins.len()) * 32);
+    encoded.extend_from_slice(BACKUP_LINKS_TRAILER);
+    encoded.push(links.local.len() as u8);
+    encoded.push(links.peer.len() as u8);
+    encoded.push(links.origins.len() as u8);
+    for id in links.local.iter().chain(&links.peer).chain(&links.origins) {
+        encoded.extend_from_slice(&decode_peer_id(id)?);
+    }
+    Ok(encoded)
+}
+
+fn decode_backup_links(
+    encoded: &[u8],
+    peer_id: &str,
+    identity: &Identity,
+) -> io::Result<BackupLinks> {
+    if encoded.len() < 11 || !encoded.starts_with(BACKUP_LINKS_TRAILER) {
+        return Err(invalid_data("missing backup relationship trailer"));
+    }
+    let local_count = encoded[8] as usize;
+    let peer_count = encoded[9] as usize;
+    let origin_count = encoded[10] as usize;
+    let records = local_count + peer_count + origin_count;
+    if local_count > 32
+        || peer_count > 32
+        || origin_count > 32
+        || encoded.len() != 11 + records * 32
+    {
+        return Err(invalid_data("invalid backup relationship trailer"));
+    }
+    let mut links = BackupLinks::default();
+    let mut cursor = 11;
+    for index in 0..records {
+        let id = hex_encode(&encoded[cursor..cursor + 32]);
+        cursor += 32;
+        if index < local_count {
+            links.local.insert(id);
+        } else if index < local_count + peer_count {
+            links.peer.insert(id);
+        } else {
+            links.origins.push(id);
+        }
+    }
+    if links.local.len() != local_count
+        || links.peer.len() != peer_count
+        || links.origins.iter().collect::<HashSet<_>>().len() != links.origins.len()
+        || links.origins.contains(&identity.public_id())
+        || links.local.iter().any(|id| !links.origins.contains(id))
+        || !links.local.is_disjoint(&links.peer)
+        || links.peer.iter().any(|id| id == peer_id)
+    {
+        return Err(invalid_data("conflicting linked identity backup records"));
+    }
+    Ok(links)
+}
+
+fn decode_backup_stream<R: Read>(
+    identity: &Identity,
+    input: &mut R,
+    password: Option<&str>,
+) -> io::Result<(String, RestoreStaging, BackupLinks)> {
+    let mut magic = [0; 8];
+    input.read_exact(&mut magic)?;
+    if &magic != BACKUP_STREAM_MAGIC {
+        return Err(invalid_data("unsupported backup format"));
+    }
+    let mut flags = [0; 1];
+    input.read_exact(&mut flags)?;
+    if flags[0] > 1 || (flags[0] == 1) != password.is_some() {
+        return Err(invalid_data("backup password does not match format"));
+    }
+    let salt = if flags[0] == 1 {
+        let mut salt = [0; BACKUP_SALT_BYTES];
+        input.read_exact(&mut salt)?;
+        Some(salt)
+    } else {
+        None
+    };
+    if let Some(password) = password {
+        validate_backup_password(password)?;
+    }
+    let mut peer = [0; 32];
+    input.read_exact(&mut peer)?;
+    let peer_id = hex_encode(&peer);
+    let key = match (password, salt.as_ref()) {
+        (Some(password), Some(salt)) => {
+            let password_key = derive_password_backup_key(password, salt)?;
+            derive_combined_backup_key(&identity.storage_key(), &password_key)
+        }
+        (None, None) => derive_backup_key(&identity.storage_key()),
+        _ => return Err(invalid_data("invalid backup password header")),
+    };
+    let mut base_aad = backup_aad(identity, BACKUP_STREAM_MAGIC, salt.as_ref());
+    base_aad.push(flags[0]);
+    base_aad.extend_from_slice(&peer);
+    let request_id = format!(
+        "{}{}{}",
+        hex_encode(&random_nonce()?),
+        hex_encode(&random_nonce()?),
+        hex_encode(&random_nonce()?)
+    )[..64]
+        .to_owned();
+    let mut staging = RestoreStaging::create(identity, &peer_id, &request_id)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
+        .map_err(|_| invalid_data("invalid backup key"))?;
+    let mut count = 0u64;
+    let links = loop {
+        let mut frame_header = [0; 1 + 8 + NONCE_BYTES + 4];
+        input.read_exact(&mut frame_header)?;
+        let kind = frame_header[0];
+        let index = u64::from_be_bytes(frame_header[1..9].try_into().expect("fixed slice"));
+        let nonce = &frame_header[9..9 + NONCE_BYTES];
+        let length = u32::from_be_bytes(
+            frame_header[9 + NONCE_BYTES..]
+                .try_into()
+                .expect("fixed slice"),
+        ) as usize;
+        if length < 16 || length > MAX_MESSAGE_BYTES + 256 {
+            return Err(invalid_data("invalid backup frame length"));
+        }
+        let mut encrypted = vec![0; length];
+        input.read_exact(&mut encrypted)?;
+        let plain = Zeroizing::new(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(nonce),
+                    Payload {
+                        msg: &encrypted,
+                        aad: &backup_stream_frame_aad(&base_aad, kind, index),
+                    },
+                )
+                .map_err(|_| invalid_data("backup frame authentication failed"))?,
+        );
+        match kind {
+            1 if index == count => {
+                let message = decode_history_plain(&plain, false)?;
+                staging.append_verified(&message)?;
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("backup message count overflow"))?;
+            }
+            0 if index == count => break decode_backup_links(&plain, &peer_id, identity)?,
+            _ => return Err(invalid_data("backup frame order is invalid")),
+        }
+    };
+    staging.finish()?;
+    verify_stream_staged_proofs(identity, &peer_id, &mut staging, &links)?;
+    Ok((peer_id, staging, links))
+}
+
+fn ensure_stream_eof<R: Read>(input: &mut R) -> io::Result<()> {
+    let mut trailing = [0; 1];
+    if input.read(&mut trailing)? != 0 {
+        return Err(invalid_data("unexpected data after backup"));
+    }
+    Ok(())
+}
+
+fn verify_stream_staged_proofs(
+    identity: &Identity,
+    peer_id: &str,
+    staging: &mut RestoreStaging,
+    links: &BackupLinks,
+) -> io::Result<()> {
+    let previous_local_ids = crate::identity::previous_public_ids(identity)?;
+    let (stored_local, stored_peer) = read_linked_keys(identity, peer_id)?;
+    let mut local_ids: HashSet<_> = previous_local_ids.into_iter().collect();
+    local_ids.extend(links.origins.iter().cloned());
+    let local_aliases = stored_local
+        .into_iter()
+        .chain(links.local.iter().cloned())
+        .filter(|id| local_ids.contains(id))
+        .map(|id| decode_peer_id(&id))
+        .collect::<io::Result<Vec<_>>>()?;
+    let peer_aliases = stored_peer
+        .into_iter()
+        .chain(links.peer.iter().cloned())
+        .map(|id| decode_peer_id(&id))
+        .collect::<io::Result<Vec<_>>>()?;
+    staging.rewind()?;
+    while let Some(message) = staging.next_record()? {
+        if message.proof.is_some() {
+            verify_stored_proof(identity, peer_id, &message, &local_aliases, &peer_aliases)?;
+        }
+    }
+    staging.rewind()
+}
+
+fn export_staging_stream<W: Write>(
+    identity: &Identity,
+    peer_id: &str,
+    password: Option<&str>,
+    links: &BackupLinks,
+    staging: &mut RestoreStaging,
+    output: &mut W,
+) -> io::Result<()> {
+    let mut writer = BackupStreamWriter::new(identity, peer_id, password, links, output)?;
+    staging.rewind()?;
+    while let Some(message) = staging.next_record()? {
+        writer.write_message(&message)?;
+    }
+    writer.finish(staging.count(), links)
+}
+
+fn import_verified_staging(
+    identity: &Identity,
+    peer_id: &str,
+    staging: &mut RestoreStaging,
+    links: &BackupLinks,
+) -> io::Result<()> {
+    let old_links = read_linked_keys(identity, peer_id)?;
+    let old_origins = crate::identity::previous_public_ids(identity)?;
+    let has_links = !links.local.is_empty() || !links.peer.is_empty() || !links.origins.is_empty();
+    if has_links {
+        apply_backup_links(identity, peer_id, links)?;
+    }
+    let result = (|| {
+        let mut history = History::open_for_streaming_merge(identity, peer_id)?;
+        history.merge_restore_staging(identity, staging)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if has_links {
+            let relationship_rollback = write_linked_keys(identity, peer_id, &old_links);
+            let lineage_rollback =
+                crate::identity::replace_previous_public_ids(identity, &old_origins);
+            if relationship_rollback.is_err() || lineage_rollback.is_err() {
+                return Err(io::Error::other(format!(
+                    "backup import failed ({error}); relationship rollback failed ({}); lineage rollback failed ({})",
+                    relationship_rollback.err().map_or_else(|| "succeeded".to_owned(), |e| e.to_string()),
+                    lineage_rollback.err().map_or_else(|| "succeeded".to_owned(), |e| e.to_string()),
+                )));
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn import_backup_bundle_stream<R: Read>(
+    identity: &Identity,
+    input: &mut R,
+) -> io::Result<Vec<(String, usize, bool)>> {
+    let mut magic = [0; 8];
+    input.read_exact(&mut magic)?;
+    if &magic != BACKUP_STREAM_BUNDLE_MAGIC {
+        return Err(invalid_data("invalid backup bundle"));
+    }
+    let mut count_bytes = [0; 4];
+    input.read_exact(&mut count_bytes)?;
+    let count = u32::from_be_bytes(count_bytes) as usize;
+    if count == 0 || count > 128 {
+        return Err(invalid_data("invalid backup bundle count"));
+    }
+    let mut imported = Vec::with_capacity(count);
+    let mut unique = HashSet::new();
+    for _ in 0..count {
+        let mut len_bytes = [0; 8];
+        input.read_exact(&mut len_bytes)?;
+        let length = u64::from_be_bytes(len_bytes);
+        if length < 8 + 1 + 32 + 1 + 8 + NONCE_BYTES as u64 + 4 + 27 {
+            return Err(invalid_data("truncated backup bundle child"));
+        }
+        let mut child = input.take(length);
+        let (peer_id, mut staging, links) = decode_backup_stream(identity, &mut child, None)?;
+        if child.limit() != 0 {
+            return Err(invalid_data("unexpected data in backup bundle child"));
+        }
+        if !unique.insert(peer_id.clone()) {
+            return Err(invalid_data("duplicate conversation in backup bundle"));
+        }
+        let message_count = staging.count() as usize;
+        let has_links = !links.local.is_empty() || !links.peer.is_empty();
+        import_verified_staging(identity, &peer_id, &mut staging, &links).map_err(|error| {
+            io::Error::other(format!(
+                "backup bundle stopped after {} conversations; {error}",
+                imported.len()
+            ))
+        })?;
+        staging.cleanup()?;
+        imported.push((peer_id, message_count, has_links));
+    }
+    ensure_stream_eof(input)?;
+    Ok(imported)
+}
+
 fn backup_links_for(identity: &Identity, peer_id: &str) -> io::Result<BackupLinks> {
     let (local, peer) = read_linked_keys(identity, peer_id)?;
     let origins = crate::identity::previous_public_ids(identity)?;
@@ -2259,7 +2956,7 @@ fn encode_backup_with_links(
             }
             None => payload.push(0),
         }
-        if payload.len().saturating_add(header_len + 16) > MAX_BACKUP_BYTES {
+        if payload.len().saturating_add(header_len + 16) > MAX_LEGACY_BACKUP_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "backup is too large",
@@ -2282,7 +2979,7 @@ fn encode_backup_with_links(
     for id in &links.origins {
         payload.extend_from_slice(&decode_peer_id(id)?);
     }
-    if payload.len().saturating_add(header_len + 16) > MAX_BACKUP_BYTES {
+    if payload.len().saturating_add(header_len + 16) > MAX_LEGACY_BACKUP_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "backup is too large",
@@ -2339,7 +3036,9 @@ fn decode_backup_with_links(
     backup: &[u8],
     password: Option<&str>,
 ) -> io::Result<(String, Vec<StoredMessage>, BackupLinks)> {
-    if backup.len() > MAX_BACKUP_BYTES || backup.len() < BACKUP_MAGIC.len() + NONCE_BYTES + 16 {
+    if backup.len() > MAX_LEGACY_BACKUP_BYTES
+        || backup.len() < BACKUP_MAGIC.len() + NONCE_BYTES + 16
+    {
         return Err(invalid_data("invalid backup file"));
     }
     let magic = &backup[..BACKUP_MAGIC.len()];
@@ -4119,8 +4818,8 @@ fn wait_history_delete_test_gate() {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_peer_id, History, MessageSender, RestoreStaging, StoredMessage, MAX_BACKUP_BYTES,
-        MAX_MESSAGE_BYTES,
+        decode_peer_id, History, MessageSender, RestoreStaging, StoredMessage,
+        MAX_LEGACY_BACKUP_BYTES, MAX_MESSAGE_BYTES,
     };
     use crate::identity::Identity;
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -6207,19 +6906,196 @@ mod tests {
     }
 
     #[test]
+    fn streaming_backup_import_bundle_and_reprotection_exceed_legacy_limit() {
+        let data = IsolatedData::new();
+        let (identity, identity_code) = Identity::create().unwrap();
+        let peer = "c9".repeat(32);
+        let empty_peer = "ca".repeat(32);
+        let long_text = "m".repeat(MAX_MESSAGE_BYTES);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        for index in 0..4_200 {
+            history.append(&message(index, &long_text)).unwrap();
+        }
+        History::open(&identity, &empty_peer).unwrap();
+
+        let transfer_dir = History::backup_transfer_directory(&identity).unwrap();
+        let single_path = transfer_dir.join("large-single-fixture.adbak");
+        let mut single = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&single_path)
+            .unwrap();
+        super::set_private_file(&single).unwrap();
+        assert_eq!(
+            History::export_backup_stream(
+                &identity,
+                &peer,
+                Some("old backup password"),
+                &mut single
+            )
+            .unwrap(),
+            4_200
+        );
+        single.flush().unwrap();
+        single.sync_all().unwrap();
+        assert!(single.metadata().unwrap().len() > MAX_LEGACY_BACKUP_BYTES as u64);
+        drop(single);
+        let original_len = std::fs::metadata(&single_path).unwrap().len();
+        assert_eq!(
+            History::verify_backup_file(&identity, &single_path, Some("old backup password"))
+                .unwrap(),
+            (peer.clone(), 4_200)
+        );
+
+        let replacement = Identity::create().unwrap().0;
+        let reprotected_path = transfer_dir.join("large-reprotected-fixture.adbak");
+        let mut reprotected = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&reprotected_path)
+            .unwrap();
+        super::set_private_file(&reprotected).unwrap();
+        assert_eq!(
+            History::reprotect_backup_file(
+                &identity,
+                &replacement,
+                &single_path,
+                &mut reprotected,
+                Some("old backup password"),
+                Some("new backup password"),
+            )
+            .unwrap(),
+            4_200
+        );
+        reprotected.flush().unwrap();
+        reprotected.sync_all().unwrap();
+        drop(reprotected);
+        assert_eq!(
+            History::verify_backup_file(
+                &replacement,
+                &reprotected_path,
+                Some("new backup password")
+            )
+            .unwrap(),
+            (peer.clone(), 4_200)
+        );
+        assert_eq!(std::fs::metadata(&single_path).unwrap().len(), original_len);
+
+        let bundle_path = transfer_dir.join("large-bundle-fixture.adbak");
+        let mut bundle = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&bundle_path)
+            .unwrap();
+        super::set_private_file(&bundle).unwrap();
+        History::export_backup_bundle_stream(
+            &identity,
+            &[peer.clone(), empty_peer.clone()],
+            &mut bundle,
+        )
+        .unwrap();
+        bundle.flush().unwrap();
+        bundle.sync_all().unwrap();
+        assert!(bundle.metadata().unwrap().len() > MAX_LEGACY_BACKUP_BYTES as u64);
+        drop(bundle);
+
+        let target = data.0.join("stream-backup-target");
+        std::fs::create_dir_all(&target).unwrap();
+        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target));
+        let target_identity = Identity::from_code(&identity_code).unwrap();
+        let (mut original_history, _, _) = History::open(&target_identity, &peer).unwrap();
+        original_history
+            .append(&message(9_000, "preserve on authentication failure"))
+            .unwrap();
+        let corrupted_path = transfer_dir.join("corrupted-large-fixture.adbak");
+        std::fs::copy(&single_path, &corrupted_path).unwrap();
+        let mut corrupted = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&corrupted_path)
+            .unwrap();
+        corrupted.seek(SeekFrom::Start(90)).unwrap();
+        let mut byte = [0];
+        corrupted.read_exact(&mut byte).unwrap();
+        byte[0] ^= 1;
+        corrupted.seek(SeekFrom::Start(90)).unwrap();
+        corrupted.write_all(&byte).unwrap();
+        corrupted.sync_all().unwrap();
+        assert!(History::import_backup_file(
+            &target_identity,
+            &corrupted_path,
+            Some("old backup password")
+        )
+        .is_err());
+        let mut unchanged = History::reader_for_identity_copy(&target_identity, &peer).unwrap();
+        assert_eq!(
+            unchanged.next_record().unwrap(),
+            Some(message(9_000, "preserve on authentication failure"))
+        );
+        assert_eq!(unchanged.next_record().unwrap(), None);
+        let imported = History::import_backup_file(
+            &target_identity,
+            &single_path,
+            Some("old backup password"),
+        )
+        .unwrap();
+        assert_eq!(imported, vec![(peer.clone(), 4_200, false)]);
+        let bundle_imported =
+            History::import_backup_file(&target_identity, &bundle_path, None).unwrap();
+        assert_eq!(bundle_imported.len(), 2);
+        assert_eq!(bundle_imported[0].1, 4_200);
+        assert_eq!(bundle_imported[1].1, 0);
+        let mut reader = History::reader_for_identity_copy(&target_identity, &peer).unwrap();
+        assert_eq!(reader.next_record().unwrap(), Some(message(0, &long_text)));
+        assert_eq!(reader.next_record().unwrap(), Some(message(1, &long_text)));
+        assert_eq!(reader.next_record().unwrap(), Some(message(2, &long_text)));
+    }
+
+    #[test]
+    fn streaming_bundle_import_accepts_an_empty_conversation() {
+        let data = IsolatedData::new();
+        let (identity, code) = Identity::create().unwrap();
+        let peer = "cb".repeat(32);
+        History::open(&identity, &peer).unwrap();
+        let directory = History::backup_transfer_directory(&identity).unwrap();
+        let path = directory.join("empty-bundle-test.adbak");
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        History::export_backup_bundle_stream(&identity, std::slice::from_ref(&peer), &mut output)
+            .unwrap();
+        output.flush().unwrap();
+        output.sync_all().unwrap();
+        drop(output);
+        let target = data.0.join("empty-bundle-target");
+        std::fs::create_dir_all(&target).unwrap();
+        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target));
+        let target_identity = Identity::from_code(&code).unwrap();
+        assert_eq!(
+            History::import_backup_file(&target_identity, &path, None).unwrap(),
+            vec![(peer, 0, false)]
+        );
+    }
+
+    #[test]
     fn exports_enforce_the_final_file_size_limit_for_both_formats() {
         let _data = IsolatedData::new();
         let identity = Identity::create().unwrap().0;
         let peer = "cd".repeat(32);
         for password in [None, Some("correct horse battery")] {
             let envelope_len = 8 + password.map_or(0, |_| 16) + 12 + 16;
-            let exact_payload_len = MAX_BACKUP_BYTES - envelope_len - 11;
+            let exact_payload_len = MAX_LEGACY_BACKUP_BYTES - envelope_len - 11;
             let mut history = History::open(&identity, &peer).unwrap().0;
             history
                 .replace(&messages_with_payload_len(exact_payload_len))
                 .unwrap();
             let backup = History::export_backup(&identity, &peer, password).unwrap();
-            assert_eq!(backup.len(), MAX_BACKUP_BYTES);
+            assert_eq!(backup.len(), MAX_LEGACY_BACKUP_BYTES);
 
             history
                 .replace(&messages_with_payload_len(exact_payload_len + 1))
