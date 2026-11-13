@@ -836,7 +836,7 @@ document.querySelector('#save-code').addEventListener('click', () => {
   link.download = 'another-dimension-code.txt';
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-  message.textContent = '코드 저장을 요청했습니다.';
+  message.textContent = '코드 파일 저장을 시작했습니다.';
 });
 
 document.querySelector('#continue').addEventListener('click', async () => {
@@ -897,7 +897,7 @@ document.querySelector('#save-added-code').addEventListener('click', () => {
   link.download = 'another-dimension-code.txt';
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-  message.textContent = '코드 저장을 요청했습니다.';
+  message.textContent = '코드 파일 저장을 시작했습니다.';
 });
 
 document.querySelector('#close-added-code').addEventListener('click', () => {
@@ -1017,7 +1017,7 @@ document.querySelector('#save-invite').addEventListener('click', () => {
   link.download = 'another-dimension-invite.txt';
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-  message.textContent = '초대 코드 저장을 요청했습니다.';
+  message.textContent = '초대 코드 파일 저장을 시작했습니다.';
 });
 
 document.querySelector('#start-room').addEventListener('click', async () => {
@@ -1194,21 +1194,21 @@ document.querySelector('#contact-export').addEventListener('click', async () => 
     link.download = 'another-dimension-contact.adcontact';
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    message.textContent = '상대 확인 백업을 저장했습니다.';
-  } catch (_) { message.textContent = '상대 확인 기록을 백업하지 못했습니다.'; }
+    message.textContent = '상대방 신원 정보 백업을 저장했습니다.';
+  } catch (_) { message.textContent = '상대방 신원 정보를 백업하지 못했습니다.'; }
 });
 document.querySelector('#contact-import').addEventListener('click', async () => {
   const input = document.querySelector('#contact-file');
   const file = input.files[0];
-  if (!file || file.size > 256) { message.textContent = '상대 확인 백업 파일을 선택하세요.'; return; }
+  if (!file || file.size > 256) { message.textContent = '상대방 신원 정보 백업 파일을 선택하세요.'; return; }
   try {
     const bytes = new Uint8Array(await file.arrayBuffer());
     const response = await request('/api/contacts/import-backup', btoa(String.fromCharCode(...bytes)));
-    if (response.status === 409) { message.textContent = '연결을 종료하세요. 기존 확인 기록과 충돌하는 백업은 가져올 수 없습니다.'; return; }
+    if (response.status === 409) { message.textContent = '연결을 종료하세요. 기존 상대 신원 정보와 충돌하는 백업은 가져올 수 없습니다.'; return; }
     if (!response.ok) throw new Error('invalid backup');
     input.value = '';
     await refreshHistoryList();
-    message.textContent = '상대 확인 기록을 복원했습니다. 오래된 백업의 최신 여부는 확인할 수 없습니다.';
+    message.textContent = '상대방 신원 정보를 복원했습니다. 오래된 백업의 최신 여부는 확인할 수 없습니다.';
   } catch (_) { message.textContent = '백업을 읽지 못했거나 개인 접속 코드가 다릅니다.'; }
 });
 document.querySelector('#history-export').addEventListener('click', () => {

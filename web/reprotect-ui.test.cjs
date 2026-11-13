@@ -198,6 +198,14 @@ test('dashboard menu closes on outside click and Escape; management dialog reuse
   assert.match(html, /--control-height:\s*44px/);
   assert.match(html, /\.conversation-options\s*\{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/);
   assert.match(html, /@media\s*\(max-width:\s*680px\)\s*\{\s*\.conversation-options\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\)/);
+  assert.match(html, /main:has\(\.identity-dashboard:not\(\[hidden\]\)\)\s*\{[^}]*align-items:\s*flex-start;[^}]*padding:\s*clamp\(48px, 8vh, 96px\)/);
+  const dashboard = html.slice(html.indexOf('<section id="identity-active"'), html.indexOf('<section id="invite-view"'));
+  for (const copy of ['채팅 시작', '채팅방 생성', '초대 코드 생성', '채팅방 입장', '입장']) {
+    assert.ok(dashboard.includes(copy), `dashboard copy missing: ${copy}`);
+  }
+  for (const removedCopy of ['새로운 대화를 만들거나 초대 코드로 참여하세요.', '새 대화 만들기', '초대 코드를 생성하고 상대방과 공유하세요.', '초대 코드로 참여', '상대방에게 받은 초대 코드를 입력하세요.', '>참여<']) {
+    assert.equal(dashboard.includes(removedCopy), false, `old dashboard copy remains: ${removedCopy}`);
+  }
 
   const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]);
   const duplicateIds = ids.filter((id, index) => ids.indexOf(id) !== index);
@@ -271,13 +279,18 @@ test('history detail separates browsing, backup and deletion without replacing f
   assert.match(detail, /현재 불러온 페이지의 메시지를 평문 텍스트 파일로 저장합니다\. 파일은 암호화되지 않습니다\./);
   assert.match(detail, /비밀번호는 선택 사항입니다/);
   assert.match(detail, /현재 페이지 검색/);
-  assert.match(detail, /검색과 TXT 저장은 현재 불러온 페이지를 대상으로 합니다/);
+  assert.match(detail, /TXT 저장은 현재 페이지에만 적용됩니다/);
+  assert.match(detail, /상대방 신원 정보 백업/);
+  assert.match(detail, />보관 기간 외 삭제</);
   assert.equal((detail.match(/class="history-reprotect-steps"[\s\S]*?<\/div>/) || [''])[0].match(/<span>/g).length, 5);
   assert.match(detail, /id="keep-days"[^>]*value="3"/);
   assert.match(html, /#history-detail #history-messages\s*\{[^}]*overflow-y:\s*auto/s);
   assert.match(html, /#history-detail #history-messages\s*\{[^}]*max-height:\s*680px/s);
   assert.match(html, /@media\s*\(max-width:\s*680px\)[\s\S]*?\.history-tool-grid\s*\{\s*grid-template-columns:\s*minmax\(0,\s*1fr\)/);
   assert.match(html, /\.danger-button\s*\{[^}]*background:\s*var\(--danger\)/);
+  assert.match(html, /<h2>접속 코드로 로그인<\/h2>\s*<form id="login-form">/);
+  assert.doesNotMatch(html, /개인 접속 코드로 로그인하거나 새 코드를 생성하세요\./);
+  assert.match(html, /다른 신원의 코드를 입력하면 해당 신원으로 로그인됩니다\./);
 });
 
 test('whole-conversation deletion remains explicitly confirmed and locally scoped', async () => {

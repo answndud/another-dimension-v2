@@ -189,7 +189,7 @@
     .menu-item { display: flex; width: 100%; min-height: 42px; align-items: center; justify-content: center; padding: 0 var(--space-3); border: 0; border-radius: 6px; background: transparent; font-size: 14px; font-weight: 500; }
     .menu-item:hover { background: var(--surface-muted); }
     .menu-divider { height: 1px; margin: var(--space-1) 0; background: var(--border-soft); }
-    main:has(.identity-dashboard:not([hidden])) { display: flex; width: min(100%, 800px); min-height: calc(100vh - 72px); min-height: calc(100dvh - 72px); align-items: center; margin: 0 auto; padding: var(--space-6) 0 var(--space-8); }
+    main:has(.identity-dashboard:not([hidden])) { display: flex; width: min(100%, 800px); min-height: calc(100vh - 72px); min-height: calc(100dvh - 72px); align-items: flex-start; margin: 0 auto; padding: clamp(48px, 8vh, 96px) 0 var(--space-8); }
     .identity-dashboard { display: block; width: 100%; max-width: none; margin: 0; padding: 0; border: 0; background: transparent; box-shadow: none; }
     .dashboard-card { width: 100%; max-width: none; margin: 0; padding: var(--space-6); border-radius: var(--radius-card); background: var(--surface); }
     .dashboard-card .eyebrow { margin: 0 0 var(--space-1); color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .04em; }
@@ -202,7 +202,8 @@
     .conversation-card > .meta { margin: var(--space-2) 0 var(--space-8); font-size: 15px; }
     .dashboard-card-heading h2 { margin: 0; font-size: 28px; font-weight: 700; }
     .conversation-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; gap: var(--space-4); }
-    .conversation-options > .conversation-option { display: grid; grid-template-rows: auto auto 1fr; min-width: 0; max-width: none; align-content: stretch; gap: var(--space-3); margin: 0; padding: var(--space-6); border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); box-shadow: none; }
+    .conversation-options > .conversation-option { display: grid; grid-template-rows: 1fr auto; min-width: 0; max-width: none; align-content: stretch; gap: var(--space-3); margin: 0; padding: var(--space-6); border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); box-shadow: none; }
+    .conversation-card .dashboard-card-heading { margin-bottom: var(--space-6); }
     .conversation-option h3 { margin: 0; font-size: 18px; font-weight: 600; }
     .conversation-option p { margin: 0; color: var(--muted); font-size: 14px; }
     .invite-option button { align-self: end; justify-self: start; min-width: 10rem; }
@@ -298,7 +299,7 @@
     }
     @media (max-width: 680px) {
       .conversation-options { grid-template-columns: minmax(0, 1fr); }
-      .conversation-options > .conversation-option { grid-template-rows: auto auto auto; padding: 20px; }
+      .conversation-options > .conversation-option { grid-template-rows: 1fr auto; padding: 20px; }
       .conversation-option p { min-height: 0; }
       .invite-option button, .join-controls { align-self: start; }
       .chat-header { align-items: flex-start; flex-direction: column; gap: var(--space-2); padding: var(--space-3) 16px; }
@@ -488,7 +489,7 @@
                   <button id="history-bundle-export" type="button">선택 백업</button>
                 </div>
                 <div class="history-tools">
-                  <label class="history-import-label" for="contact-file">상대 확인 백업 가져오기</label>
+                  <label class="history-import-label" for="contact-file">상대방 신원 정보 백업 가져오기</label>
                   <div class="history-import-controls">
                     <input id="contact-file" type="file" accept=".adcontact,application/octet-stream">
                     <button id="contact-import" type="button">상대 확인 복원</button>
@@ -509,14 +510,13 @@
       <button type="submit" class="primary">연결</button>
     </form>
     <section id="identity-entry" class="entry-card" hidden>
-      <h2>개인 신원</h2>
-      <p>개인 접속 코드로 로그인하거나 새 코드를 생성하세요.</p>
+      <h2>접속 코드로 로그인</h2>
       <form id="login-form">
         <label for="identity-code">개인 접속 코드</label>
         <input id="identity-code" type="password" autocomplete="off" spellcheck="false" required>
         <button type="submit" class="primary">로그인</button>
       </form>
-      <p>형식이 맞는 다른 코드를 입력하면 다른 신원이 열립니다.</p>
+      <p>다른 신원의 코드를 입력하면 해당 신원으로 로그인됩니다.</p>
       <div class="actions"><button id="create" type="button">새 코드 생성</button><button class="disconnect" type="button">로컬 연결 해제</button></div>
     </section>
     <section id="created" class="entry-card" hidden>
@@ -530,22 +530,19 @@
     <section id="identity-active" class="identity-dashboard" hidden>
       <section class="dashboard-card conversation-card" aria-labelledby="conversation-heading">
         <div class="dashboard-card-heading">
-          <div><h2 id="conversation-heading">대화 시작</h2></div>
+          <div><h2 id="conversation-heading">채팅 시작</h2></div>
         </div>
-        <p class="meta">새로운 대화를 만들거나 초대 코드로 참여하세요.</p>
         <div class="conversation-options">
           <section class="conversation-option invite-option" aria-labelledby="invite-option-heading">
-            <h3 id="invite-option-heading">새 대화 만들기</h3>
-            <p>초대 코드를 생성하고 상대방과 공유하세요.</p>
-            <button id="create-invite" type="button" class="primary">초대 코드 만들기</button>
+            <h3 id="invite-option-heading">채팅방 생성</h3>
+            <button id="create-invite" type="button" class="primary">초대 코드 생성</button>
           </section>
           <form id="join-form" class="conversation-option join-form" aria-labelledby="join-option-heading">
-            <h3 id="join-option-heading">초대 코드로 참여</h3>
-            <p>상대방에게 받은 초대 코드를 입력하세요.</p>
+            <h3 id="join-option-heading">채팅방 입장</h3>
             <label class="visually-hidden" for="join-code">초대 코드</label>
             <div class="join-controls">
               <input id="join-code" type="password" autocomplete="off" spellcheck="false" placeholder="초대 코드 입력" required>
-              <button type="submit">참여</button>
+              <button type="submit">입장</button>
             </div>
           </form>
         </div>
@@ -627,7 +624,7 @@
           <button id="history-back" type="button">대화 목록</button>
           <button id="contact-reconnect" type="button">상대와 다시 연결</button>
         </div>
-        <p class="history-reconnect-note">현재는 양쪽에서 다시 연결을 선택해야 합니다.</p>
+        <p class="history-reconnect-note">기존 대화를 이어가려면 양쪽에서 다시 연결을 선택해야 합니다.</p>
       </header>
 
       <div class="history-explorer">
@@ -635,7 +632,7 @@
           <label for="message-filter">현재 페이지 검색</label>
           <input id="message-filter" type="search" autocomplete="off" placeholder="현재 불러온 페이지에서 검색">
         </div>
-        <p class="history-scope-note">검색과 TXT 저장은 현재 불러온 페이지를 대상으로 합니다.</p>
+        <p class="history-scope-note">TXT 저장은 현재 페이지에만 적용됩니다.</p>
         <div id="history-messages" class="history-message-list" aria-live="polite"></div>
         <div class="history-pagination">
           <p id="history-page-status" class="meta" role="status"></p>
@@ -668,9 +665,9 @@
                 <button id="history-backup-export" type="button">암호화 백업 저장</button>
               </div>
               <div class="history-tool-card">
-                <h4>상대 확인 백업</h4>
-                <p class="meta">상대 확인 백업은 이 개인 접속 코드로 보호됩니다. 대화 내용 백업과 별도로 저장하세요. 오래된 백업의 최신 여부는 확인할 수 없습니다.</p>
-                <button id="contact-export" type="button">상대 확인 백업 저장</button>
+                <h4>상대방 신원 정보 백업</h4>
+                <p class="meta">상대방 신원 정보 백업은 이 개인 접속 코드로 보호됩니다. 대화 내용 백업과 별도로 저장하세요. 오래된 백업의 최신 여부는 확인할 수 없습니다.</p>
+                <button id="contact-export" type="button">상대방 신원 정보 백업 저장</button>
               </div>
             </div>
           </section>
@@ -736,7 +733,7 @@
             <p class="meta">입력한 일수보다 오래된 메시지를 삭제합니다. 기본 보관 기간은 3일입니다.</p>
             <div class="history-retention-row">
               <div><label for="keep-days">최근 며칠 보관</label><input id="keep-days" type="number" min="1" max="36500" value="3"></div>
-              <button id="keep-recent" type="button">기간 외 삭제</button>
+              <button id="keep-recent" type="button">보관 기간 외 삭제</button>
             </div>
           </section>
           <section class="history-tool-section history-delete-all">
