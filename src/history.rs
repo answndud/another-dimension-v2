@@ -3045,6 +3045,8 @@ fn import_backup_bundle_stream<R: Read>(
     input: &mut R,
 ) -> io::Result<Vec<(String, usize, bool)>> {
     let mut imported = Vec::new();
+    let mut staged_children = Vec::new();
+    let mut validated_children = Vec::new();
     let result = (|| {
         let mut magic = [0; 8];
         input.read_exact(&mut magic)?;
@@ -3088,6 +3090,7 @@ fn import_backup_bundle_stream<R: Read>(
                     .read(true)
                     .write(true)
                     .open(&child_path)?;
+                staged_children.push(child_path.clone());
                 set_private_file(&child_file)?;
                 let mut remaining = length;
                 let mut buffer = [0; 64 * 1024];
@@ -3102,49 +3105,89 @@ fn import_backup_bundle_stream<R: Read>(
                 child_file.flush()?;
                 child_file.sync_all()?;
                 child_file.seek(SeekFrom::Start(0))?;
-                let (peer_id, mut staging, links) =
+                let (peer_id, staging, links) =
                     decode_backup_stream(identity, &mut child_file, None)?;
                 ensure_stream_eof(&mut child_file)?;
                 if !unique.insert(peer_id.clone()) {
+                    staging.cleanup()?;
                     return Err(invalid_data("duplicate conversation in backup bundle"));
                 }
                 let message_count = usize::try_from(staging.count())
                     .map_err(|_| invalid_data("backup conversation count is too large"))?;
                 let has_links = !links.local.is_empty() || !links.peer.is_empty();
-                import_verified_staging(identity, &peer_id, &mut staging, &links)?;
-                imported.push((peer_id, message_count, has_links));
-                staging
-                    .cleanup()
-                    .map_err(|error| partial_bundle_error(imported.len(), error))?;
+                validated_children.push(Some((peer_id, staging, links, message_count, has_links)));
                 Ok(())
             })();
-            let cleanup = if child_path.exists() {
-                std::fs::remove_file(&child_path)
-            } else {
-                Ok(())
-            };
-            match (child_result, cleanup) {
-                (Ok(()), Ok(())) => {}
-                (Err(error), Ok(())) => return Err(error),
-                (Ok(()), Err(cleanup_error)) => {
-                    return Err(io::Error::other(format!(
-                        "backup bundle child was applied but temporary file cleanup failed: {cleanup_error}"
-                    )))
-                }
-                (Err(error), Err(cleanup_error)) => {
-                    return Err(io::Error::other(format!(
-                        "{error}; temporary bundle child cleanup failed: {cleanup_error}"
-                    )))
-                }
-            }
+            child_result?;
         }
         let mut supplied_tag = [0; BACKUP_BUNDLE_TAG_BYTES];
         input.read_exact(&mut supplied_tag)?;
         ensure_stream_eof(input)?;
         mac.verify_slice(&supplied_tag)
             .map_err(|_| invalid_data("backup bundle authentication failed"))?;
+
+        // Keep the validated encrypted staging objects until the bundle HMAC
+        // succeeds, then apply those exact verified records and relationships.
+        for validated in &mut validated_children {
+            let Some((peer_id, mut staging, links, message_count, has_links)) = validated.take()
+            else {
+                continue;
+            };
+            let apply_result = import_verified_staging(identity, &peer_id, &mut staging, &links);
+            if apply_result.is_ok() {
+                imported.push((peer_id, message_count, has_links));
+            }
+            let staging_cleanup = staging.cleanup();
+            match (apply_result, staging_cleanup) {
+                (Ok(()), Ok(())) => {}
+                (Err(error), Ok(())) => return Err(error),
+                (Ok(()), Err(cleanup_error)) => {
+                    return Err(io::Error::other(format!(
+                        "backup bundle applied {} conversation(s), but staging cleanup failed: {cleanup_error}",
+                        imported.len()
+                    )))
+                }
+                (Err(error), Err(cleanup_error)) => {
+                    return Err(io::Error::other(format!(
+                        "{error}; restore staging cleanup failed: {cleanup_error}"
+                    )))
+                }
+            }
+        }
         Ok(())
     })();
+    let mut cleanup_errors = Vec::new();
+    for (_, staging, _, _, _) in validated_children.into_iter().flatten() {
+        if let Err(error) = staging.cleanup() {
+            cleanup_errors.push(error.to_string());
+        }
+    }
+    for path in staged_children {
+        let cleanup = if path.exists() {
+            std::fs::remove_file(path)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = cleanup {
+            cleanup_errors.push(error.to_string());
+        }
+    }
+    let cleanup_result = if cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(cleanup_errors.join("; ")))
+    };
+    let result = match (result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup_error)) => Err(io::Error::other(format!(
+            "backup bundle applied {} conversation(s), but temporary bundle cleanup failed: {cleanup_error}",
+            imported.len()
+        ))),
+        (Err(error), Err(cleanup_error)) => Err(io::Error::other(format!(
+            "{error}; temporary bundle cleanup failed: {cleanup_error}"
+        ))),
+    };
     result.map_err(|error| partial_bundle_error(imported.len(), error))?;
     Ok(imported)
 }
@@ -7616,7 +7659,7 @@ mod tests {
     }
 
     #[test]
-    fn bundle3_authenticates_membership_and_reports_partial_application() {
+    fn bundle3_rejects_membership_tampering_without_applying_any_child() {
         let data = IsolatedData::new();
         let (identity, code) = Identity::create().unwrap();
         let peers = ["d3".repeat(32), "d4".repeat(32), "d5".repeat(32)];
@@ -7626,6 +7669,15 @@ mod tests {
                 .0
                 .append(&message(index as u64 + 1, "bundle member"))
                 .unwrap();
+            super::write_linked_keys(
+                &identity,
+                peer,
+                &(
+                    HashSet::new(),
+                    HashSet::from([format!("f{index}").repeat(32)]),
+                ),
+            )
+            .unwrap();
         }
         let directory = History::backup_transfer_directory(&identity).unwrap();
         let bundle_path = directory.join("members.adbak");
@@ -7669,54 +7721,85 @@ mod tests {
         append_bundle3_child(&mut reordered, &bundle, children[1]);
         append_bundle3_child(&mut reordered, &bundle, children[0]);
         reordered.extend_from_slice(&bundle[bundle.len() - super::BACKUP_BUNDLE_TAG_BYTES..]);
+        let mut invalid_tag = bundle.clone();
+        let last = invalid_tag.len() - 1;
+        invalid_tag[last] ^= 1;
 
-        let target_a = data.0.join("bundle-removed-target");
-        std::fs::create_dir_all(&target_a).unwrap();
-        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target_a));
-        let target_identity = Identity::from_code(&code).unwrap();
-        let removed_path = History::backup_transfer_directory(&target_identity)
-            .unwrap()
-            .join("removed.adbak");
-        std::fs::write(&removed_path, removed).unwrap();
-        let error = History::import_backup_file(&target_identity, &removed_path, None).unwrap_err();
-        assert!(
-            error.to_string().contains("applying 1 conversation"),
-            "{error}"
-        );
+        fn reject_without_changes(
+            root: &std::path::Path,
+            code: &str,
+            file_name: &str,
+            bundle: &[u8],
+            peers: &[String],
+        ) {
+            let target = root.join(format!("{file_name}-target"));
+            std::fs::create_dir_all(&target).unwrap();
+            super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target));
+            let target_identity = Identity::from_code(code).unwrap();
+            for (index, peer) in peers.iter().enumerate() {
+                History::open(&target_identity, peer)
+                    .unwrap()
+                    .0
+                    .append(&message(index as u64 + 100, "existing local record"))
+                    .unwrap();
+                super::write_linked_keys(
+                    &target_identity,
+                    peer,
+                    &(HashSet::new(), HashSet::from(["ee".repeat(32)])),
+                )
+                .unwrap();
+            }
+            let relationships: Vec<_> = peers
+                .iter()
+                .map(|peer| super::read_linked_keys(&target_identity, peer).unwrap())
+                .collect();
+            let path = History::backup_transfer_directory(&target_identity)
+                .unwrap()
+                .join(file_name);
+            std::fs::write(&path, bundle).unwrap();
+            let error = History::import_backup_file(&target_identity, &path, None).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("backup bundle authentication failed"),
+                "{error}"
+            );
+            assert!(!error.to_string().contains("applying "), "{error}");
+            for (index, peer) in peers.iter().enumerate() {
+                let mut reader = History::reader_for_identity_copy(&target_identity, peer).unwrap();
+                assert_eq!(
+                    reader.next_record().unwrap(),
+                    Some(message(index as u64 + 100, "existing local record"))
+                );
+                assert_eq!(reader.next_record().unwrap(), None);
+                assert_eq!(
+                    super::read_linked_keys(&target_identity, peer).unwrap(),
+                    relationships[index]
+                );
+            }
+        }
 
-        let target_b = data.0.join("bundle-replaced-target");
-        std::fs::create_dir_all(&target_b).unwrap();
-        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target_b));
-        let target_identity = Identity::from_code(&code).unwrap();
-        let replaced_path = History::backup_transfer_directory(&target_identity)
-            .unwrap()
-            .join("replaced.adbak");
-        std::fs::write(&replaced_path, replaced).unwrap();
-        let error =
-            History::import_backup_file(&target_identity, &replaced_path, None).unwrap_err();
-        assert!(
-            error.to_string().contains("applying 2 conversation"),
-            "{error}"
-        );
+        reject_without_changes(&data.0, &code, "removed.adbak", &removed, &peers);
+        reject_without_changes(&data.0, &code, "replaced.adbak", &replaced, &peers);
+        reject_without_changes(&data.0, &code, "reordered.adbak", &reordered, &peers);
+        reject_without_changes(&data.0, &code, "invalid-tag.adbak", &invalid_tag, &peers);
 
-        let target_c = data.0.join("bundle-reordered-target");
-        std::fs::create_dir_all(&target_c).unwrap();
-        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target_c));
+        let target = data.0.join("valid-bundle-target");
+        std::fs::create_dir_all(&target).unwrap();
+        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target));
         let target_identity = Identity::from_code(&code).unwrap();
-        let reordered_path = History::backup_transfer_directory(&target_identity)
+        let valid_path = History::backup_transfer_directory(&target_identity)
             .unwrap()
-            .join("reordered.adbak");
-        std::fs::write(&reordered_path, reordered).unwrap();
-        let error =
-            History::import_backup_file(&target_identity, &reordered_path, None).unwrap_err();
-        assert!(
-            error.to_string().contains("applying 2 conversation"),
-            "{error}"
+            .join("valid.adpak");
+        std::fs::write(&valid_path, &bundle).unwrap();
+        assert_eq!(
+            History::import_backup_file(&target_identity, &valid_path, None).unwrap(),
+            vec![(peers[0].clone(), 1, true), (peers[1].clone(), 1, true)]
         );
     }
 
     #[test]
-    fn bundle3_late_child_authentication_error_reports_applied_count() {
+    fn bundle3_authenticated_save_failure_reports_partial_application() {
         let data = IsolatedData::new();
         let (identity, code) = Identity::create().unwrap();
         let peers = ["d6".repeat(32), "d7".repeat(32)];
@@ -7727,6 +7810,13 @@ mod tests {
                 .append(&message(1, "verified child"))
                 .unwrap();
         }
+        let linked_peer_id = "e8".repeat(32);
+        super::write_linked_keys(
+            &identity,
+            &peers[1],
+            &(HashSet::new(), HashSet::from([linked_peer_id])),
+        )
+        .unwrap();
         let directory = History::backup_transfer_directory(&identity).unwrap();
         let path = directory.join("late-error-source.adbak");
         let mut output = OpenOptions::new()
@@ -7737,20 +7827,18 @@ mod tests {
         History::export_backup_bundle_stream(&identity, &peers, &mut output).unwrap();
         output.flush().unwrap();
         drop(output);
-        let mut bundle = std::fs::read(&path).unwrap();
-        let children = bundle3_children(&bundle);
-        let second_child = children[1];
-        bundle[second_child.1 - 1] ^= 1;
-
         let target = data.0.join("late-error-target");
         std::fs::create_dir_all(&target).unwrap();
         super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target));
         let target_identity = Identity::from_code(&code).unwrap();
-        let damaged_path = History::backup_transfer_directory(&target_identity)
+        let bundle = std::fs::read(&path).unwrap();
+        let import_path = History::backup_transfer_directory(&target_identity)
             .unwrap()
-            .join("late-error.adbak");
-        std::fs::write(&damaged_path, bundle).unwrap();
-        let error = History::import_backup_file(&target_identity, &damaged_path, None).unwrap_err();
+            .join("storage-error.adpak");
+        std::fs::write(&import_path, bundle).unwrap();
+        super::TEST_FAILURES.with(|flags| flags.set(super::FAIL_LINKED_STORE));
+        let error = History::import_backup_file(&target_identity, &import_path, None).unwrap_err();
+        super::TEST_FAILURES.with(|flags| flags.set(0));
         assert!(
             error.to_string().contains("applying 1 conversation"),
             "{error}"
@@ -7760,6 +7848,11 @@ mod tests {
             reader.next_record().unwrap(),
             Some(message(1, "verified child"))
         );
+        assert_eq!(reader.next_record().unwrap(), None);
+        assert!(super::read_linked_keys(&target_identity, &peers[1])
+            .unwrap()
+            .0
+            .is_empty());
     }
 
     #[test]
