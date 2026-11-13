@@ -55,6 +55,43 @@ let reprotectPassword = '';
 const reprotectWork = new window.ReprotectWork();
 let historySummaries = [];
 let dismissedTransitionKey = '';
+let activeNetworkMode = 'general';
+
+function appendMessageBody(container, text) {
+  const source = String(text);
+  const urlPattern = /https?:\/\/[^\s<>"']+/gi;
+  let cursor = 0;
+  for (const match of source.matchAll(urlPattern)) {
+    const start = match.index;
+    const raw = match[0];
+    let candidate = raw.replace(/[.,!?;:]+$/, '');
+    while (/[)\]}]$/.test(candidate)) {
+      const closing = candidate.at(-1);
+      const opening = closing === ')' ? '(' : closing === ']' ? '[' : '{';
+      const opens = [...candidate].filter((character) => character === opening).length;
+      const closes = [...candidate].filter((character) => character === closing).length;
+      if (closes <= opens) break;
+      candidate = candidate.slice(0, -1);
+    }
+    let parsed;
+    try { parsed = new URL(candidate); } catch (_) { parsed = null; }
+    if (!parsed || !['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password) continue;
+    if (start > cursor) container.append(document.createTextNode(source.slice(cursor, start)));
+    const link = document.createElement('a');
+    link.href = parsed.href;
+    link.textContent = candidate;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.addEventListener('click', (event) => {
+      if (activeNetworkMode === 'tor' && !window.confirm('이 링크는 외부 브라우저에서 열립니다. 외부 브라우저가 Tor를 사용하지 않아 실제 IP 주소가 노출될 수 있습니다. 계속 여시겠습니까?')) {
+        event.preventDefault();
+      }
+    });
+    container.append(link);
+    cursor = start + candidate.length;
+  }
+  if (cursor < source.length) container.append(document.createTextNode(source.slice(cursor)));
+}
 
 function clearReprotectSecrets() {
   document.querySelector('#history-reprotect-previous-code').value = '';
@@ -265,6 +302,7 @@ async function refreshNetworkSettings() {
   const response = await request('/api/settings/get');
   if (!response.ok) throw new Error('settings unavailable');
   const settings = await response.json();
+  activeNetworkMode = settings.activeMode === 'tor' ? 'tor' : 'general';
   const modeChoice = document.querySelector('#network-mode-choice');
   const torAddress = document.querySelector('#tor-socks-address');
   const notificationChoice = document.querySelector('#notifications-enabled');
@@ -377,7 +415,7 @@ function renderHistoryMessages() {
     time.dateTime = new Date(item.time * 1000).toISOString();
     time.textContent = `${formatTime(item.time)} [${item.sender}]`;
     const body = document.createElement('div');
-    body.textContent = item.text;
+    appendMessageBody(body, item.text);
     card.append(selection, time, body);
     historyMessages.append(card);
   }
@@ -459,7 +497,7 @@ function appendMessages(items) {
     time.dateTime = new Date(item.time * 1000).toISOString();
     time.textContent = `${formatTime(item.time)} [${item.sender}]`;
     const body = document.createElement('div');
-    body.textContent = item.text;
+    appendMessageBody(body, item.text);
     card.append(time, body);
     conversation.append(card);
     messageCursor += 1;
@@ -821,6 +859,7 @@ document.querySelector('#save-settings').addEventListener('click', async () => {
       return;
     }
     const saved = await response.json();
+    activeNetworkMode = saved.activeMode === 'tor' ? 'tor' : 'general';
     status.textContent = saved.restartRequired
       ? '설정을 저장했습니다. 연결 설정 적용을 위해 터미널에서 프로그램을 종료한 뒤 다시 실행하세요. 터미널의 새 주소와 로컬 연결 코드를 사용하고, 다시 연 화면에서 개인 접속 코드로 로그인하세요.'
       : '설정을 저장했습니다.';

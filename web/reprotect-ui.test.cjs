@@ -704,6 +704,60 @@ test('actual UI: relay settings display the active relay list and save edited li
   });
 });
 
+test('actual UI: live and saved messages link only valid HTTP(S) URLs safely', async (t) => {
+  const h = createHarness();
+  const generalSettings = {
+    savedMode: 'tor', socks: '127.0.0.1:9050', activeMode: 'general', activeSocks: null,
+    notifications: false, savedRelays: ['wss://relay.one'], activeRelays: ['wss://relay.one'],
+  };
+  const refresh = h.evaluate('refreshNetworkSettings()');
+  h.requestFor('/api/settings/get').resolve(response(JSON.stringify(generalSettings)));
+  await refresh;
+
+  h.evaluate(`appendMessages(${JSON.stringify([{ time: 1, sender: '상대', text: 'visit https://example.com/path?x=1.\n<img src=x onerror=alert(1)> javascript:alert(1) http://' }])})`);
+  const liveBody = h.element('#conversation').children[0].children[1];
+  const liveLinks = liveBody.children.filter((child) => child.tagName === undefined && child.href);
+  assert.equal(liveLinks.length, 1);
+  assert.equal(liveLinks[0].href, 'https://example.com/path?x=1');
+  assert.equal(liveLinks[0].target, '_blank');
+  assert.equal(liveLinks[0].rel, 'noopener noreferrer');
+  assert.equal(liveBody.children.some((child) => child.textContent.includes('<img src=x onerror=alert(1)> javascript:alert(1) http://')), true);
+
+  let confirmCalls = 0;
+  h.window.confirm = () => { confirmCalls += 1; return false; };
+  let prevented = false;
+  liveLinks[0].listeners.click({ preventDefault() { prevented = true; } });
+  assert.equal(confirmCalls, 0, 'saved Tor mode must not override active general mode');
+  assert.equal(prevented, false);
+
+  await t.test('Tor confirmation applies to stored history links and cancel blocks opening', async () => {
+    const torSettings = { ...generalSettings, activeMode: 'tor', savedMode: 'general' };
+    const loading = h.evaluate('refreshNetworkSettings()');
+    h.requestFor('/api/settings/get').resolve(response(JSON.stringify(torSettings)));
+    await loading;
+    h.evaluate(`selectedHistoryMessages = [{index: 0, time: 1, sender: '상대', text: 'https://safe.example and data:text/html,<b>x</b>'}]; renderHistoryMessages()`);
+    const storedBody = h.element('#history-messages').children[0].children[2];
+    const storedLink = storedBody.children.find((child) => child.href);
+    assert.ok(storedLink);
+    let warning = '';
+    h.window.confirm = (text) => { warning = text; return false; };
+    prevented = false;
+    storedLink.listeners.click({ preventDefault() { prevented = true; } });
+    assert.match(warning, /외부 브라우저가 Tor를 사용하지 않아/);
+    assert.equal(prevented, true);
+    assert.equal(storedLink.rel, 'noopener noreferrer');
+    assert.equal(storedBody.children.some((child) => child.textContent.includes('data:text/html')), true);
+  });
+
+  await t.test('Tor confirmation allows opening only after explicit confirmation', async () => {
+    h.window.confirm = () => true;
+    const anchor = h.element('#history-messages').children[0].children[2].children.find((child) => child.href);
+    let prevented = false;
+    anchor.listeners.click({ preventDefault() { prevented = true; } });
+    assert.equal(prevented, false);
+  });
+});
+
 test('actual UI: stale polls cannot change another identity after response or JSON awaits', async (t) => {
   const settings = JSON.stringify({
     savedMode: 'general', socks: null, activeMode: 'general', activeSocks: null,
