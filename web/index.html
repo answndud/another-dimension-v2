@@ -201,10 +201,10 @@
     .menu-item { display: flex; width: 100%; min-height: 42px; align-items: center; justify-content: center; padding: 0 var(--space-3); border: 0; border-radius: 6px; background: transparent; font-size: 14px; font-weight: 500; }
     .menu-item:hover { background: var(--surface-muted); }
     .menu-divider { height: 1px; margin: var(--space-1) 0; background: var(--border-soft); }
-    main:has(.identity-dashboard:not([hidden])) { display: flex; flex-direction: column; width: min(100%, 800px); min-height: calc(100vh - 72px); min-height: calc(100dvh - 72px); align-items: stretch; justify-content: center; margin: 0 auto; padding: var(--space-6) 0 var(--space-8); }
+    main:has(.identity-dashboard:not([hidden])) { display: flex; flex-direction: column; width: min(100%, 800px); min-height: calc(100vh - 72px); min-height: calc(100dvh - 72px); align-items: stretch; justify-content: flex-start; margin: 0 auto; padding: clamp(32px, 8vh, 72px) 0 var(--space-8); }
     main:has(.identity-dashboard:not([hidden])) #message, main:has(#chat-view:not([hidden])) #message { flex: 0 0 52px; width: 100%; min-width: 0; min-height: 52px; max-height: 52px; overflow: auto; margin: 0; padding: var(--space-2) var(--space-3); border: 1px solid var(--border-soft); border-radius: var(--radius-control); color: var(--text); background: var(--surface); overflow-wrap: anywhere; }
     main:has(.identity-dashboard:not([hidden])) #message:empty, main:has(#chat-view:not([hidden])) #message:empty { visibility: hidden; }
-    .identity-dashboard { display: block; flex: 0 0 auto; width: 100%; max-width: none; margin: auto 0; padding: 0; border: 0; background: transparent; box-shadow: none; }
+    .identity-dashboard { display: block; flex: 0 0 auto; width: 100%; max-width: none; margin: 0; padding: 0; border: 0; background: transparent; box-shadow: none; }
     .dashboard-card { width: 100%; max-width: none; margin: 0; padding: var(--space-6); border-radius: var(--radius-card); background: var(--surface); }
     .dashboard-card .eyebrow { margin: 0 0 var(--space-1); color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .04em; }
     .identity-id-details { margin-top: var(--space-3); }
@@ -337,8 +337,7 @@
       h1 { font-size: 16px; letter-spacing: .02em; }
       .site-header-controls { gap: var(--space-2); }
       .identity-menu > summary, .theme-toggle { min-width: 0; padding: var(--space-2); font-size: 13px; white-space: nowrap; }
-      main:has(.identity-dashboard:not([hidden])) { justify-content: flex-start; }
-      main:has(.identity-dashboard:not([hidden])) .identity-dashboard { margin: var(--space-8) 0 auto; }
+      main:has(.identity-dashboard:not([hidden])) { padding-top: var(--space-8); }
       .management-dialog { width: calc(100vw - 24px); max-height: 90dvh; padding: 20px; }
       .management-dialog-header { top: -20px; margin: -20px -20px var(--space-4); padding: var(--space-3) 20px; }
       main:has(#chat-view:not([hidden])) { height: calc(100vh - 72px - var(--space-8)); height: calc(100dvh - 72px - var(--space-8)); }
@@ -377,8 +376,7 @@
       .menu-account-actions { grid-template-columns: minmax(0, 1fr); }
     }
     @media (max-height: 600px) {
-      main:has(.identity-dashboard:not([hidden])) { justify-content: flex-start; }
-      main:has(.identity-dashboard:not([hidden])) .identity-dashboard { margin: var(--space-4) 0 auto; }
+      main:has(.identity-dashboard:not([hidden])) { padding-top: var(--space-4); }
       main:has(#chat-view:not([hidden])) { min-height: 0; }
       #chat-view .chat-workflows { max-height: 36vh; }
       #history-detail #history-messages { min-height: 240px; }

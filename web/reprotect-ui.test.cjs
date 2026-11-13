@@ -210,8 +210,9 @@ test('dashboard menu closes on outside click and Escape; management dialog reuse
   assert.match(html, /--control-height:\s*44px/);
   assert.match(html, /\.conversation-options\s*\{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/);
   assert.match(html, /@media\s*\(max-width:\s*680px\)\s*\{\s*\.conversation-options\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\)/);
-  assert.match(html, /main:has\(\.identity-dashboard:not\(\[hidden\]\)\)\s*\{[^}]*justify-content:\s*center/);
-  assert.match(html, /@media\s*\(max-width:\s*560px\)[\s\S]*?main:has\(\.identity-dashboard:not\(\[hidden\]\)\)\s*\{\s*justify-content:\s*flex-start/);
+  assert.match(html, /main:has\(\.identity-dashboard:not\(\[hidden\]\)\)\s*\{[^}]*justify-content:\s*flex-start;[^}]*padding:\s*clamp\(32px, 8vh, 72px\)/);
+  assert.match(html, /\.identity-dashboard\s*\{[^}]*margin:\s*0;/);
+  assert.match(html, /@media\s*\(max-width:\s*560px\)[\s\S]*?main:has\(\.identity-dashboard:not\(\[hidden\]\)\)\s*\{\s*padding-top:\s*var\(--space-8\)/);
   assert.match(html, /\.chat-header\s*\{[^}]*grid-row:\s*1/);
   assert.match(html, /\.chat-status-strip\s*\{[^}]*grid-row:\s*2/);
   assert.match(html, /\.chat-workflows\s*\{[^}]*grid-row:\s*3/);
