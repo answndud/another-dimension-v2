@@ -300,10 +300,16 @@ test('dashboard menu closes on outside click and Escape; management dialog reuse
 
 test('brand button returns to the dashboard and global status has consistent separation', async () => {
   const h = createHarness();
+  const returnButton = h.element('#return-to-chat');
+  assert.equal(returnButton.hidden, true);
+
   h.element('#identity-id').textContent = 'test-identity';
   h.element('#chat-view').hidden = false;
   h.element('#history-detail').hidden = false;
   h.element('#message').textContent = '이전 오류';
+  h.evaluate("operationId = 'live-operation'; updateChatView({ phase: 'connected', messageEpoch: 1 })");
+  const existingMessage = { textContent: '기존 메시지' };
+  h.element('#conversation').appendChild(existingMessage);
 
   await h.click('#brand-home');
 
@@ -311,6 +317,26 @@ test('brand button returns to the dashboard and global status has consistent sep
   assert.equal(h.element('#chat-view').hidden, true);
   assert.equal(h.element('#history-detail').hidden, true);
   assert.equal(h.element('#message').textContent, '');
+  assert.equal(returnButton.hidden, false);
+
+  await h.click('#return-to-chat');
+  assert.equal(h.element('#chat-view').hidden, false);
+  assert.equal(h.element('#identity-active').hidden, true);
+  assert.equal(h.element('#conversation').children[0], existingMessage);
+  assert.equal(h.evaluate('operationId'), 'live-operation');
+
+  const closeTask = h.click('#close-chat');
+  h.requestFor('/api/chat/cancel').resolve(response('ok'));
+  await closeTask;
+  assert.equal(returnButton.hidden, true);
+  assert.equal(h.evaluate('operationId'), null);
+
+  h.evaluate("operationId = 'logout-operation'; updateChatView({ phase: 'connected', messageEpoch: 2 }); show('active')");
+  assert.equal(returnButton.hidden, false);
+  await h.click('#logout');
+  assert.equal(returnButton.hidden, true);
+  assert.equal(h.evaluate('operationId'), null);
+
   const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
   assert.match(html, /<h1><button id="brand-home"[^>]*>Another Dimension<\/button><\/h1>/);
   assert.match(html, /main\s*>\s*#message\s*\{[^}]*margin-top:\s*var\(--space-4\)/);

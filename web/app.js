@@ -34,6 +34,7 @@ const sendForm = document.querySelector('#send-form');
 const chatText = document.querySelector('#chat-text');
 const conversation = document.querySelector('#conversation');
 const message = document.querySelector('#message');
+const returnToChat = document.querySelector('#return-to-chat');
 const sessionKey = 'local-bridge-session';
 const operationKey = 'local-chat-operation';
 const restoreJobKey = 'local-history-restore-job';
@@ -42,6 +43,7 @@ const themeStorageKey = 'another-dimension-theme';
 let token = sessionStorage.getItem(sessionKey);
 let currentInvite = '';
 let operationId = null;
+let canReturnToChat = false;
 let latestChatSnapshot = null;
 let messageCursor = 0;
 let messageEpoch = null;
@@ -222,9 +224,14 @@ function show(view) {
   inviteView.hidden = view !== 'invite';
   chatView.hidden = view !== 'chat';
   historyDetail.hidden = view !== 'history';
+  syncChatReturnButton();
   if (managementDialog.open) managementDialog.close();
   if (view !== 'active') clearAddedCodeDisplay();
   return true;
+}
+
+function syncChatReturnButton() {
+  returnToChat.hidden = active.hidden || !canReturnToChat;
 }
 
 document.querySelector('#brand-home').addEventListener('click', () => {
@@ -232,6 +239,11 @@ document.querySelector('#brand-home').addEventListener('click', () => {
   if (!show(view)) return;
   message.textContent = '';
   if (typeof window.scrollTo === 'function') window.scrollTo({ top: 0, behavior: 'auto' });
+});
+
+returnToChat.addEventListener('click', () => {
+  if (!canReturnToChat || !operationId) return;
+  show('chat');
 });
 
 async function request(path, body = '', session = token) {
@@ -335,6 +347,7 @@ async function refreshIdentity() {
     }
     stopPolling();
     operationId = null;
+    canReturnToChat = false;
     latestChatSnapshot = null;
     sessionStorage.removeItem(operationKey);
     conversation.replaceChildren();
@@ -699,6 +712,9 @@ function appendMessages(items) {
 
 function updateChatView(snapshot) {
   latestChatSnapshot = snapshot;
+  canReturnToChat = Boolean(operationId)
+    && !['failed', 'disconnected', 'closed'].includes(snapshot.phase);
+  syncChatReturnButton();
   if (messageEpoch !== snapshot.messageEpoch) {
     conversation.replaceChildren();
     messageCursor = 0;
@@ -835,6 +851,8 @@ async function pollChat() {
     if (!response.ok) {
       if (response.status === 404) {
         if (!isCurrentPoll()) return;
+        canReturnToChat = false;
+        syncChatReturnButton();
         forgetRestoreJob(polledIdentityId, polledOperationId);
         chatStatus.textContent = '복원 작업을 찾을 수 없습니다. 프로그램이 재시작됐거나 작업이 만료됐을 수 있습니다.';
         missingRestoreJob = true;
@@ -872,6 +890,9 @@ async function pollChat() {
 async function attachChat(id) {
   stopPolling();
   operationId = id;
+  canReturnToChat = true;
+  latestChatSnapshot = null;
+  syncChatReturnButton();
   sessionStorage.setItem(operationKey, operationId);
   messageCursor = 0;
   messageEpoch = null;
@@ -1092,6 +1113,7 @@ document.querySelector('#logout').addEventListener('click', async () => {
     stopPolling();
     if (!(await request('/api/identity/logout')).ok) throw new Error('logout failed');
     operationId = null;
+    canReturnToChat = false;
     sessionStorage.removeItem(operationKey);
     latestChatSnapshot = null;
     identityId.textContent = '';
@@ -1117,6 +1139,12 @@ document.querySelectorAll('.disconnect').forEach((button) => button.addEventList
     if (!response.ok && response.status !== 401) throw new Error('disconnect failed');
   } catch (_) { message.textContent = '연결을 해제하지 못했습니다. 로컬 프로그램을 종료하세요.'; return; }
   token = null;
+  stopPolling();
+  operationId = null;
+  canReturnToChat = false;
+  latestChatSnapshot = null;
+  conversation.replaceChildren();
+  sessionStorage.removeItem(operationKey);
   sessionStorage.removeItem(sessionKey);
   identityId.textContent = '';
   show('bridge');
@@ -1288,6 +1316,7 @@ document.querySelector('#close-chat').addEventListener('click', async () => {
   stopPolling();
   if (closingOperationId) await request('/api/chat/cancel', closingOperationId).catch(() => {});
   operationId = null;
+  canReturnToChat = false;
   sessionStorage.removeItem(operationKey);
   latestChatSnapshot = null;
   conversation.replaceChildren();
