@@ -9,6 +9,8 @@ const createdNote = document.querySelector('#created-note');
 const active = document.querySelector('#identity-active');
 const managementDialog = document.querySelector('#management-dialog');
 const managementDialogTitle = document.querySelector('#management-dialog-title');
+const addedCode = document.querySelector('#added-code');
+const addedCodeView = document.querySelector('#added-code-view');
 const managementPanes = {
   settings: document.querySelector('#management-settings-pane'),
   identity: document.querySelector('#management-identity-pane'),
@@ -64,6 +66,7 @@ const reprotectWork = new window.ReprotectWork();
 let historySummaries = [];
 let dismissedTransitionKey = '';
 let activeNetworkMode = 'general';
+let addedCodeSaved = false;
 
 function applyTheme(theme, persist = true) {
   const selected = theme === 'dark' ? 'dark' : 'light';
@@ -87,6 +90,22 @@ document.querySelector('#theme-toggle').addEventListener('click', () => {
 
 const identityMenu = document.querySelector('#identity-menu');
 const identityMenuToggle = document.querySelector('#identity-menu-toggle');
+
+function clearAddedCodeDisplay() {
+  addedCode.value = '';
+  addedCodeView.hidden = true;
+  addedCodeSaved = false;
+}
+
+function confirmAddedCodeDismissal() {
+  const hasVisibleCode = !addedCodeView.hidden && Boolean(addedCode.value);
+  if (hasVisibleCode && !addedCodeSaved && !window.confirm(
+    '아직 파일로 저장하지 않은 코드가 표시되어 있습니다. 닫으면 코드가 지워져 다시 확인할 수 없습니다. 그래도 닫을까요?',
+  )) return false;
+  clearAddedCodeDisplay();
+  return true;
+}
+
 document.addEventListener('click', (event) => {
   if (identityMenu.open && !identityMenu.contains(event.target)) identityMenu.open = false;
 });
@@ -97,6 +116,8 @@ document.addEventListener('keydown', (event) => {
 function openManagementView(view, title) {
   const pane = managementPanes[view];
   if (!pane) return;
+  const leavingIdentityPane = !managementPanes.identity.hidden && view !== 'identity';
+  if (leavingIdentityPane && !confirmAddedCodeDismissal()) return;
   identityMenu.open = false;
   for (const [name, candidate] of Object.entries(managementPanes)) candidate.hidden = name !== view;
   managementDialogTitle.textContent = title;
@@ -107,8 +128,14 @@ function openManagementView(view, title) {
 document.querySelector('#menu-open-settings').addEventListener('click', () => openManagementView('settings', '연결 설정'));
 document.querySelector('#menu-open-identity').addEventListener('click', () => openManagementView('identity', '신원 관리'));
 document.querySelector('#menu-open-history').addEventListener('click', () => openManagementView('history', '대화 기록 관리'));
-document.querySelector('#close-management-dialog').addEventListener('click', () => managementDialog.close());
+document.querySelector('#close-management-dialog').addEventListener('click', () => {
+  if (confirmAddedCodeDismissal()) managementDialog.close();
+});
+managementDialog.addEventListener('cancel', (event) => {
+  if (!confirmAddedCodeDismissal()) event.preventDefault();
+});
 managementDialog.addEventListener('close', () => {
+  clearAddedCodeDisplay();
   if (!active.hidden) identityMenuToggle.focus();
 });
 
@@ -178,6 +205,7 @@ function clearReprotectState() {
 }
 
 function show(view) {
+  if (managementDialog.open && !confirmAddedCodeDismissal()) return false;
   identityMenu.open = false;
   bridgeForm.hidden = view !== 'bridge';
   entry.hidden = view !== 'entry';
@@ -187,10 +215,8 @@ function show(view) {
   chatView.hidden = view !== 'chat';
   historyDetail.hidden = view !== 'history';
   if (managementDialog.open) managementDialog.close();
-  if (view !== 'active') {
-    document.querySelector('#added-code').value = '';
-    document.querySelector('#added-code-view').hidden = true;
-  }
+  if (view !== 'active') clearAddedCodeDisplay();
+  return true;
 }
 
 async function request(path, body = '', session = token) {
@@ -877,8 +903,13 @@ document.querySelector('#add-code').addEventListener('click', async () => {
   try {
     const response = await request('/api/identity/add-code');
     if (!response.ok) { message.textContent = '새 코드를 발급하지 못했습니다.'; return; }
-    document.querySelector('#added-code').value = await response.text();
-    document.querySelector('#added-code-view').hidden = false;
+    addedCode.value = await response.text();
+    if (!managementDialog.open || managementPanes.identity.hidden) {
+      clearAddedCodeDisplay();
+      return;
+    }
+    addedCodeSaved = false;
+    addedCodeView.hidden = false;
   } catch (_) { message.textContent = '새 코드를 발급하지 못했습니다.'; }
 });
 
@@ -890,19 +921,20 @@ document.querySelector('#copy-added-code').addEventListener('click', async () =>
 });
 
 document.querySelector('#save-added-code').addEventListener('click', () => {
-  const value = document.querySelector('#added-code').value;
+  const value = addedCode.value;
+  if (!value) return;
   const url = URL.createObjectURL(new Blob([value + '\n'], { type: 'text/plain;charset=utf-8' }));
   const link = document.createElement('a');
   link.href = url;
   link.download = 'another-dimension-code.txt';
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+  addedCodeSaved = true;
   message.textContent = '코드 파일 저장을 시작했습니다.';
 });
 
 document.querySelector('#close-added-code').addEventListener('click', () => {
-  document.querySelector('#added-code').value = '';
-  document.querySelector('#added-code-view').hidden = true;
+  if (confirmAddedCodeDismissal()) clearAddedCodeDisplay();
 });
 
 document.querySelector('#network-mode-choice').addEventListener('change', (event) => {

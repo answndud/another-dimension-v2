@@ -184,8 +184,20 @@ test('dashboard menu closes on outside click and Escape; management dialog reuse
   assert.equal(identity.hidden, false);
   assert.equal(harness.element('#management-dialog').open, true);
 
+  await harness.click('#close-added-code');
+  assert.equal(harness.element('#added-code').value, 'issued-code');
+  assert.equal(addedCodeView.hidden, false);
+  await harness.click('#close-management-dialog');
+  assert.equal(harness.element('#management-dialog').open, true);
+  assert.equal(harness.element('#added-code').value, 'issued-code');
+  let prevented = false;
+  harness.element('#management-dialog').listeners.cancel({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  harness.window.confirm = () => true;
   await harness.click('#close-management-dialog');
   assert.equal(harness.element('#management-dialog').open, false);
+  assert.equal(harness.element('#added-code').value, '');
+  assert.equal(addedCodeView.hidden, true);
   assert.equal(harness.element('#identity-menu-toggle').focused, true);
 
   const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
@@ -198,7 +210,22 @@ test('dashboard menu closes on outside click and Escape; management dialog reuse
   assert.match(html, /--control-height:\s*44px/);
   assert.match(html, /\.conversation-options\s*\{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/);
   assert.match(html, /@media\s*\(max-width:\s*680px\)\s*\{\s*\.conversation-options\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\)/);
-  assert.match(html, /main:has\(\.identity-dashboard:not\(\[hidden\]\)\)\s*\{[^}]*align-items:\s*flex-start;[^}]*padding:\s*clamp\(48px, 8vh, 96px\)/);
+  assert.match(html, /main:has\(\.identity-dashboard:not\(\[hidden\]\)\)\s*\{[^}]*justify-content:\s*center/);
+  assert.match(html, /@media\s*\(max-width:\s*560px\)[\s\S]*?main:has\(\.identity-dashboard:not\(\[hidden\]\)\)\s*\{\s*justify-content:\s*flex-start/);
+  assert.match(html, /\.chat-header\s*\{[^}]*grid-row:\s*1/);
+  assert.match(html, /\.chat-status-strip\s*\{[^}]*grid-row:\s*2/);
+  assert.match(html, /\.chat-workflows\s*\{[^}]*grid-row:\s*3/);
+  assert.match(html, /#chat-view\s+#conversation\s*\{[^}]*grid-row:\s*4/);
+  assert.match(html, /#send-form\s*\{[^}]*grid-row:\s*5/);
+  assert.match(html, /main:has\(#chat-view:not\(\[hidden\]\)\)\s+#message\s*\{[^}]*flex:\s*0 0 52px;[^}]*width:\s*100%/);
+  assert.match(html, /#connect-form\s+h2/);
+  assert.match(html, /#connect-form\s*>\s*button,\s*#login-form\s+button\s*\{[^}]*width:\s*100%/);
+  assert.match(html, /#created,\s*#invite-view\s*\{[^}]*640px/);
+  assert.match(html, /\.management-pane\s*>\s*\.dashboard-card\s*\{[^}]*border:\s*0;[^}]*background:\s*transparent/);
+  assert.match(html, /\.history-bundle-row\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\)/);
+  assert.match(html, /\.history-item\s*\{[^}]*text-align:\s*left/);
+  assert.match(html, /#chat-text\s*\{[^}]*min-height:\s*48px/);
+  assert.equal((html.match(/#chat-text\s*\{/g) || []).length, 2, 'only base and mobile chat input sizing rules remain');
   const dashboard = html.slice(html.indexOf('<section id="identity-active"'), html.indexOf('<section id="invite-view"'));
   for (const copy of ['채팅 시작', '채팅방 생성', '초대 코드 생성', '채팅방 입장', '입장']) {
     assert.ok(dashboard.includes(copy), `dashboard copy missing: ${copy}`);
@@ -216,7 +243,7 @@ test('dashboard menu closes on outside click and Escape; management dialog reuse
   for (const requiredId of [
     'theme-toggle', 'identity-menu', 'logout', 'save-settings', 'add-code',
     'replace-identity', 'history-bundle-export', 'identity-active', 'create-invite',
-    'join-form', 'join-code', 'connect-form', 'identity-entry', 'created', 'invite-view',
+    'join-form', 'join-code', 'connect-form', 'connect-heading', 'identity-entry', 'created', 'invite-view',
     'chat-view', 'history-detail', 'added-code-view',
   ]) {
     assert.ok(ids.includes(requiredId), `required feature id missing: ${requiredId}`);
