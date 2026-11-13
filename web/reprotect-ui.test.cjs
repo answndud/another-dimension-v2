@@ -44,10 +44,11 @@ function file(name, contents) {
   };
 }
 
-function createHarness() {
+function createHarness(options = {}) {
   const elements = new Map();
   const requests = [];
   const storage = new Map();
+  const themeStorage = options.themeStorage || new Map();
   const element = (selector) => {
     if (!elements.has(selector)) {
       const target = {
@@ -67,6 +68,7 @@ function createHarness() {
     return elements.get(selector);
   };
   const document = {
+    documentElement: { dataset: {}, setAttribute() {} },
     querySelector: element,
     querySelectorAll: () => [],
     createElement: (tag) => element(`created:${tag}:${elements.size}`),
@@ -99,8 +101,12 @@ function createHarness() {
     setItem: (key, value) => storage.set(key, value),
     removeItem: (key) => storage.delete(key),
   };
+  const localStorage = {
+    getItem: (key) => themeStorage.get(key) || null,
+    setItem: (key, value) => themeStorage.set(key, value),
+  };
   const context = {
-    window, document, fetch, sessionStorage, FileReader, Uint8Array,
+    window, document, fetch, sessionStorage, localStorage, FileReader, Uint8Array,
     atob: (value) => Buffer.from(value, 'base64').toString('binary'),
     Blob, URL, console, setTimeout, clearTimeout, setInterval, clearInterval,
     queueMicrotask, Date, Math, Set, Map, Promise, Error, JSON,
@@ -113,7 +119,7 @@ function createHarness() {
     return callback({ preventDefault() {} });
   };
   const requestFor = (path) => requests.findLast((item) => item.path === path);
-  return { element, window, click, requests, requestFor, evaluate };
+  return { element, window, click, requests, requestFor, evaluate, themeStorage, document };
 }
 
 async function chooseSource(harness, sourceHandle) {
@@ -137,6 +143,29 @@ function enterSecrets(harness, suffix) {
   harness.element('#history-reprotect-new-password').value = `replacement-${suffix}-secret`;
   harness.element('#history-reprotect-new-password-confirm').value = `replacement-${suffix}-secret`;
 }
+
+test('actual UI: light and dark themes toggle and persist across reloads', async () => {
+  const themeStorage = new Map();
+  const first = createHarness({ themeStorage });
+  assert.equal(first.document.documentElement.dataset.theme, 'light');
+  first.element('#bridge-code').value = 'local-connection-code';
+  first.element('#identity-code').value = 'private-identity-code';
+  first.element('#created-note').textContent = '코드 생성 상태';
+  await first.click('#theme-toggle');
+  assert.equal(first.document.documentElement.dataset.theme, 'dark');
+  assert.equal(first.element('#theme-toggle').textContent, '라이트 모드');
+  assert.equal(themeStorage.get('another-dimension-theme'), 'dark');
+  assert.equal(first.element('#bridge-code').value, 'local-connection-code');
+  assert.equal(first.element('#identity-code').value, 'private-identity-code');
+  assert.equal(first.element('#created-note').textContent, '코드 생성 상태');
+
+  const reopened = createHarness({ themeStorage });
+  assert.equal(reopened.document.documentElement.dataset.theme, 'dark');
+  assert.equal(reopened.element('#theme-toggle').textContent, '라이트 모드');
+  await reopened.click('#theme-toggle');
+  assert.equal(reopened.document.documentElement.dataset.theme, 'light');
+  assert.equal(themeStorage.get('another-dimension-theme'), 'light');
+});
 
 test('actual UI: request A then B, and B completes before A', async () => {
   const h = createHarness();

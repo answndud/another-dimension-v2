@@ -29,6 +29,7 @@ const sessionKey = 'local-bridge-session';
 const operationKey = 'local-chat-operation';
 const restoreJobKey = 'local-history-restore-job';
 const historyDeleteJobKey = 'local-history-delete-jobs';
+const themeStorageKey = 'another-dimension-theme';
 let token = sessionStorage.getItem(sessionKey);
 let currentInvite = '';
 let operationId = null;
@@ -56,6 +57,26 @@ const reprotectWork = new window.ReprotectWork();
 let historySummaries = [];
 let dismissedTransitionKey = '';
 let activeNetworkMode = 'general';
+
+function applyTheme(theme, persist = true) {
+  const selected = theme === 'dark' ? 'dark' : 'light';
+  document.documentElement.dataset.theme = selected;
+  const toggle = document.querySelector('#theme-toggle');
+  toggle.textContent = selected === 'dark' ? '라이트 모드' : '다크 모드';
+  toggle.setAttribute('aria-pressed', String(selected === 'dark'));
+  if (persist) {
+    try { localStorage.setItem(themeStorageKey, selected); } catch (_) { /* keep the current page theme */ }
+  }
+}
+
+let initialTheme = 'light';
+try {
+  if (localStorage.getItem(themeStorageKey) === 'dark') initialTheme = 'dark';
+} catch (_) { /* use the default theme when storage is unavailable */ }
+applyTheme(initialTheme, false);
+document.querySelector('#theme-toggle').addEventListener('click', () => {
+  applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+});
 
 function appendMessageBody(container, text) {
   const source = String(text);
