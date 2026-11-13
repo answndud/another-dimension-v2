@@ -3987,6 +3987,7 @@ fn respond_settings(stream: &mut TcpStream, state: &State) -> io::Result<()> {
     )
 }
 
+#[cfg(test)]
 fn first_active_relay(relays: &[String]) -> &str {
     relays.first().map_or(DEFAULT_RELAY, String::as_str)
 }

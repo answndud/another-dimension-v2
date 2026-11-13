@@ -154,6 +154,7 @@ pub(crate) struct HistoryPage {
 pub(crate) struct RestoreMergeSummary {
     pub(crate) total_count: u64,
     pub(crate) imported_count: u64,
+    #[cfg(test)]
     pub(crate) peak_sort_buffer_bytes: usize,
 }
 
@@ -1387,6 +1388,7 @@ impl History {
             Ok(RestoreMergeSummary {
                 total_count,
                 imported_count,
+                #[cfg(test)]
                 peak_sort_buffer_bytes: peak_buffer_bytes,
             })
         })();
