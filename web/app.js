@@ -79,9 +79,10 @@ function applyTheme(theme, persist = true) {
   }
 }
 
-let initialTheme = 'light';
+let initialTheme = 'dark';
 try {
-  if (localStorage.getItem(themeStorageKey) === 'dark') initialTheme = 'dark';
+  const savedTheme = localStorage.getItem(themeStorageKey);
+  if (savedTheme === 'light' || savedTheme === 'dark') initialTheme = savedTheme;
 } catch (_) { /* use the default theme when storage is unavailable */ }
 applyTheme(initialTheme, false);
 document.querySelector('#theme-toggle').addEventListener('click', () => {
@@ -192,8 +193,8 @@ function clearReprotectSecrets() {
 }
 
 function clearReprotectState() {
-  reprotectWork.begin();
   discardReprotectOutput();
+  reprotectWork.begin();
   clearReprotectSecrets();
   reprotectSourceHandle = null;
   reprotectSourceName = '';
@@ -203,7 +204,6 @@ function clearReprotectState() {
   if (save) save.disabled = true;
 }
 
-function show(view) {
 function discardReprotectOutput() {
   if (reprotectOutput && reprotectOutput.transferId && token) {
     request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId: reprotectOutput.transferId })).catch(() => {});
@@ -212,6 +212,7 @@ function discardReprotectOutput() {
   reprotectPassword = '';
 }
 
+function show(view) {
   if (managementDialog.open && !confirmAddedCodeDismissal()) return false;
   identityMenu.open = false;
   bridgeForm.hidden = view !== 'bridge';
@@ -232,7 +233,6 @@ async function request(path, body = '', session = token) {
   return fetch(path, { method: 'POST', headers, body, cache: 'no-store' });
 }
 
-async function refreshIdentity() {
 const backupTransferChunkBytes = 256 * 1024;
 
 function bytesToBase64(bytes) {
@@ -316,6 +316,7 @@ async function saveBackupTransfer(action, payload, suggestedName) {
   return transfer.size;
 }
 
+async function refreshIdentity() {
   const response = await request('/api/identity/status');
   if (response.status === 401) { show('entry'); return false; }
   if (!response.ok) throw new Error('status failed');
@@ -1395,8 +1396,8 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     message.textContent = '백업 비밀번호는 12자 이상이어야 합니다.';
     return;
   }
-  try {
   let transferId = null;
+  try {
     const header = new Uint8Array(await file.slice(0, 8).arrayBuffer());
     const backupMagic = new TextDecoder().decode(header);
     const hasLinkedIdentityData = backupMagic === 'ADBACK5\0' || backupMagic === 'ADBACK7\0'
@@ -1428,8 +1429,8 @@ document.querySelector('#history-backup-import').addEventListener('click', async
   } catch (_) {
     message.textContent = '백업 파일을 읽거나 검증·저장하지 못했습니다. 기존 기록과 선택한 원본 파일은 보존됩니다.';
   } finally {
-    passwordField.value = '';
     if (transferId) await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId })).catch(() => {});
+    passwordField.value = '';
   }
 });
 
@@ -1570,13 +1571,13 @@ document.querySelector('#history-reprotect-save').addEventListener('click', asyn
     const verification = await request('/api/history/backup-transfer', JSON.stringify({
       action: 'verify', transferId: verificationId, password,
     }));
-    if (!isCurrent()) return;
     await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId: verificationId })).catch(() => {});
+    if (!isCurrent()) return;
     if (!verification.ok) throw new Error('saved backup verification failed');
     const result = await verification.json();
     if (!isCurrent()) return;
-    reprotectOutput = null;
     await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId: output.transferId })).catch(() => {});
+    reprotectOutput = null;
     reprotectPassword = '';
     document.querySelector('#history-reprotect-save').disabled = true;
     const removeSource = window.confirm(

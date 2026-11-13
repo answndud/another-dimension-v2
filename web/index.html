@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ko">
+<html lang="ko" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -187,7 +187,7 @@
     #send-form button { width: 100%; height: 48px; min-height: 48px; }
     #chat-view > .chat-end-row { display: none; }
     #message { min-height: 1.6rem; color: var(--muted); }
-    .theme-toggle { min-width: 7rem; }
+    .theme-toggle { width: 100%; min-width: 0; }
     .identity-header-actions { position: relative; }
     .identity-menu { position: relative; }
     .identity-menu > summary { display: flex; min-height: var(--control-height); align-items: center; justify-content: center; gap: var(--space-2); padding: var(--space-2) var(--space-3); border: 1px solid var(--input-border); border-radius: var(--radius-control); background: var(--button); font-size: 14px; font-weight: 500; cursor: pointer; list-style: none; }
@@ -393,11 +393,15 @@
   <header class="site-header">
     <h1>Another Dimension</h1>
     <div class="site-header-controls">
-      <button id="theme-toggle" class="theme-toggle" type="button" aria-label="테마 변경">다크 모드</button>
       <div class="identity-header-actions">
         <details id="identity-menu" class="identity-menu">
           <summary id="identity-menu-toggle" aria-label="관리 메뉴 열기"><span class="hamburger-icon" aria-hidden="true"><i></i><i></i><i></i></span><span>메뉴</span></summary>
           <div class="identity-menu-panel">
+            <section class="menu-group" aria-label="화면 설정">
+              <p class="menu-group-label">화면 설정</p>
+              <button id="theme-toggle" class="theme-toggle menu-item" type="button" aria-label="테마 변경">라이트 모드</button>
+            </section>
+            <div class="menu-divider" role="separator"></div>
             <nav class="menu-group" aria-label="관리">
               <p class="menu-group-label">관리</p>
               <button id="menu-open-settings" class="menu-item" type="button" data-management-view="settings">연결 설정</button>

@@ -250,7 +250,8 @@ test('dashboard menu closes on outside click and Escape; management dialog reuse
   assert.ok(menuPanel.indexOf('class="menu-group-label">관리') < menuPanel.indexOf('class="menu-group menu-account"'));
   assert.match(html, /\.identity-menu-panel\s*\{[^}]*width:\s*min\(240px/);
   assert.match(html, /\.menu-group-label\s*\{[^}]*text-align:\s*left/);
-  assert.ok(html.indexOf('id="theme-toggle"') < html.indexOf('id="identity-menu"'));
+  assert.ok(menuPanel.indexOf('class="menu-group-label">화면 설정') < menuPanel.indexOf('id="theme-toggle"'));
+  assert.ok(menuPanel.indexOf('id="theme-toggle"') < menuPanel.indexOf('class="menu-group-label">관리'));
   assert.match(html, /\.join-controls input, \.join-controls button\s*\{[^}]*height:\s*var\(--control-height\);[^}]*min-height:\s*var\(--control-height\);/);
   assert.match(html, /--control-height:\s*44px/);
   assert.match(html, /\.conversation-options\s*\{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/);
@@ -392,40 +393,40 @@ function sourceHandle(name, contents) {
   return entry;
 }
 
-function enterSecrets(harness, suffix) {
 function reprotectResponse(harness, encoded, transferId = `result-${harness.requests.length}`) {
   const bytes = Buffer.from(encoded, 'base64');
   harness.addTransferFile(transferId, bytes);
   return response(JSON.stringify({ transferId, size: bytes.length, messageCount: 1 }));
 }
 
+function enterSecrets(harness, suffix) {
   harness.element('#history-reprotect-previous-code').value = `code-${suffix}`;
   harness.element('#history-reprotect-previous-password').value = `old-${suffix}`;
   harness.element('#history-reprotect-new-password').value = `replacement-${suffix}-secret`;
   harness.element('#history-reprotect-new-password-confirm').value = `replacement-${suffix}-secret`;
 }
 
-test('actual UI: light and dark themes toggle and persist across reloads', async () => {
+test('actual UI: dark is the default and theme selection persists across reloads', async () => {
   const themeStorage = new Map();
   const first = createHarness({ themeStorage });
-  assert.equal(first.document.documentElement.dataset.theme, 'light');
+  assert.equal(first.document.documentElement.dataset.theme, 'dark');
   first.element('#bridge-code').value = 'local-connection-code';
   first.element('#identity-code').value = 'private-identity-code';
   first.element('#created-note').textContent = '코드 생성 상태';
   await first.click('#theme-toggle');
-  assert.equal(first.document.documentElement.dataset.theme, 'dark');
-  assert.equal(first.element('#theme-toggle').textContent, '라이트 모드');
-  assert.equal(themeStorage.get('another-dimension-theme'), 'dark');
+  assert.equal(first.document.documentElement.dataset.theme, 'light');
+  assert.equal(first.element('#theme-toggle').textContent, '다크 모드');
+  assert.equal(themeStorage.get('another-dimension-theme'), 'light');
   assert.equal(first.element('#bridge-code').value, 'local-connection-code');
   assert.equal(first.element('#identity-code').value, 'private-identity-code');
   assert.equal(first.element('#created-note').textContent, '코드 생성 상태');
 
   const reopened = createHarness({ themeStorage });
-  assert.equal(reopened.document.documentElement.dataset.theme, 'dark');
-  assert.equal(reopened.element('#theme-toggle').textContent, '라이트 모드');
-  await reopened.click('#theme-toggle');
   assert.equal(reopened.document.documentElement.dataset.theme, 'light');
-  assert.equal(themeStorage.get('another-dimension-theme'), 'light');
+  assert.equal(reopened.element('#theme-toggle').textContent, '다크 모드');
+  await reopened.click('#theme-toggle');
+  assert.equal(reopened.document.documentElement.dataset.theme, 'dark');
+  assert.equal(themeStorage.get('another-dimension-theme'), 'dark');
 });
 
 test('actual UI: request A then B, and B completes before A', async () => {
