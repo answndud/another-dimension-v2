@@ -1461,7 +1461,18 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     const response = await request('/api/history/backup-transfer', JSON.stringify({ action: 'import', transferId, password }));
     transferId = null;
     if (response.status === 409) { setImportResult('failure'); message.textContent = '먼저 모든 대화 연결을 종료한 뒤 다시 시도하세요.'; return; }
-    if (!response.ok) { setImportResult('failure'); message.textContent = (await response.text()) || '백업을 검증하거나 저장하지 못했습니다.'; return; }
+    if (!response.ok) {
+      const detail = (await response.text()) || '백업을 검증하거나 저장하지 못했습니다.';
+      const partial = detail.match(/backup bundle failed after applying (\d+) conversation\(s\):/i);
+      setImportResult('failure');
+      if (partial && Number(partial[1]) > 0) {
+        await refreshHistoryList();
+        message.textContent = `${detail} 기록 목록을 새로고침해 적용된 대화를 확인하고, 원본 백업 파일은 보관하세요. 미적용 대화만 선택해 재시도하는 기능은 없습니다.`;
+      } else {
+        message.textContent = detail;
+      }
+      return;
+    }
     const result = await response.json();
     imported = true;
     setImportResult('success');

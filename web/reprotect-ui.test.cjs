@@ -568,13 +568,24 @@ test('legacy streaming backup formats warn about their integrity and privacy lim
 test('backup import presents the server-reported partial bundle count', async () => {
   const detail = 'backup bundle failed after applying 1 conversation(s): backup bundle authentication failed';
   const h = createHarness({ importFailure: detail });
-  h.element('#history-backup-file').files = [file('bundle.adbak', 'ADPACK3\0payload')];
+  const original = file('bundle.adpak', 'ADPACK3\0payload');
+  h.element('#history-backup-file').files = [original];
   h.window.confirm = () => true;
-  await h.click('#history-backup-import');
-  assert.equal(h.element('#message').textContent, detail);
+  const task = h.click('#history-backup-import');
+  await new Promise((resolve) => setImmediate(resolve));
+  const listRequest = h.requestFor('/api/history/list');
+  assert.ok(listRequest, 'partial application refreshes the conversation list');
+  listRequest.resolve(response(JSON.stringify([{
+    peerId: 'cd'.repeat(32), messageCount: 3, lastMessage: 1234, verified: true,
+  }])));
+  await task;
+  assert.equal(h.element('#message').textContent, `${detail} 기록 목록을 새로고침해 적용된 대화를 확인하고, 원본 백업 파일은 보관하세요. 미적용 대화만 선택해 재시도하는 기능은 없습니다.`);
   assert.equal(h.element('#history-backup-import-result').textContent, '백업 가져오기 실패');
   assert.equal(h.element('#history-backup-import-result').dataset.result, 'failure');
   assert.equal(h.element('#history-backup-import-result').hidden, false);
+  assert.equal(h.element('#history-list').children.length, 1);
+  assert.equal(h.element('#history-list').children[0].children[1].children[0].textContent, '대화 cdcdcdcdcdcd');
+  assert.equal(h.element('#history-backup-file').files[0], original);
 });
 
 test('backup import exposes success on the import control after a successful response', async () => {
