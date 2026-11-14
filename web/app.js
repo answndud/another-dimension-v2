@@ -1453,6 +1453,7 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     importStatus.dataset.result = result;
     importStatus.textContent = result === 'success' ? '백업 가져오기 성공'
       : result === 'cleanup-warning' ? '가져오기 완료 · 임시 파일 정리 실패'
+        : result === 'unknown' ? '가져오기 결과 확인 필요'
         : '백업 가져오기 실패';
     importStatus.hidden = false;
   };
@@ -1475,6 +1476,7 @@ document.querySelector('#history-backup-import').addEventListener('click', async
   }
   let transferId = null;
   let imported = false;
+  let importRequestStarted = false;
   try {
     const header = new Uint8Array(await file.slice(0, 8).arrayBuffer());
     if (!isCurrentImport()) return;
@@ -1490,6 +1492,7 @@ document.querySelector('#history-backup-import').addEventListener('click', async
       && !window.confirm('이 백업에는 이전 신원 연결 정보가 포함될 수 있습니다. 파일 인증에 성공한 경우에만 해당 관계를 이 기기에 복원합니다. 계속할까요?')) return;
     transferId = await uploadBackupFile(file, isCurrentImport, importSession);
     if (!isCurrentImport()) return;
+    importRequestStarted = true;
     const response = await request('/api/history/backup-transfer', JSON.stringify({ action: 'import', transferId, password }), importSession);
     transferId = null;
     if (!isCurrentImport()) return;
@@ -1533,9 +1536,13 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     if (!isCurrentImport()) return;
     if (imported) {
       message.textContent = '백업은 가져왔지만 화면을 갱신하지 못했습니다. 기록을 다시 불러오세요.';
+    } else if (importRequestStarted) {
+      setImportResult('unknown');
+      message.textContent = '가져오기 요청을 보낸 뒤 결과를 확인하지 못했습니다. 기록 목록을 새로고침해 적용 여부를 확인하고, 선택한 원본 백업 파일은 보관하세요. 전체 묶음을 다시 가져와도 안전한 재개라고 보장되지 않습니다.';
+      try { await refreshHistoryList(isCurrentImport); } catch (_) { /* preserve the unknown import result */ }
     } else {
       setImportResult('failure');
-      message.textContent = '백업 파일을 읽거나 검증·저장하지 못했습니다. 기존 기록과 선택한 원본 파일은 보존됩니다.';
+      message.textContent = '가져오기 요청 전에 백업 파일을 읽거나 업로드하지 못했습니다. 기록 가져오기는 시작되지 않았으며 선택한 원본 백업 파일은 유지됩니다.';
     }
   } finally {
     if (transferId) {

@@ -113,7 +113,8 @@ function createHarness(options = {}) {
         const prior = transferFiles.get(payload.transferId) || Buffer.alloc(0);
         const bytes = Buffer.from(payload.data, 'base64');
         transferFiles.set(payload.transferId, Buffer.concat([prior, bytes]));
-        if (!options.manualUploadChunks) pending.resolve(response(JSON.stringify({ offset: prior.length + bytes.length })));
+        if (options.uploadChunkReject) pending.reject(new Error('upload failed'));
+        else if (!options.manualUploadChunks) pending.resolve(response(JSON.stringify({ offset: prior.length + bytes.length })));
       } else if (payload.action === 'cleanup') {
         transferFiles.delete(payload.transferId);
         pending.resolve(response('{"ok":true}'));
@@ -131,7 +132,11 @@ function createHarness(options = {}) {
         transferFiles.set(transferId, Buffer.from('exported backup'));
         pending.resolve(response(JSON.stringify({ transferId, size: transferFiles.get(transferId).length })));
       } else if (payload.action === 'import') {
-        if (!options.manualImport) {
+        if (options.importFetchReject) pending.reject(new Error('connection lost'));
+        else if (options.importTextReject) pending.resolve({
+          ok: false, status: 500, text: async () => { throw new Error('response body unavailable'); },
+        });
+        else if (!options.manualImport) {
           pending.resolve(options.importFailure
             ? response(options.importFailure, 400)
             : response(options.importResult
@@ -663,6 +668,42 @@ test('completed import with upload cleanup failure refreshes the list and explai
   assert.equal(h.element('#history-backup-file').files[0], original);
 });
 
+test('backup import distinguishes an unconfirmed server result from pre-request upload failure', async (t) => {
+  for (const outcome of ['fetch rejected after import request', 'response body unreadable']) {
+    await t.test(outcome, async () => {
+      const h = createHarness(outcome === 'fetch rejected after import request'
+        ? { importFetchReject: true }
+        : { importTextReject: true });
+      h.element('#history-backup-file').files = [file('backup.adbak', 'ADBACK4\0payload')];
+      const task = h.click('#history-backup-import');
+      const importRequest = await waitForRequest(() => h.requestForAction('import'));
+      assert.ok(importRequest);
+      const listRequest = await waitForRequest(() => h.requestFor('/api/history/list'));
+      listRequest.resolve(response('[]'));
+      await task;
+      assert.equal(h.element('#history-backup-import-result').dataset.result, 'unknown');
+      assert.equal(h.element('#history-backup-import-result').textContent, '가져오기 결과 확인 필요');
+      assert.match(h.element('#message').textContent, /가져오기 요청을 보낸 뒤 결과를 확인하지 못했습니다/);
+      assert.match(h.element('#message').textContent, /기록 목록을 새로고침해 적용 여부를 확인/);
+      assert.match(h.element('#message').textContent, /원본 백업 파일은 보관/);
+      assert.doesNotMatch(h.element('#message').textContent, /기존 기록과 선택한 원본 파일은 보존됩니다/);
+      assert.equal(h.element('#history-backup-file').files[0].name, 'backup.adbak');
+    });
+  }
+
+  await t.test('upload fails before import was sent', async () => {
+    const h = createHarness({ uploadChunkReject: true });
+    h.element('#history-backup-file').files = [file('large.adbak', `ADBACK4\0${'x'.repeat(300000)}`)];
+    const task = h.click('#history-backup-import');
+    await task;
+    assert.equal(h.requestForAction('import'), undefined);
+    assert.equal(h.element('#history-backup-import-result').dataset.result, 'failure');
+    assert.match(h.element('#message').textContent, /가져오기 요청 전에 백업 파일을 읽거나 업로드하지 못했습니다/);
+    assert.match(h.element('#message').textContent, /기록 가져오기는 시작되지 않았으며/);
+    assert.doesNotMatch(h.element('#message').textContent, /기존 기록과 선택한 원본 파일은 보존됩니다/);
+  });
+});
+
 test('a partial import list response from the previous identity cannot replace the new identity list', async () => {
   const detail = 'backup bundle failed after applying 1 conversation(s): linked identity store failed';
   const h = createHarness({ importFailure: detail });
@@ -756,7 +797,7 @@ test('a superseded import cannot clear the newer import file or password', async
 
   h.element('#history-backup-file').files = [file('next.adbak', 'ADBACK4\0next')];
   h.element('#history-backup-import-password').value = 'password-for-the-next-import';
-  olderRequest.resolve(response(JSON.stringify({ conversations: [] })));
+  olderRequest.reject(new Error('older import response lost'));
   await olderTask;
 
   assert.equal(h.element('#history-backup-file').files[0].name, 'next.adbak');
