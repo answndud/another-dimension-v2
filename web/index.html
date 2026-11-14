@@ -516,6 +516,7 @@
                   <div><p class="eyebrow">SAVED LOCALLY</p><h3 id="history-heading">대화 기록</h3></div>
                   <button id="history-bundle-export" type="button">선택 백업</button>
                 </div>
+                <p class="meta">대화 묶음 백업은 한 번에 최대 128개 대화까지 선택할 수 있습니다.</p>
                 <div class="history-tools">
                   <label class="history-import-label" for="contact-file">상대방 신원 정보 백업 가져오기</label>
                   <div class="history-import-controls">
@@ -687,7 +688,7 @@
               </div>
               <div class="history-tool-card">
                 <h4>암호화 백업</h4>
-                <p class="meta">새 백업은 개인 접속 코드에서 만든 키로 암호화합니다. 비밀번호는 선택 사항입니다. 설정하면 코드와 비밀번호가 모두 있어야 복호화할 수 있고, 둘 중 하나라도 잃으면 복구할 수 없습니다. 비밀번호를 비우면 코드만 사용합니다. 이전 ADBACK2는 암호화 키를 백업 비밀번호로 만들지만 파일 인증은 이전 신원 공개키에도 묶여 있어 이전 코드가 필요합니다. 새 보호는 이전 파일에 소급 적용되지 않습니다.</p>
+                <p class="meta">새 ADBACK7 백업은 개인 접속 코드에서 파생한 키로 보호합니다. 비밀번호는 선택 사항입니다. 설정하면 코드와 비밀번호가 모두 복원에 필요합니다. ADBACK2는 암호화 키를 백업 비밀번호에서 유도하고 공개 신원 ID를 인증 데이터(AAD)에 포함합니다. 앱 가져오기는 해당 신원 문맥도 요구하지만, 공개 ID는 비밀이 아니며 ADBACK2의 암호화 키에 개인 코드가 결합된 것은 아닙니다. 새 형식의 보호는 이전 파일에 소급 적용되지 않습니다.</p>
                 <label for="history-backup-export-password">백업 비밀번호 (선택, 12자 이상)</label>
                 <input id="history-backup-export-password" type="password" autocomplete="new-password" maxlength="1024">
                 <label for="history-backup-export-password-confirm">백업 비밀번호 확인</label>

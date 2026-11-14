@@ -414,6 +414,24 @@ test('history detail separates browsing, backup and deletion without replacing f
   assert.match(html, /다른 신원의 코드를 입력하면 해당 신원으로 로그인됩니다\./);
 });
 
+test('bundle export accepts 128 selections and rejects 129 before requesting a backup', async () => {
+  const h = createHarness();
+  let count = 128;
+  let confirmations = 0;
+  h.element('#history-list').querySelectorAll = () =>
+    Array.from({ length: count }, (_, index) => ({ dataset: { bundlePeerId: String(index) } }));
+  h.window.confirm = () => { confirmations += 1; return false; };
+
+  await h.click('#history-bundle-export');
+  assert.equal(confirmations, 1);
+
+  count = 129;
+  await h.click('#history-bundle-export');
+  assert.equal(confirmations, 1);
+  assert.match(h.element('#message').textContent, /최대 128개/);
+  assert.equal(h.requests.some((request) => request.path === '/api/history/backup-transfer'), false);
+});
+
 test('whole-conversation deletion remains explicitly confirmed and locally scoped', async () => {
   const h = createHarness();
   let prompt = '';

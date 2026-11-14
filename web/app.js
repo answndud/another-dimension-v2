@@ -1411,6 +1411,7 @@ document.querySelector('#history-bundle-export').addEventListener('click', async
   const peerIds = [...historyList.querySelectorAll('input[data-bundle-peer-id]:checked')]
     .map(input => input.dataset.bundlePeerId);
   if (!peerIds.length) { message.textContent = '백업할 대화를 선택하세요.'; return; }
+  if (peerIds.length > 128) { message.textContent = '대화 묶음 백업은 한 번에 최대 128개 대화까지 선택할 수 있습니다.'; return; }
   if (!window.confirm(`선택한 ${peerIds.length}개 대화를 암호화 백업으로 저장할까요?`)) return;
   try {
     await saveBackupTransfer('bundle-export', { peerIds }, 'another-dimension-conversations.adbak');
