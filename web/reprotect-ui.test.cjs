@@ -113,7 +113,7 @@ function createHarness(options = {}) {
         const prior = transferFiles.get(payload.transferId) || Buffer.alloc(0);
         const bytes = Buffer.from(payload.data, 'base64');
         transferFiles.set(payload.transferId, Buffer.concat([prior, bytes]));
-        pending.resolve(response(JSON.stringify({ offset: prior.length + bytes.length })));
+        if (!options.manualUploadChunks) pending.resolve(response(JSON.stringify({ offset: prior.length + bytes.length })));
       } else if (payload.action === 'cleanup') {
         transferFiles.delete(payload.transferId);
         pending.resolve(response('{"ok":true}'));
@@ -131,10 +131,12 @@ function createHarness(options = {}) {
         transferFiles.set(transferId, Buffer.from('exported backup'));
         pending.resolve(response(JSON.stringify({ transferId, size: transferFiles.get(transferId).length })));
       } else if (payload.action === 'import') {
-        pending.resolve(options.importFailure
-          ? response(options.importFailure, 400)
-          : response(options.importResult
-            || JSON.stringify({ peerId: 'ab'.repeat(32), messageCount: 1, linkedIdentityRestored: false })));
+        if (!options.manualImport) {
+          pending.resolve(options.importFailure
+            ? response(options.importFailure, 400)
+            : response(options.importResult
+              || JSON.stringify({ peerId: 'ab'.repeat(32), messageCount: 1, linkedIdentityRestored: false })));
+        }
       }
     }
     return pending.promise;
@@ -174,6 +176,34 @@ function createHarness(options = {}) {
   const requestForAction = (action) => requests.findLast((item) => item.path === '/api/history/backup-transfer' && JSON.parse(item.init.body).action === action);
   const addTransferFile = (id, bytes) => transferFiles.set(id, Buffer.from(bytes));
   return { element, window, click, requests, requestFor, requestForAction, addTransferFile, evaluate, themeStorage, document };
+}
+
+async function refreshHarnessAs(h, identity, historyItems = []) {
+  const refresh = h.evaluate('refreshIdentity()');
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/identity/status').resolve(response(identity));
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/settings/get').resolve(response(JSON.stringify({
+    savedMode: 'general', socks: null, activeMode: 'general', activeSocks: null,
+    restartRequired: false, notifications: false,
+    savedRelays: ['wss://relay.primal.net'], activeRelays: ['wss://relay.primal.net'],
+  })));
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/history/list').resolve(response(JSON.stringify(historyItems)));
+  await refresh;
+}
+
+function historySummary(peerId, messageCount = 1) {
+  return { peerId, messageCount, lastMessage: 1234, verified: true };
+}
+
+async function waitForRequest(getRequest) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const found = getRequest();
+    if (found) return found;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail('expected request was not issued');
 }
 
 test('dashboard menu closes on outside click and Escape; management dialog reuses the selected pane and restores focus', async () => {
@@ -654,6 +684,102 @@ test('a partial import list response from the previous identity cannot replace t
   assert.equal(h.element('#message').textContent, '신원 B의 화면 상태');
   assert.deepEqual(h.element('#history-list').children, [newIdentityRow]);
   assert.equal(h.element('#history-backup-import-result').hidden, true);
+});
+
+test('successful import list refresh from A cannot update B or a later A session', async () => {
+  const h = createHarness({ manualImport: true });
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'bridge-session-A'");
+  h.element('#history-backup-file').files = [file('bundle.adpak', 'ADPACK3\0payload')];
+  h.window.confirm = () => true;
+  const task = h.click('#history-backup-import');
+  const importRequest = await waitForRequest(() => h.requestForAction('import'));
+  importRequest.resolve(response(JSON.stringify({ conversations: [] })));
+  const delayedAList = await waitForRequest(() => h.requestFor('/api/history/list'));
+  assert.equal(h.element('#history-backup-import-result').hidden, true);
+
+  await refreshHarnessAs(h, 'identity-B', [historySummary('b1'.repeat(32), 2)]);
+  assert.match(h.element('#history-list').children[0].children[1].children[0].textContent, /^대화 b1/);
+  await refreshHarnessAs(h, 'identity-A', [historySummary('a2'.repeat(32), 3)]);
+  h.element('#message').textContent = '새 A 세션의 안내';
+  h.element('#history-backup-import-result').textContent = '새 A 세션의 가져오기 상태';
+  h.element('#history-backup-import-result').hidden = false;
+  delayedAList.resolve(response(JSON.stringify([historySummary('a1'.repeat(32), 99)])));
+  await task;
+
+  assert.equal(h.element('#identity-id').textContent, 'identity-A');
+  assert.equal(h.element('#message').textContent, '새 A 세션의 안내');
+  assert.equal(h.element('#history-backup-import-result').textContent, '새 A 세션의 가져오기 상태');
+  assert.match(h.element('#history-list').children[0].children[1].children[0].textContent, /^대화 a2/);
+});
+
+test('logout and relogin to the same identity invalidate an older import response', async () => {
+  const h = createHarness({ manualImport: true });
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'bridge-session-A'");
+  h.element('#history-backup-file').files = [file('single.adbak', 'ADBACK4\0payload')];
+  const oldImport = h.click('#history-backup-import');
+  const delayedImport = await waitForRequest(() => h.requestForAction('import'));
+
+  await h.click('#logout');
+  await refreshHarnessAs(h, 'identity-A', [historySummary('a3'.repeat(32), 4)]);
+  h.element('#message').textContent = '재로그인한 A의 안내';
+  h.element('#history-backup-import-result').textContent = '재로그인한 A의 상태';
+  h.element('#history-backup-import-result').hidden = false;
+  delayedImport.resolve(response(JSON.stringify({ conversations: [] })));
+  await oldImport;
+
+  assert.equal(h.element('#message').textContent, '재로그인한 A의 안내');
+  assert.equal(h.element('#history-backup-import-result').textContent, '재로그인한 A의 상태');
+  assert.match(h.element('#history-list').children[0].children[1].children[0].textContent, /^대화 a3/);
+});
+
+test('a superseded import cannot clear the newer import file or password', async () => {
+  const h = createHarness({ manualImport: true });
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'bridge-session-A'");
+  h.element('#history-backup-file').files = [file('older.adbak', 'ADBACK4\0older')];
+  h.element('#history-backup-import-password').value = 'older-password-long';
+  const olderTask = h.click('#history-backup-import');
+  const olderRequest = await waitForRequest(() => h.requestForAction('import'));
+
+  const newerFile = file('newer.adpak', 'ADPACK3\0newer');
+  h.element('#history-backup-file').files = [newerFile];
+  h.element('#history-backup-import-password').value = 'newer-password-long';
+  h.window.confirm = () => true;
+  const newerTask = h.click('#history-backup-import');
+  const newerRequest = await waitForRequest(() => {
+    const current = h.requestForAction('import');
+    return current !== olderRequest ? current : null;
+  });
+  assert.notEqual(newerRequest, olderRequest);
+  newerRequest.resolve(response(JSON.stringify({ conversations: [] })));
+  (await waitForRequest(() => h.requestFor('/api/history/list'))).resolve(response('[]'));
+  await newerTask;
+
+  h.element('#history-backup-file').files = [file('next.adbak', 'ADBACK4\0next')];
+  h.element('#history-backup-import-password').value = 'password-for-the-next-import';
+  olderRequest.resolve(response(JSON.stringify({ conversations: [] })));
+  await olderTask;
+
+  assert.equal(h.element('#history-backup-file').files[0].name, 'next.adbak');
+  assert.equal(h.element('#history-backup-import-password').value, 'password-for-the-next-import');
+  assert.equal(h.element('#history-backup-import-result').textContent, '백업 가져오기 성공');
+});
+
+test('superseded upload cleanup uses the session that created its transfer', async () => {
+  const h = createHarness({ manualUploadChunks: true });
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'bridge-session-A'");
+  h.element('#history-backup-file').files = [file('large.adbak', `ADBACK4\0${'x'.repeat(300000)}`)];
+  h.element('#history-backup-import-password').value = 'old-session-password';
+  const task = h.click('#history-backup-import');
+  const chunk = await waitForRequest(() => h.requestForAction('upload-chunk'));
+
+  h.evaluate("token = 'bridge-session-B'; identitySessionGeneration += 1");
+  h.element('#history-backup-import-password').value = 'new-session-password';
+  chunk.resolve(response(JSON.stringify({ offset: 256 * 1024 })));
+  await task;
+  const cleanup = h.requestForAction('cleanup');
+  assert.equal(cleanup.init.headers.Authorization, 'Bearer bridge-session-A');
+  assert.equal(h.element('#history-backup-import-password').value, 'new-session-password');
+  assert.equal(h.requestForAction('import'), undefined);
 });
 
 test('backup import exposes success on the import control after a successful response', async () => {

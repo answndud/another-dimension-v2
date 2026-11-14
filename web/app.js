@@ -65,6 +65,8 @@ let reprotectSourceName = '';
 let reprotectOutput = null;
 let reprotectPassword = '';
 const reprotectWork = new window.ReprotectWork();
+const backupImportWork = new window.ReprotectWork();
+let identitySessionGeneration = 0;
 let historySummaries = [];
 let dismissedTransitionKey = '';
 let activeNetworkMode = 'general';
@@ -262,29 +264,31 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
-async function backupTransferRequest(payload) {
-  const response = await request('/api/history/backup-transfer', JSON.stringify(payload));
+async function backupTransferRequest(payload, session = token) {
+  const response = await request('/api/history/backup-transfer', JSON.stringify(payload), session);
   if (!response.ok) throw new Error((await response.text()) || 'backup transfer failed');
   return response;
 }
 
-async function uploadBackupFile(file, isCurrent = () => true) {
-  const begin = await backupTransferRequest({ action: 'upload-start' });
+async function uploadBackupFile(file, isCurrent = () => true, session = token) {
+  const begin = await backupTransferRequest({ action: 'upload-start' }, session);
   const { transferId } = await begin.json();
   try {
+    if (!isCurrent()) throw new Error('backup transfer superseded');
     for (let offset = 0; offset < file.size; offset += backupTransferChunkBytes) {
       if (!isCurrent()) throw new Error('backup transfer superseded');
       const bytes = new Uint8Array(await file.slice(offset, offset + backupTransferChunkBytes).arrayBuffer());
       if (!isCurrent()) throw new Error('backup transfer superseded');
       const acknowledgement = await backupTransferRequest({
         action: 'upload-chunk', transferId, offset, data: bytesToBase64(bytes),
-      });
+      }, session);
       const result = await acknowledgement.json();
+      if (!isCurrent()) throw new Error('backup transfer superseded');
       if (result.offset !== offset + bytes.length) throw new Error('backup upload position mismatch');
     }
     return transferId;
   } catch (error) {
-    await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId })).catch(() => {});
+    await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId }), session).catch(() => {});
     throw error;
   }
 }
@@ -337,10 +341,15 @@ async function saveBackupTransfer(action, payload, suggestedName) {
 
 async function refreshIdentity() {
   const response = await request('/api/identity/status');
-  if (response.status === 401) { show('entry'); return false; }
+  if (response.status === 401) {
+    identitySessionGeneration += 1;
+    show('entry');
+    return false;
+  }
   if (!response.ok) throw new Error('status failed');
   const currentIdentityId = await response.text();
   const previousIdentityId = identityId.textContent.trim();
+  if (previousIdentityId !== currentIdentityId) identitySessionGeneration += 1;
   if (previousIdentityId && previousIdentityId !== currentIdentityId) {
     if (latestChatSnapshot && ['merge-queued', 'merging'].includes(latestChatSnapshot.historyRestoreState) && operationId) {
       rememberRestoreJob(operationId);
@@ -528,25 +537,27 @@ async function refreshNetworkSettings() {
     : '';
 }
 
-async function refreshHistoryList() {
+async function refreshHistoryList(isCurrent = () => true) {
   const requestedIdentityId = identityId.textContent.trim();
+  const ownsList = () => isCurrent() && identityId.textContent.trim() === requestedIdentityId;
+  if (!ownsList()) return;
   historyList.replaceChildren();
   historySummaries = [];
   let items;
   try {
     const response = await request('/api/history/list');
-    if (identityId.textContent.trim() !== requestedIdentityId) return;
+    if (!ownsList()) return;
     if (!response.ok) throw new Error('history list unavailable');
     items = await response.json();
   } catch (_) {
-    if (identityId.textContent.trim() !== requestedIdentityId) return;
+    if (!ownsList()) return;
     const error = document.createElement('p');
     error.className = 'meta';
     error.textContent = '대화 기록 목록을 불러오지 못했습니다.';
     historyList.append(error);
     return;
   }
-  if (identityId.textContent.trim() !== requestedIdentityId) return;
+  if (!ownsList()) return;
   historySummaries = items;
   verifiedPeers = new Set(items.filter(item => item.verified).map(item => item.peerId));
   for (const item of items) {
@@ -636,7 +647,8 @@ function updateSelectionCount() {
     : '선택한 메시지 없음';
 }
 
-async function openHistory(peerId) {
+async function openHistory(peerId, isCurrent = () => true) {
+  if (!isCurrent()) return false;
   selectedHistoryPeer = peerId;
   selectedHistoryIndices.clear();
   historyCursorStack = [null];
@@ -646,20 +658,24 @@ async function openHistory(peerId) {
   document.querySelector('#contact-reconnect').hidden = !verifiedPeers.has(peerId);
   document.querySelector('#contact-export').hidden = !verifiedPeers.has(peerId);
   messageFilter.value = '';
-  if (!(await loadHistoryPage(null))) return false;
+  if (!(await loadHistoryPage(null, isCurrent)) || !isCurrent()) return false;
   show('history');
   return true;
 }
 
-async function loadHistoryPage(cursor) {
+async function loadHistoryPage(cursor, isCurrent = () => true) {
   const requestedIdentityId = identityId.textContent.trim();
   const requestedPeerId = selectedHistoryPeer;
+  const ownsPage = () => isCurrent()
+    && identityId.textContent.trim() === requestedIdentityId
+    && selectedHistoryPeer === requestedPeerId;
+  if (!ownsPage()) return false;
   const response = await request('/api/history/messages', JSON.stringify({
     peerId: requestedPeerId,
     cursor,
     limit: historyPageSize,
   }));
-  if (identityId.textContent.trim() !== requestedIdentityId || selectedHistoryPeer !== requestedPeerId) return false;
+  if (!ownsPage()) return false;
   if (response.status === 409) {
     message.textContent = '기록이 바뀌어 선택을 적용할 수 없습니다. 다시 불러와 선택을 갱신하세요.';
     document.querySelector('#history-page-reload').disabled = false;
@@ -667,7 +683,7 @@ async function loadHistoryPage(cursor) {
   }
   if (!response.ok) { message.textContent = '대화 기록을 열지 못했습니다.'; return false; }
   const page = await response.json();
-  if (identityId.textContent.trim() !== requestedIdentityId || selectedHistoryPeer !== requestedPeerId) return false;
+  if (!ownsPage()) return false;
   selectedHistoryMessages = page.messages;
   historyPageVersion = page.version;
   historyNextCursor = page.nextCursor;
@@ -936,6 +952,7 @@ async function restoreSession() {
       return;
     }
     token = null;
+    identitySessionGeneration += 1;
     sessionStorage.removeItem(sessionKey);
     sessionStorage.removeItem(operationKey);
     show('bridge');
@@ -953,6 +970,7 @@ bridgeForm.addEventListener('submit', async (event) => {
     bridgeCode.value = '';
     if (!response.ok) { message.textContent = '연결할 수 없습니다. 터미널에서 새 코드를 발급받으세요.'; return; }
     token = await response.text();
+    identitySessionGeneration += 1;
     sessionStorage.setItem(sessionKey, token);
     await refreshIdentity();
   } catch (_) { message.textContent = '로컬 프로그램에 연결할 수 없습니다.'; }
@@ -1106,6 +1124,7 @@ loginForm.addEventListener('submit', async (event) => {
 });
 
 document.querySelector('#logout').addEventListener('click', async () => {
+  identitySessionGeneration += 1;
   try {
     if (latestChatSnapshot && ['merge-queued', 'merging'].includes(latestChatSnapshot.historyRestoreState) && operationId) {
       rememberRestoreJob(operationId);
@@ -1134,6 +1153,7 @@ document.querySelector('#logout').addEventListener('click', async () => {
 });
 
 document.querySelectorAll('.disconnect').forEach((button) => button.addEventListener('click', async () => {
+  identitySessionGeneration += 1;
   try {
     const response = await request('/api/disconnect');
     if (!response.ok && response.status !== 401) throw new Error('disconnect failed');
@@ -1420,8 +1440,14 @@ document.querySelector('#history-bundle-export').addEventListener('click', async
 });
 
 document.querySelector('#history-backup-import').addEventListener('click', async () => {
+  const workGeneration = backupImportWork.begin();
   const importIdentityId = identityId.textContent.trim();
-  const isCurrentImportIdentity = () => identityId.textContent.trim() === importIdentityId;
+  const importSession = token;
+  const importSessionGeneration = identitySessionGeneration;
+  const isCurrentImport = () => backupImportWork.isCurrent(workGeneration)
+    && identitySessionGeneration === importSessionGeneration
+    && identityId.textContent.trim() === importIdentityId
+    && token === importSession;
   const importStatus = document.querySelector('#history-backup-import-result');
   const setImportResult = (result) => {
     importStatus.dataset.result = result;
@@ -1451,7 +1477,7 @@ document.querySelector('#history-backup-import').addEventListener('click', async
   let imported = false;
   try {
     const header = new Uint8Array(await file.slice(0, 8).arrayBuffer());
-    if (!isCurrentImportIdentity()) return;
+    if (!isCurrentImport()) return;
     const backupMagic = new TextDecoder().decode(header);
     const hasLinkedIdentityData = backupMagic === 'ADBACK5\0' || backupMagic === 'ADBACK7\0'
       || backupMagic === 'ADBACK6\0' || backupMagic === 'ADPACK1\0'
@@ -1462,47 +1488,49 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     }
     if (hasLinkedIdentityData
       && !window.confirm('이 백업에는 이전 신원 연결 정보가 포함될 수 있습니다. 파일 인증에 성공한 경우에만 해당 관계를 이 기기에 복원합니다. 계속할까요?')) return;
-    transferId = await uploadBackupFile(file);
-    if (!isCurrentImportIdentity()) return;
-    const response = await request('/api/history/backup-transfer', JSON.stringify({ action: 'import', transferId, password }));
+    transferId = await uploadBackupFile(file, isCurrentImport, importSession);
+    if (!isCurrentImport()) return;
+    const response = await request('/api/history/backup-transfer', JSON.stringify({ action: 'import', transferId, password }), importSession);
     transferId = null;
-    if (!isCurrentImportIdentity()) return;
+    if (!isCurrentImport()) return;
     if (response.status === 409) { setImportResult('failure'); message.textContent = '먼저 모든 대화 연결을 종료한 뒤 다시 시도하세요.'; return; }
     if (!response.ok) {
       const detail = (await response.text()) || '백업을 검증하거나 저장하지 못했습니다.';
-      if (!isCurrentImportIdentity()) return;
+      if (!isCurrentImport()) return;
       const partial = detail.match(/backup bundle failed after applying (\d+) conversation\(s\):/i);
       const cleanupWarning = detail.startsWith('backup import completed but temporary upload cleanup failed');
       setImportResult('failure');
       if (partial && Number(partial[1]) > 0) {
         message.textContent = `${detail} 기록 목록을 새로고침해 적용된 대화를 확인하고, 원본 백업 파일은 보관하세요. 미적용 대화만 선택해 재시도하는 기능은 없습니다.`;
-        try { await refreshHistoryList(); } catch (_) { /* preserve the server's partial-application result */ }
+        try { await refreshHistoryList(isCurrentImport); } catch (_) { /* preserve the server's partial-application result */ }
       } else if (cleanupWarning) {
         setImportResult('cleanup-warning');
         message.textContent = `${detail} 가져온 대화를 기록 목록에서 확인하세요. 임시 업로드 파일은 자동 정리되지 않았을 수 있습니다. 앱을 모두 종료한 뒤 README의 수동 정리 안내를 확인하세요.`;
-        try { await refreshHistoryList(); } catch (_) { /* import completed; keep the cleanup warning visible */ }
+        try { await refreshHistoryList(isCurrentImport); } catch (_) { /* import completed; keep the cleanup warning visible */ }
       } else {
         message.textContent = detail;
       }
       return;
     }
     const result = await response.json();
-    if (!isCurrentImportIdentity()) return;
+    if (!isCurrentImport()) return;
     imported = true;
+    await refreshHistoryList(isCurrentImport);
+    if (!isCurrentImport()) return;
     setImportResult('success');
     document.querySelector('#history-backup-file').value = '';
-    await refreshHistoryList();
     if (Array.isArray(result.conversations)) {
       const linked = result.conversations.filter(item => item.linkedIdentityRestored).length;
       message.textContent = `${result.conversations.length}개 대화 백업을 기존 기록과 병합했습니다.${linked ? ` ${linked}개 대화의 인증된 이전 신원 관계도 복원했습니다.` : ''}`;
     } else {
-      await openHistory(result.peerId);
+      await openHistory(result.peerId, isCurrentImport);
+      if (!isCurrentImport()) return;
       message.textContent = result.linkedIdentityRestored
         ? '백업을 확인해 기존 기록과 인증된 이전 신원 관계를 복원했습니다.'
         : '백업을 확인해 기존 기록과 병합했습니다.';
     }
   } catch (_) {
-    if (!isCurrentImportIdentity()) return;
+    if (!isCurrentImport()) return;
     if (imported) {
       message.textContent = '백업은 가져왔지만 화면을 갱신하지 못했습니다. 기록을 다시 불러오세요.';
     } else {
@@ -1510,8 +1538,13 @@ document.querySelector('#history-backup-import').addEventListener('click', async
       message.textContent = '백업 파일을 읽거나 검증·저장하지 못했습니다. 기존 기록과 선택한 원본 파일은 보존됩니다.';
     }
   } finally {
-    if (transferId) await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId })).catch(() => {});
-    if (isCurrentImportIdentity()) passwordField.value = '';
+    if (transferId) {
+      await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId }), importSession).catch(() => {});
+      const stillCurrentAfterCleanup = isCurrentImport();
+      if (stillCurrentAfterCleanup) passwordField.value = '';
+    } else if (isCurrentImport()) {
+      passwordField.value = '';
+    }
   }
 });
 
