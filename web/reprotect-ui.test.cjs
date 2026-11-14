@@ -588,6 +588,74 @@ test('backup import presents the server-reported partial bundle count', async ()
   assert.equal(h.element('#history-backup-file').files[0], original);
 });
 
+test('partial import error remains visible when the follow-up list request or rendering fails', async (t) => {
+  for (const mode of ['list request failure', 'list rendering failure']) {
+    await t.test(mode, async () => {
+      const detail = 'backup bundle failed after applying 2 conversation(s): disk write failed';
+      const h = createHarness({ importFailure: detail });
+      h.element('#history-backup-file').files = [file('bundle.adpak', 'ADPACK3\0payload')];
+      h.window.confirm = () => true;
+      if (mode === 'list rendering failure') {
+        h.element('#history-list').append = () => { throw new Error('render failed'); };
+      }
+      const task = h.click('#history-backup-import');
+      await new Promise((resolve) => setImmediate(resolve));
+      h.requestFor('/api/history/list').resolve(mode === 'list request failure'
+        ? response('unavailable', 500)
+        : response(JSON.stringify([{ peerId: 'ef'.repeat(32), messageCount: 4, verified: false }])));
+      await task;
+      assert.match(h.element('#message').textContent, /backup bundle failed after applying 2 conversation\(s\): disk write failed/);
+      assert.match(h.element('#message').textContent, /기록 목록을 새로고침해 적용된 대화를 확인/);
+      assert.equal(h.element('#history-backup-import-result').dataset.result, 'failure');
+      assert.equal(h.element('#history-backup-file').files[0].name, 'bundle.adpak');
+    });
+  }
+});
+
+test('completed import with upload cleanup failure refreshes the list and explains manual cleanup', async () => {
+  const detail = 'backup import completed but temporary upload cleanup failed (permission denied)';
+  const h = createHarness({ importFailure: detail });
+  h.element('#history-backup-file').files = [file('backup.adbak', 'ADBACK7\0payload')];
+  h.window.confirm = () => true;
+  const original = h.element('#history-backup-file').files[0];
+  const task = h.click('#history-backup-import');
+  await new Promise((resolve) => setImmediate(resolve));
+  const listRequest = h.requestFor('/api/history/list');
+  assert.ok(listRequest, 'completed import still refreshes conversation history');
+  listRequest.resolve(response(JSON.stringify([{ peerId: '12'.repeat(32), messageCount: 6, verified: true }])));
+  await task;
+  assert.equal(h.element('#history-backup-import-result').dataset.result, 'cleanup-warning');
+  assert.equal(h.element('#history-backup-import-result').textContent, '가져오기 완료 · 임시 파일 정리 실패');
+  assert.match(h.element('#message').textContent, /backup import completed but temporary upload cleanup failed/);
+  assert.match(h.element('#message').textContent, /기록 목록에서 확인/);
+  assert.match(h.element('#message').textContent, /앱을 모두 종료한 뒤 README의 수동 정리 안내/);
+  assert.equal(h.element('#history-list').children[0].children[1].children[0].textContent, '대화 121212121212');
+  assert.equal(h.element('#history-backup-file').files[0], original);
+});
+
+test('a partial import list response from the previous identity cannot replace the new identity list', async () => {
+  const detail = 'backup bundle failed after applying 1 conversation(s): linked identity store failed';
+  const h = createHarness({ importFailure: detail });
+  h.element('#identity-id').textContent = 'identity-a';
+  h.element('#history-backup-file').files = [file('bundle.adpak', 'ADPACK3\0payload')];
+  h.window.confirm = () => true;
+  const task = h.click('#history-backup-import');
+  await new Promise((resolve) => setImmediate(resolve));
+  const listRequest = h.requestFor('/api/history/list');
+  assert.ok(listRequest);
+  h.element('#identity-id').textContent = 'identity-b';
+  h.element('#message').textContent = '신원 B의 화면 상태';
+  h.element('#history-backup-import-result').hidden = true;
+  h.element('#history-backup-import-result').textContent = '';
+  const newIdentityRow = { textContent: '신원 B의 대화 목록' };
+  h.element('#history-list').replaceChildren(newIdentityRow);
+  listRequest.resolve(response(JSON.stringify([{ peerId: '34'.repeat(32), messageCount: 1, verified: true }])));
+  await task;
+  assert.equal(h.element('#message').textContent, '신원 B의 화면 상태');
+  assert.deepEqual(h.element('#history-list').children, [newIdentityRow]);
+  assert.equal(h.element('#history-backup-import-result').hidden, true);
+});
+
 test('backup import exposes success on the import control after a successful response', async () => {
   const h = createHarness({ importResult: JSON.stringify({ conversations: [] }) });
   h.element('#history-backup-file').files = [file('backup.adbak', 'ADBACK4\0payload')];

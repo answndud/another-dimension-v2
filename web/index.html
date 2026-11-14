@@ -298,6 +298,7 @@
     .history-import-result { position: absolute; z-index: 5; right: 0; bottom: calc(100% + var(--space-2)); width: max-content; max-width: min(22rem, calc(100vw - 48px)); padding: var(--space-2) var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-control); color: var(--text); background: var(--surface); box-shadow: 0 4px 16px var(--shadow); font-size: 13px; line-height: 1.4; }
     .history-import-action:hover .history-import-result:not([hidden]), .history-import-action:focus-within .history-import-result:not([hidden]) { display: block; }
     .history-import-result[data-result="failure"] { border-color: var(--danger-border); color: var(--danger); background: var(--danger-surface); }
+    .history-import-result[data-result="cleanup-warning"] { border-color: var(--border); color: var(--text); background: var(--surface-muted); }
     .history-import-result:not([hidden]) { display: none; }
     .history-reprotect-card { max-width: 100%; }
     .history-reprotect-steps { display: flex; flex-wrap: wrap; gap: var(--space-2); color: var(--muted); font-size: 12px; }

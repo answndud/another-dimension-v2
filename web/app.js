@@ -1420,10 +1420,14 @@ document.querySelector('#history-bundle-export').addEventListener('click', async
 });
 
 document.querySelector('#history-backup-import').addEventListener('click', async () => {
+  const importIdentityId = identityId.textContent.trim();
+  const isCurrentImportIdentity = () => identityId.textContent.trim() === importIdentityId;
   const importStatus = document.querySelector('#history-backup-import-result');
   const setImportResult = (result) => {
     importStatus.dataset.result = result;
-    importStatus.textContent = result === 'success' ? '백업 가져오기 성공' : '백업 가져오기 실패';
+    importStatus.textContent = result === 'success' ? '백업 가져오기 성공'
+      : result === 'cleanup-warning' ? '가져오기 완료 · 임시 파일 정리 실패'
+        : '백업 가져오기 실패';
     importStatus.hidden = false;
   };
   importStatus.hidden = true;
@@ -1447,6 +1451,7 @@ document.querySelector('#history-backup-import').addEventListener('click', async
   let imported = false;
   try {
     const header = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+    if (!isCurrentImportIdentity()) return;
     const backupMagic = new TextDecoder().decode(header);
     const hasLinkedIdentityData = backupMagic === 'ADBACK5\0' || backupMagic === 'ADBACK7\0'
       || backupMagic === 'ADBACK6\0' || backupMagic === 'ADPACK1\0'
@@ -1458,22 +1463,31 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     if (hasLinkedIdentityData
       && !window.confirm('이 백업에는 이전 신원 연결 정보가 포함될 수 있습니다. 파일 인증에 성공한 경우에만 해당 관계를 이 기기에 복원합니다. 계속할까요?')) return;
     transferId = await uploadBackupFile(file);
+    if (!isCurrentImportIdentity()) return;
     const response = await request('/api/history/backup-transfer', JSON.stringify({ action: 'import', transferId, password }));
     transferId = null;
+    if (!isCurrentImportIdentity()) return;
     if (response.status === 409) { setImportResult('failure'); message.textContent = '먼저 모든 대화 연결을 종료한 뒤 다시 시도하세요.'; return; }
     if (!response.ok) {
       const detail = (await response.text()) || '백업을 검증하거나 저장하지 못했습니다.';
+      if (!isCurrentImportIdentity()) return;
       const partial = detail.match(/backup bundle failed after applying (\d+) conversation\(s\):/i);
+      const cleanupWarning = detail.startsWith('backup import completed but temporary upload cleanup failed');
       setImportResult('failure');
       if (partial && Number(partial[1]) > 0) {
-        await refreshHistoryList();
         message.textContent = `${detail} 기록 목록을 새로고침해 적용된 대화를 확인하고, 원본 백업 파일은 보관하세요. 미적용 대화만 선택해 재시도하는 기능은 없습니다.`;
+        try { await refreshHistoryList(); } catch (_) { /* preserve the server's partial-application result */ }
+      } else if (cleanupWarning) {
+        setImportResult('cleanup-warning');
+        message.textContent = `${detail} 가져온 대화를 기록 목록에서 확인하세요. 임시 업로드 파일은 자동 정리되지 않았을 수 있습니다. 앱을 모두 종료한 뒤 README의 수동 정리 안내를 확인하세요.`;
+        try { await refreshHistoryList(); } catch (_) { /* import completed; keep the cleanup warning visible */ }
       } else {
         message.textContent = detail;
       }
       return;
     }
     const result = await response.json();
+    if (!isCurrentImportIdentity()) return;
     imported = true;
     setImportResult('success');
     document.querySelector('#history-backup-file').value = '';
@@ -1488,6 +1502,7 @@ document.querySelector('#history-backup-import').addEventListener('click', async
         : '백업을 확인해 기존 기록과 병합했습니다.';
     }
   } catch (_) {
+    if (!isCurrentImportIdentity()) return;
     if (imported) {
       message.textContent = '백업은 가져왔지만 화면을 갱신하지 못했습니다. 기록을 다시 불러오세요.';
     } else {
@@ -1496,7 +1511,7 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     }
   } finally {
     if (transferId) await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId })).catch(() => {});
-    passwordField.value = '';
+    if (isCurrentImportIdentity()) passwordField.value = '';
   }
 });
 
