@@ -133,6 +133,7 @@
     .history-item { display: grid; width: 100%; min-width: 0; gap: var(--space-1); text-align: left; }
     .history-item span, .history-item small { overflow-wrap: anywhere; }
     .history-item small { color: var(--muted); font-weight: 400; }
+    #management-history-status:not([hidden]) { margin: var(--space-3) 0 0; padding: var(--space-3); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--surface-muted); overflow-wrap: anywhere; }
     .field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: var(--space-3); margin: var(--space-3) 0; }
     .message-select { margin-right: var(--space-2); }
     .checkbox-row { display: flex; align-items: center; gap: var(--space-2); }
@@ -518,6 +519,7 @@
                   <button id="history-bundle-export" type="button">선택 백업</button>
                 </div>
                 <p class="meta">대화 묶음 백업은 한 번에 최대 128개 대화까지 선택할 수 있습니다.</p>
+                <p id="management-history-status" class="meta" role="status" aria-live="polite" aria-atomic="true" hidden></p>
                 <div class="history-tools">
                   <label class="history-import-label" for="contact-file">상대방 신원 정보 백업 가져오기</label>
                   <div class="history-import-controls">

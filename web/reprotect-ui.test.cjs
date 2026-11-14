@@ -128,9 +128,13 @@ function createHarness(options = {}) {
       } else if (payload.action === 'verify') {
         pending.resolve(response(JSON.stringify({ peerId: 'ab'.repeat(32), messageCount: 1 })));
       } else if (payload.action === 'export' || payload.action === 'bundle-export') {
-        const transferId = `export-${++transferSequence}`;
-        transferFiles.set(transferId, Buffer.from('exported backup'));
-        pending.resolve(response(JSON.stringify({ transferId, size: transferFiles.get(transferId).length })));
+        if (payload.action === 'bundle-export' && options.bundleExportReject) {
+          pending.reject(new Error('bundle export failed'));
+        } else {
+          const transferId = `export-${++transferSequence}`;
+          transferFiles.set(transferId, Buffer.from('exported backup'));
+          pending.resolve(response(JSON.stringify({ transferId, size: transferFiles.get(transferId).length })));
+        }
       } else if (payload.action === 'import') {
         if (options.importFetchReject) pending.reject(new Error('connection lost'));
         else if (options.importTextReject) pending.resolve({
@@ -451,20 +455,58 @@ test('history detail separates browsing, backup and deletion without replacing f
 
 test('bundle export accepts 128 selections and rejects 129 before requesting a backup', async () => {
   const h = createHarness();
-  let count = 128;
+  const status = h.element('#management-history-status');
+  h.element('#management-dialog').open = true;
+  h.element('#management-history-pane').hidden = false;
+  let count = 0;
   let confirmations = 0;
   h.element('#history-list').querySelectorAll = () =>
     Array.from({ length: count }, (_, index) => ({ dataset: { bundlePeerId: String(index) } }));
   h.window.confirm = () => { confirmations += 1; return false; };
 
   await h.click('#history-bundle-export');
+  assert.equal(status.hidden, false);
+  assert.match(status.textContent, /백업할 대화를 선택하세요/);
+  assert.equal(h.element('#message').textContent, '');
+  assert.equal(h.requests.some((request) => request.path === '/api/history/backup-transfer'), false);
+
+  count = 128;
+  await h.click('#history-bundle-export');
   assert.equal(confirmations, 1);
 
   count = 129;
   await h.click('#history-bundle-export');
   assert.equal(confirmations, 1);
-  assert.match(h.element('#message').textContent, /최대 128개/);
+  assert.match(status.textContent, /최대 128개/);
+  assert.equal(h.element('#message').textContent, '');
   assert.equal(h.requests.some((request) => request.path === '/api/history/backup-transfer'), false);
+
+  const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
+  const historyPane = html.slice(html.indexOf('id="management-history-pane"'), html.indexOf('</dialog>', html.indexOf('id="management-history-pane"')));
+  assert.match(historyPane, /id="management-history-status"[^>]*role="status"[^>]*aria-live="polite"/);
+});
+
+test('bundle export success and failure are announced inside the open history dialog', async () => {
+  for (const [options, expected] of [
+    [{}, /1개 대화의 암호화 백업을 저장했습니다/],
+    [{ bundleExportReject: true }, /대화 백업을 만들거나 저장하지 못했습니다/],
+  ]) {
+    const h = createHarness(options);
+    h.element('#management-dialog').open = true;
+    h.element('#management-history-pane').hidden = false;
+    h.element('#history-list').querySelectorAll = () => [{ dataset: { bundlePeerId: 'peer-one' } }];
+    h.window.confirm = () => true;
+    h.window.showSaveFilePicker = async () => ({
+      createWritable: async () => ({ write: async () => {}, close: async () => {}, abort: async () => {} }),
+    });
+
+    await h.click('#history-bundle-export');
+
+    assert.equal(h.element('#management-history-status').hidden, false);
+    assert.match(h.element('#management-history-status').textContent, expected);
+    assert.equal(h.element('#message').textContent, '');
+    assert.ok(h.requests.some((request) => request.path === '/api/history/backup-transfer'));
+  }
 });
 
 test('whole-conversation deletion remains explicitly confirmed and locally scoped', async () => {

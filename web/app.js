@@ -25,6 +25,7 @@ const chatView = document.querySelector('#chat-view');
 const chatStatus = document.querySelector('#chat-status');
 const storageStatus = document.querySelector('#storage-status');
 const historyList = document.querySelector('#history-list');
+const managementHistoryStatus = document.querySelector('#management-history-status');
 const historyDetail = document.querySelector('#history-detail');
 const historyMessages = document.querySelector('#history-messages');
 const historyFilter = document.querySelector('#history-filter');
@@ -111,6 +112,20 @@ function confirmAddedCodeDismissal() {
   return true;
 }
 
+function clearManagementHistoryStatus() {
+  managementHistoryStatus.textContent = '';
+  managementHistoryStatus.hidden = true;
+}
+
+function setManagementHistoryStatus(text) {
+  if (managementDialog.open && !managementPanes.history.hidden) {
+    managementHistoryStatus.textContent = text;
+    managementHistoryStatus.hidden = !text;
+  } else {
+    message.textContent = text;
+  }
+}
+
 document.addEventListener('click', (event) => {
   if (identityMenu.open && !identityMenu.contains(event.target)) identityMenu.open = false;
 });
@@ -121,6 +136,7 @@ document.addEventListener('keydown', (event) => {
 function openManagementView(view, title) {
   const pane = managementPanes[view];
   if (!pane) return;
+  if (view === 'history') clearManagementHistoryStatus();
   const leavingIdentityPane = !managementPanes.identity.hidden && view !== 'identity';
   if (leavingIdentityPane && !confirmAddedCodeDismissal()) return;
   identityMenu.open = false;
@@ -579,7 +595,7 @@ async function refreshHistoryList(isCurrent = () => true) {
     details.textContent = `${item.messageCount}개 메시지 · ${lastMessage} · ${item.verified ? '상대 확인 기록 있음' : '상대 확인 필요'}`;
     button.append(label, details);
     button.addEventListener('click', () => openHistory(item.peerId).catch(() => {
-      message.textContent = '대화 기록을 열지 못했습니다.';
+      setManagementHistoryStatus('대화 기록을 열지 못했습니다.');
     }));
     row.append(checkLabel, button);
     historyList.append(row);
@@ -1377,18 +1393,19 @@ document.querySelector('#contact-export').addEventListener('click', async () => 
   } catch (_) { message.textContent = '상대방 신원 정보를 백업하지 못했습니다.'; }
 });
 document.querySelector('#contact-import').addEventListener('click', async () => {
+  clearManagementHistoryStatus();
   const input = document.querySelector('#contact-file');
   const file = input.files[0];
-  if (!file || file.size > 256) { message.textContent = '상대방 신원 정보 백업 파일을 선택하세요.'; return; }
+  if (!file || file.size > 256) { setManagementHistoryStatus('상대방 신원 정보 백업 파일을 선택하세요.'); return; }
   try {
     const bytes = new Uint8Array(await file.arrayBuffer());
     const response = await request('/api/contacts/import-backup', btoa(String.fromCharCode(...bytes)));
-    if (response.status === 409) { message.textContent = '연결을 종료하세요. 기존 상대 신원 정보와 충돌하는 백업은 가져올 수 없습니다.'; return; }
+    if (response.status === 409) { setManagementHistoryStatus('연결을 종료하세요. 기존 상대 신원 정보와 충돌하는 백업은 가져올 수 없습니다.'); return; }
     if (!response.ok) throw new Error('invalid backup');
     input.value = '';
     await refreshHistoryList();
-    message.textContent = '상대방 신원 정보를 복원했습니다. 오래된 백업의 최신 여부는 확인할 수 없습니다.';
-  } catch (_) { message.textContent = '백업을 읽지 못했거나 개인 접속 코드가 다릅니다.'; }
+    setManagementHistoryStatus('상대방 신원 정보를 복원했습니다. 오래된 백업의 최신 여부는 확인할 수 없습니다.');
+  } catch (_) { setManagementHistoryStatus('백업을 읽지 못했거나 개인 접속 코드가 다릅니다.'); }
 });
 document.querySelector('#history-export').addEventListener('click', () => {
   const lines = selectedHistoryMessages.map((item) => `${formatTime(item.time)} [${item.sender}]: ${item.text}`);
@@ -1428,15 +1445,16 @@ document.querySelector('#history-backup-export').addEventListener('click', async
 });
 
 document.querySelector('#history-bundle-export').addEventListener('click', async () => {
+  clearManagementHistoryStatus();
   const peerIds = [...historyList.querySelectorAll('input[data-bundle-peer-id]:checked')]
     .map(input => input.dataset.bundlePeerId);
-  if (!peerIds.length) { message.textContent = '백업할 대화를 선택하세요.'; return; }
-  if (peerIds.length > 128) { message.textContent = '대화 묶음 백업은 한 번에 최대 128개 대화까지 선택할 수 있습니다.'; return; }
+  if (!peerIds.length) { setManagementHistoryStatus('백업할 대화를 선택하세요.'); return; }
+  if (peerIds.length > 128) { setManagementHistoryStatus('대화 묶음 백업은 한 번에 최대 128개 대화까지 선택할 수 있습니다.'); return; }
   if (!window.confirm(`선택한 ${peerIds.length}개 대화를 암호화 백업으로 저장할까요?`)) return;
   try {
     await saveBackupTransfer('bundle-export', { peerIds }, 'another-dimension-conversations.adbak');
-    message.textContent = `${peerIds.length}개 대화의 암호화 백업을 저장했습니다.`;
-  } catch (_) { message.textContent = '대화 백업을 만들거나 저장하지 못했습니다. 저장 위치와 연결 상태를 확인하세요.'; }
+    setManagementHistoryStatus(`${peerIds.length}개 대화의 암호화 백업을 저장했습니다.`);
+  } catch (_) { setManagementHistoryStatus('대화 백업을 만들거나 저장하지 못했습니다. 저장 위치와 연결 상태를 확인하세요.'); }
 });
 
 document.querySelector('#history-backup-import').addEventListener('click', async () => {
