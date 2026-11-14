@@ -130,6 +130,8 @@ function createHarness(options = {}) {
       } else if (payload.action === 'export' || payload.action === 'bundle-export') {
         if (payload.action === 'bundle-export' && options.bundleExportReject) {
           pending.reject(new Error('bundle export failed'));
+        } else if (payload.action === 'bundle-export' && options.manualBundleExport) {
+          // The test resolves this after a dialog transition to model a late server result.
         } else {
           const transferId = `export-${++transferSequence}`;
           transferFiles.set(transferId, Buffer.from('exported backup'));
@@ -563,6 +565,183 @@ test('detail page HTTP errors stay on the detail screen and stale management err
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(stale.element('#management-history-status').textContent, '');
   assert.equal(stale.element('#message').textContent, '');
+});
+
+test('closing and reopening management invalidates an older conversation open', async () => {
+  const h = createHarness();
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  const listing = h.evaluate('refreshHistoryList()');
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/history/list').resolve(response(JSON.stringify([historySummary('peer-old-open')])));
+  await listing;
+  h.element('#management-dialog').open = true;
+  h.element('#management-history-pane').hidden = false;
+
+  h.element('#history-list').children[0].children[1].listeners.click();
+  const request = await waitForRequest(() => h.requests.findLast((item) => item.path === '/api/history/messages'));
+  await h.click('#close-management-dialog');
+  await h.click('#menu-open-history');
+  request.resolve(response('', 500));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(h.element('#management-dialog').open, true);
+  assert.equal(h.element('#management-history-pane').hidden, false);
+  assert.equal(h.element('#management-history-status').textContent, '');
+  assert.equal(h.element('#message').textContent, '');
+});
+
+test('the latest conversation selection wins when an older messages response arrives last', async () => {
+  const h = createHarness();
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  const listing = h.evaluate('refreshHistoryList()');
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/history/list').resolve(response(JSON.stringify([
+    historySummary('peer-A'), historySummary('peer-B'),
+  ])));
+  await listing;
+  h.element('#management-dialog').open = true;
+  h.element('#management-history-pane').hidden = false;
+  const [rowA, rowB] = h.element('#history-list').children;
+
+  rowA.children[1].listeners.click();
+  const requestA = await waitForRequest(() => h.requests.findLast((item) => item.path === '/api/history/messages'));
+  rowB.children[1].listeners.click();
+  const requestB = await waitForRequest(() => h.requests.filter((item) => item.path === '/api/history/messages').at(-1));
+  requestB.resolve(response(JSON.stringify({
+    version: 'B-v1', hasMore: false, nextCursor: null,
+    messages: [{ index: 1, time: 1, sender: '상대방', text: 'B message' }],
+  })));
+  await new Promise((resolve) => setImmediate(resolve));
+  requestA.resolve(response('', 500));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(h.evaluate('selectedHistoryPeer'), 'peer-B');
+  assert.equal(h.element('#history-detail').hidden, false);
+  assert.equal(h.evaluate('selectedHistoryMessages[0].text'), 'B message');
+  assert.equal(h.element('#management-history-status').textContent, '');
+});
+
+test('late bundle export and contact import results do not overwrite a new pane or input', async () => {
+  const bundle = createHarness({ manualBundleExport: true });
+  bundle.element('#management-dialog').open = true;
+  bundle.element('#management-history-pane').hidden = false;
+  bundle.element('#history-list').querySelectorAll = () => [{ dataset: { bundlePeerId: 'peer-export' } }];
+  bundle.window.confirm = () => true;
+  bundle.window.showSaveFilePicker = async () => ({
+    createWritable: async () => ({ write: async () => {}, close: async () => {}, abort: async () => {} }),
+  });
+  const exporting = bundle.click('#history-bundle-export');
+  const exportRequest = await waitForRequest(() => bundle.requestForAction('bundle-export'));
+  await bundle.click('#close-management-dialog');
+  await bundle.click('#menu-open-settings');
+  bundle.addTransferFile('late-export', 'backup');
+  exportRequest.resolve(response(JSON.stringify({ transferId: 'late-export', size: 6 })));
+  await exporting;
+  assert.equal(bundle.element('#management-dialog-title').textContent, '연결 설정');
+  assert.equal(bundle.element('#management-history-status').textContent, '');
+  assert.equal(bundle.element('#message').textContent, '');
+  await bundle.click('#menu-open-history');
+  assert.match(bundle.element('#management-history-status').textContent, /암호화 백업을 저장했습니다/);
+
+  const failedBundle = createHarness({ manualBundleExport: true });
+  failedBundle.element('#management-dialog').open = true;
+  failedBundle.element('#management-history-pane').hidden = false;
+  failedBundle.element('#history-list').querySelectorAll = () => [{ dataset: { bundlePeerId: 'peer-export' } }];
+  failedBundle.window.confirm = () => true;
+  failedBundle.window.showSaveFilePicker = async () => ({
+    createWritable: async () => ({ write: async () => {}, close: async () => {}, abort: async () => {} }),
+  });
+  const failedExporting = failedBundle.click('#history-bundle-export');
+  const failedExportRequest = await waitForRequest(() => failedBundle.requestForAction('bundle-export'));
+  await failedBundle.click('#close-management-dialog');
+  failedExportRequest.reject(new Error('server unavailable'));
+  await failedExporting;
+  assert.equal(failedBundle.element('#message').textContent, '');
+  await failedBundle.click('#menu-open-history');
+  assert.match(failedBundle.element('#management-history-status').textContent, /대화 백업을 만들거나 저장하지 못했습니다/);
+
+  const picker = createHarness();
+  const pickerOpened = deferred();
+  const pickerResult = deferred();
+  picker.element('#management-dialog').open = true;
+  picker.element('#management-history-pane').hidden = false;
+  picker.element('#history-list').querySelectorAll = () => [{ dataset: { bundlePeerId: 'peer-export' } }];
+  picker.window.confirm = () => true;
+  picker.window.showSaveFilePicker = () => { pickerOpened.resolve(); return pickerResult.promise; };
+  const pickerExport = picker.click('#history-bundle-export');
+  await pickerOpened.promise;
+  await picker.click('#close-management-dialog');
+  pickerResult.resolve({ createWritable: async () => ({ write: async () => {}, close: async () => {}, abort: async () => {} }) });
+  await pickerExport;
+  assert.equal(picker.requestForAction('bundle-export'), undefined);
+  assert.equal(picker.element('#message').textContent, '');
+
+  const contact = createHarness();
+  contact.element('#management-dialog').open = true;
+  contact.element('#management-history-pane').hidden = false;
+  const fileInput = contact.element('#contact-file');
+  fileInput.value = 'first.adcontact';
+  fileInput.files = [{ size: 1, arrayBuffer: async () => Uint8Array.of(1).buffer }];
+  const importing = contact.click('#contact-import');
+  const importRequest = await waitForRequest(() => contact.requests.findLast((item) => item.path === '/api/contacts/import-backup'));
+  await contact.click('#menu-open-identity');
+  fileInput.value = 'new-selection.adcontact';
+  importRequest.resolve(response('ok'));
+  await importing;
+  assert.equal(contact.element('#management-dialog-title').textContent, '신원 관리');
+  assert.equal(fileInput.value, 'new-selection.adcontact');
+  assert.equal(contact.element('#management-history-status').textContent, '');
+  assert.equal(contact.element('#message').textContent, '');
+  await contact.click('#menu-open-history');
+  assert.match(contact.element('#management-history-status').textContent, /상대방 신원 정보를 복원했습니다/);
+
+  const switched = createHarness();
+  switched.element('#management-dialog').open = true;
+  switched.element('#management-history-pane').hidden = false;
+  switched.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  const switchedInput = switched.element('#contact-file');
+  switchedInput.value = 'identity-A.adcontact';
+  switchedInput.files = [{ size: 1, arrayBuffer: async () => Uint8Array.of(1).buffer }];
+  const switchedImport = switched.click('#contact-import');
+  const switchedRequest = await waitForRequest(() => switched.requests.findLast((item) => item.path === '/api/contacts/import-backup'));
+  switched.evaluate("identitySessionGeneration += 1; identityId.textContent = 'identity-B'; token = 'session-B'");
+  switchedRequest.resolve(response('ok'));
+  await switchedImport;
+  assert.equal(switched.element('#management-history-status').textContent, '');
+  assert.equal(switched.element('#message').textContent, '');
+  assert.equal(switchedInput.value, 'identity-A.adcontact');
+  await switched.click('#close-management-dialog');
+  await switched.click('#menu-open-history');
+  assert.equal(switched.element('#management-history-status').textContent, '');
+  switched.evaluate("identitySessionGeneration += 1; identityId.textContent = 'identity-A'; token = 'session-A-again'");
+  await switched.click('#close-management-dialog');
+  await switched.click('#menu-open-history');
+  assert.match(switched.element('#management-history-status').textContent, /상대방 신원 정보를 복원했습니다/);
+
+  const overlapping = createHarness();
+  overlapping.element('#management-dialog').open = true;
+  overlapping.element('#management-history-pane').hidden = false;
+  const overlappingInput = overlapping.element('#contact-file');
+  overlappingInput.value = 'older.adcontact';
+  overlappingInput.files = [{ size: 1, arrayBuffer: async () => Uint8Array.of(1).buffer }];
+  const olderImport = overlapping.click('#contact-import');
+  const olderRequest = await waitForRequest(() => overlapping.requests.findLast((item) => item.path === '/api/contacts/import-backup'));
+  overlappingInput.value = 'newer.adcontact';
+  const newerImport = overlapping.click('#contact-import');
+  const newerRequest = await waitForRequest(() => {
+    const requests = overlapping.requests.filter((item) => item.path === '/api/contacts/import-backup');
+    return requests.length > 1 ? requests.at(-1) : null;
+  });
+  olderRequest.resolve(response('ok'));
+  await olderImport;
+  assert.equal(overlappingInput.value, 'newer.adcontact');
+  assert.equal(overlapping.element('#management-history-status').textContent, '');
+  newerRequest.resolve(response('ok'));
+  const refreshedList = await waitForRequest(() => overlapping.requests.filter((item) => item.path === '/api/history/list').at(-1));
+  refreshedList.resolve(response('[]'));
+  await newerImport;
+  assert.equal(overlappingInput.value, '');
+  assert.match(overlapping.element('#management-history-status').textContent, /상대방 신원 정보를 복원했습니다/);
 });
 
 test('whole-conversation deletion remains explicitly confirmed and locally scoped', async () => {
