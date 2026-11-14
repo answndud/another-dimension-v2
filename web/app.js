@@ -594,9 +594,20 @@ async function refreshHistoryList(isCurrent = () => true) {
     const lastMessage = item.lastMessage ? formatTime(item.lastMessage) : '메시지 없음';
     details.textContent = `${item.messageCount}개 메시지 · ${lastMessage} · ${item.verified ? '상대 확인 기록 있음' : '상대 확인 필요'}`;
     button.append(label, details);
-    button.addEventListener('click', () => openHistory(item.peerId).catch(() => {
-      setManagementHistoryStatus('대화 기록을 열지 못했습니다.');
-    }));
+    button.addEventListener('click', () => {
+      const requestedIdentityId = identityId.textContent.trim();
+      const requestedToken = token;
+      const requestedSessionGeneration = identitySessionGeneration;
+      const ownsManagementView = () => managementDialog.open
+        && !managementPanes.history.hidden
+        && identityId.textContent.trim() === requestedIdentityId
+        && token === requestedToken
+        && identitySessionGeneration === requestedSessionGeneration;
+      clearManagementHistoryStatus();
+      openHistory(item.peerId, ownsManagementView, setManagementHistoryStatus).catch(() => {
+        if (ownsManagementView()) setManagementHistoryStatus('대화 기록을 열지 못했습니다.');
+      });
+    });
     row.append(checkLabel, button);
     historyList.append(row);
   }
@@ -663,7 +674,7 @@ function updateSelectionCount() {
     : '선택한 메시지 없음';
 }
 
-async function openHistory(peerId, isCurrent = () => true) {
+async function openHistory(peerId, isCurrent = () => true, reportLoadError = null) {
   if (!isCurrent()) return false;
   selectedHistoryPeer = peerId;
   selectedHistoryIndices.clear();
@@ -674,31 +685,45 @@ async function openHistory(peerId, isCurrent = () => true) {
   document.querySelector('#contact-reconnect').hidden = !verifiedPeers.has(peerId);
   document.querySelector('#contact-export').hidden = !verifiedPeers.has(peerId);
   messageFilter.value = '';
-  if (!(await loadHistoryPage(null, isCurrent)) || !isCurrent()) return false;
+  if (!(await loadHistoryPage(null, isCurrent, reportLoadError)) || !isCurrent()) return false;
   show('history');
   return true;
 }
 
-async function loadHistoryPage(cursor, isCurrent = () => true) {
+async function loadHistoryPage(cursor, isCurrent = () => true, reportLoadError = null) {
   const requestedIdentityId = identityId.textContent.trim();
   const requestedPeerId = selectedHistoryPeer;
   const ownsPage = () => isCurrent()
     && identityId.textContent.trim() === requestedIdentityId
     && selectedHistoryPeer === requestedPeerId;
+  const reportError = (text) => {
+    if (!ownsPage()) return;
+    if (reportLoadError) reportLoadError(text);
+    else message.textContent = text;
+  };
   if (!ownsPage()) return false;
-  const response = await request('/api/history/messages', JSON.stringify({
-    peerId: requestedPeerId,
-    cursor,
-    limit: historyPageSize,
-  }));
-  if (!ownsPage()) return false;
-  if (response.status === 409) {
-    message.textContent = '기록이 바뀌어 선택을 적용할 수 없습니다. 다시 불러와 선택을 갱신하세요.';
-    document.querySelector('#history-page-reload').disabled = false;
+  let page;
+  try {
+    const response = await request('/api/history/messages', JSON.stringify({
+      peerId: requestedPeerId,
+      cursor,
+      limit: historyPageSize,
+    }));
+    if (!ownsPage()) return false;
+    if (response.status === 409) {
+      reportError('기록이 바뀌어 선택을 적용할 수 없습니다. 다시 불러와 선택을 갱신하세요.');
+      document.querySelector('#history-page-reload').disabled = false;
+      return false;
+    }
+    if (!response.ok) {
+      reportError('대화 기록을 열지 못했습니다.');
+      return false;
+    }
+    page = await response.json();
+  } catch (_) {
+    reportError('대화 기록을 열지 못했습니다.');
     return false;
   }
-  if (!response.ok) { message.textContent = '대화 기록을 열지 못했습니다.'; return false; }
-  const page = await response.json();
   if (!ownsPage()) return false;
   selectedHistoryMessages = page.messages;
   historyPageVersion = page.version;

@@ -509,6 +509,62 @@ test('bundle export success and failure are announced inside the open history di
   }
 });
 
+test('opening a conversation reports HTTP and network errors inside the history dialog', async () => {
+  for (const [status, reject, expected] of [
+    [500, false, /대화 기록을 열지 못했습니다/],
+    [409, false, /기록이 바뀌어 선택을 적용할 수 없습니다/],
+    [0, true, /대화 기록을 열지 못했습니다/],
+  ]) {
+    const h = createHarness();
+    h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+    const listing = h.evaluate('refreshHistoryList()');
+    await new Promise((resolve) => setImmediate(resolve));
+    h.requestFor('/api/history/list').resolve(response(JSON.stringify([historySummary('peer-history-error')])));
+    await listing;
+    h.element('#management-dialog').open = true;
+    h.element('#management-history-pane').hidden = false;
+
+    const row = h.element('#history-list').children[0];
+    const open = row.children[1].listeners.click();
+    const request = await waitForRequest(() => h.requests.findLast((item) => item.path === '/api/history/messages'));
+    if (reject) request.reject(new Error('connection lost'));
+    else request.resolve(response('', status));
+    await open;
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(h.element('#management-dialog').open, true);
+    assert.equal(h.element('#management-history-status').hidden, false);
+    assert.match(h.element('#management-history-status').textContent, expected);
+    assert.equal(h.element('#message').textContent, '');
+  }
+});
+
+test('detail page HTTP errors stay on the detail screen and stale management errors are discarded', async () => {
+  const detail = createHarness();
+  detail.evaluate("identityId.textContent = 'identity-A'; selectedHistoryPeer = 'peer-detail'; historyCursorStack = [null]");
+  const loading = detail.evaluate('loadHistoryPage(null)');
+  await new Promise((resolve) => setImmediate(resolve));
+  detail.requestFor('/api/history/messages').resolve(response('', 500));
+  await loading;
+  assert.match(detail.element('#message').textContent, /대화 기록을 열지 못했습니다/);
+
+  const stale = createHarness();
+  stale.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  const listing = stale.evaluate('refreshHistoryList()');
+  await new Promise((resolve) => setImmediate(resolve));
+  stale.requestFor('/api/history/list').resolve(response(JSON.stringify([historySummary('peer-stale-error')])));
+  await listing;
+  stale.element('#management-dialog').open = true;
+  stale.element('#management-history-pane').hidden = false;
+  stale.element('#history-list').children[0].children[1].listeners.click();
+  const request = await waitForRequest(() => stale.requests.findLast((item) => item.path === '/api/history/messages'));
+  stale.evaluate("identitySessionGeneration += 1; identityId.textContent = 'identity-B'; token = 'session-B'");
+  request.resolve(response('', 500));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stale.element('#management-history-status').textContent, '');
+  assert.equal(stale.element('#message').textContent, '');
+});
+
 test('whole-conversation deletion remains explicitly confirmed and locally scoped', async () => {
   const h = createHarness();
   let prompt = '';
