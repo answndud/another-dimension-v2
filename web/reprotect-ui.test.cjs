@@ -69,7 +69,7 @@ function createHarness(options = {}) {
         replaceChildren(...children) { this.children = children; },
         append(...children) { this.children.push(...children); },
         appendChild(child) { this.children.push(child); return child; },
-        focus() { this.focused = true; }, click() {}, remove() {}, setAttribute() {},
+        focus() { this.focused = true; this.focusCalls = (this.focusCalls || 0) + 1; document.activeElement = this; }, click() {}, remove() {}, setAttribute() {},
         showModal() { this.open = true; },
         close() {
           this.open = false;
@@ -324,6 +324,73 @@ test('a successful send does not clear text entered while that send was pending'
   request.resolve(response('ok'));
   await sending;
   assert.equal(h.element('#chat-text').value, 'new draft');
+});
+
+test('a delayed close for A cannot clean up a newly attached B conversation', async () => {
+  const h = createHarness();
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  await attachChatInHarness(h, 'operation-A');
+  const closing = h.click('#close-chat');
+  const cancelA = await waitForRequest(() => h.requestFor('/api/chat/cancel'));
+  assert.equal(cancelA.init.body, 'operation-A');
+  assert.equal(h.evaluate('operationId'), null);
+  assert.equal(h.element('#identity-active').hidden, false);
+
+  await attachChatInHarness(h, 'operation-B');
+  const bSnapshot = h.evaluate('latestChatSnapshot');
+  const bMessage = { textContent: 'B message' };
+  h.element('#conversation').appendChild(bMessage);
+  inputChat(h, 'B draft');
+  const bPollGeneration = h.evaluate('pollGeneration');
+
+  cancelA.resolve(response('cancelled A'));
+  await closing;
+
+  assert.equal(h.evaluate('operationId'), 'operation-B');
+  assert.equal(h.evaluate('latestChatSnapshot'), bSnapshot);
+  assert.equal(h.element('#chat-view').hidden, false);
+  assert.equal(h.element('#identity-active').hidden, true);
+  assert.deepEqual(h.element('#conversation').children, [bMessage]);
+  assert.equal(h.element('#chat-text').value, 'B draft');
+  assert.equal(h.evaluate('pollGeneration'), bPollGeneration);
+  assert.equal(h.requests.filter((item) => item.path === '/api/history/list').length, 0);
+});
+
+test('send success while home is open does not focus the hidden conversation input', async () => {
+  const h = createHarness();
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  await attachChatInHarness(h, 'operation-A');
+  h.document.activeElement = h.element('#chat-text');
+  inputChat(h, 'message from A');
+  const sending = submitChat(h);
+  const request = await waitForRequest(() => h.requestFor('/api/chat/send'));
+  await h.click('#brand-home');
+  request.resolve(response('sent'));
+  await sending;
+
+  assert.equal(h.element('#identity-active').hidden, false);
+  assert.equal(h.element('#chat-view').hidden, true);
+  assert.equal(h.element('#chat-text').value, '');
+  assert.equal(h.document.activeElement, h.element('#chat-text'));
+  assert.equal(h.element('#chat-text').focusCalls || 0, 0);
+});
+
+test('send success does not steal focus from another control in the same chat', async () => {
+  const h = createHarness();
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  await attachChatInHarness(h, 'operation-A');
+  h.document.activeElement = h.element('#chat-text');
+  inputChat(h, 'message from A');
+  const sending = submitChat(h);
+  const request = await waitForRequest(() => h.requestFor('/api/chat/send'));
+  const closeButton = h.element('#close-chat');
+  h.document.activeElement = closeButton;
+  request.resolve(response('sent'));
+  await sending;
+
+  assert.equal(h.element('#chat-view').hidden, false);
+  assert.equal(h.document.activeElement, closeButton);
+  assert.equal(h.element('#chat-text').focusCalls || 0, 0);
 });
 
 test('dashboard menu closes on outside click and Escape; management dialog reuses the selected pane and restores focus', async () => {

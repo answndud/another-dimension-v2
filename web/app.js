@@ -1446,6 +1446,7 @@ sendForm.addEventListener('submit', async (event) => {
   const sentSessionGeneration = identitySessionGeneration;
   const sentViewGeneration = chatViewGeneration;
   const text = chatText.value;
+  const sentFocusTarget = document.activeElement;
   const body = `${sentOperationId}\n${text}`;
   const button = sendForm.querySelector('button');
   const isCurrentSend = () => operationId === sentOperationId
@@ -1472,7 +1473,10 @@ sendForm.addEventListener('submit', async (event) => {
       const draftKey = chatDraftKey(sentIdentityId, sentOperationId, sentSessionGeneration);
       if (draftKey) chatDrafts.set(draftKey, '');
     }
-    if (isCurrentSend()) chatText.focus();
+    const focusIsStillInSendForm = Boolean(sentFocusTarget)
+      && (sentFocusTarget === chatText || sendForm.contains(sentFocusTarget));
+    if (isCurrentSend() && !chatView.hidden && sentFocusTarget
+      && document.activeElement === sentFocusTarget && focusIsStillInSendForm) chatText.focus();
   } catch (_) {
     if (isCurrentSend()) {
       sendForm.hidden = false;
@@ -1496,6 +1500,8 @@ document.querySelector('#close-chat').addEventListener('click', async () => {
     rememberRestoreJob(operationId);
   }
   const closingOperationId = operationId;
+  const closingIdentityId = identityId.textContent.trim();
+  const closingSessionGeneration = identitySessionGeneration;
   const closingDraftKey = chatDraftKey();
   if (closingDraftKey) chatDrafts.delete(closingDraftKey);
   chatText.value = '';
@@ -1507,10 +1513,14 @@ document.querySelector('#close-chat').addEventListener('click', async () => {
   sendForm.querySelector('button').disabled = true;
   sessionStorage.removeItem(operationKey);
   stopPolling();
-  if (closingOperationId) await request('/api/chat/cancel', closingOperationId).catch(() => {});
   latestChatSnapshot = null;
   conversation.replaceChildren();
   show('active');
+  const closingViewGeneration = chatViewGeneration;
+  if (closingOperationId) await request('/api/chat/cancel', closingOperationId).catch(() => {});
+  if (chatViewGeneration !== closingViewGeneration || operationId !== null
+    || identityId.textContent.trim() !== closingIdentityId
+    || identitySessionGeneration !== closingSessionGeneration) return;
   refreshHistoryList().catch(() => {});
 });
 
