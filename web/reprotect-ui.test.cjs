@@ -95,7 +95,8 @@ function createHarness(options = {}) {
     createElement: (tag) => element(`created:${tag}:${elements.size}`),
     createTextNode: (text) => ({ textContent: text }),
   };
-  document.activeElement = element('body');
+  document.body = element('body');
+  document.activeElement = document.body;
   const window = {
     ReprotectWork,
     confirm: () => false,
@@ -1992,6 +1993,95 @@ test('chat phase focus moves only when the active workflow control disappears', 
   home.element('#brand-home').focus();
   home.evaluate("updateChatView({ phase: 'connected', messageCount: 0, messageEpoch: 1, identityTransition: [] })");
   assert.equal(home.document.activeElement, home.element('#brand-home'));
+});
+
+test('peer confirmation request and phase polling stay scoped to the same conversation', async (t) => {
+  for (const order of ['poll-before-response', 'response-before-poll']) {
+    await t.test(order, async () => {
+      const h = createHarness();
+      h.evaluate("operationId = 'operation-A'; identityId.textContent = 'identity-A'; token = 'session-A'; chatView.hidden = false");
+      h.evaluate("updateChatView({ phase: 'verification', messageCount: 0, messageEpoch: 1, identityTransition: [] })");
+      h.element('#confirm-peer').focus();
+      const confirming = h.click('#confirm-peer');
+      await new Promise((resolve) => setImmediate(resolve));
+      const confirmRequest = h.requestFor('/api/chat/confirm');
+      assert.equal(confirmRequest.init.body, 'operation-A');
+      assert.equal(confirmRequest.init.headers.Authorization, 'Bearer session-A');
+      if (order === 'poll-before-response') {
+        h.document.activeElement = h.element('body');
+        h.evaluate("updateChatView({ phase: 'confirming', messageCount: 0, messageEpoch: 1, identityTransition: [] })");
+        assert.equal(h.document.activeElement, h.element('#chat-status'));
+      }
+      confirmRequest.resolve(response('ok'));
+      await confirming;
+      if (order === 'response-before-poll') {
+        h.evaluate("updateChatView({ phase: 'confirming', messageCount: 0, messageEpoch: 1, identityTransition: [] })");
+        assert.equal(h.document.activeElement, h.element('#chat-status'));
+      }
+      assert.match(h.element('#chat-status').textContent, /상대 확인 응답을 기다리는 중/);
+      assert.equal(h.element('#confirm-peer').disabled, true);
+    });
+  }
+
+  for (const outcome of ['success', 'failure']) {
+    await t.test(`stale A ${outcome} after closing A and starting B`, async () => {
+      const h = createHarness();
+      h.evaluate("operationId = 'operation-A'; identityId.textContent = 'identity-A'; token = 'session-A'; chatView.hidden = false");
+      h.evaluate("updateChatView({ phase: 'verification', messageCount: 0, messageEpoch: 1, identityTransition: [] })");
+      h.element('#confirm-peer').focus();
+      const confirming = h.click('#confirm-peer');
+      await new Promise((resolve) => setImmediate(resolve));
+      const confirmRequest = h.requestFor('/api/chat/confirm');
+
+      const closing = h.click('#close-chat');
+      h.requestFor('/api/chat/cancel').resolve(response('ok'));
+      await closing;
+      const attaching = h.evaluate("attachChat('operation-B')");
+      const statusRequest = await waitForRequest(() => h.requests.findLast((item) => item.path === '/api/chat/status'));
+      statusRequest.resolve(response(JSON.stringify({ phase: 'verification', messageCount: 0, messageEpoch: 1 })));
+      await attaching;
+      const statusBeforeLateResponse = h.element('#chat-status').textContent;
+      const buttonBeforeLateResponse = h.element('#confirm-peer').disabled;
+      h.element('#close-chat').focus();
+
+      confirmRequest.resolve(outcome === 'success' ? response('ok') : response('missing', 404));
+      await confirming;
+      assert.equal(h.evaluate('operationId'), 'operation-B');
+      assert.equal(h.element('#chat-status').textContent, statusBeforeLateResponse);
+      assert.equal(h.element('#confirm-peer').disabled, buttonBeforeLateResponse);
+      assert.equal(h.document.activeElement, h.element('#close-chat'));
+    });
+  }
+
+  await t.test('home navigation and connected polling are not overwritten by a late response', async () => {
+    const h = createHarness();
+    h.evaluate("operationId = 'operation-A'; identityId.textContent = 'identity-A'; token = 'session-A'; chatView.hidden = false");
+    h.evaluate("updateChatView({ phase: 'verification', messageCount: 0, messageEpoch: 1, identityTransition: [] })");
+    h.element('#confirm-peer').focus();
+    const confirming = h.click('#confirm-peer');
+    await new Promise((resolve) => setImmediate(resolve));
+    const confirmRequest = h.requestFor('/api/chat/confirm');
+    h.element('#brand-home').focus();
+    h.evaluate("show('active')");
+    confirmRequest.resolve(response('ok'));
+    await confirming;
+    assert.equal(h.document.activeElement, h.element('#brand-home'));
+
+    const connected = createHarness();
+    connected.evaluate("operationId = 'operation-late-confirm'; identityId.textContent = 'identity-A'; token = 'session-A'; chatView.hidden = false");
+    connected.evaluate("updateChatView({ phase: 'verification', messageCount: 0, messageEpoch: 1, identityTransition: [] })");
+    connected.element('#confirm-peer').focus();
+    const lateConfirming = connected.click('#confirm-peer');
+    await new Promise((resolve) => setImmediate(resolve));
+    const lateConfirmRequest = connected.requestFor('/api/chat/confirm');
+    connected.evaluate("updateChatView({ phase: 'confirming', messageCount: 0, messageEpoch: 1, identityTransition: [] }); updateChatView({ phase: 'connected', messageCount: 0, messageEpoch: 1, identityTransition: [] })");
+    const connectedStatus = connected.element('#chat-status').textContent;
+    assert.equal(connected.document.activeElement, connected.element('#chat-text'));
+    lateConfirmRequest.resolve(response('ok'));
+    await lateConfirming;
+    assert.equal(connected.element('#chat-status').textContent, connectedStatus);
+    assert.equal(connectedStatus, '대화 연결이 활성화되었습니다. relay는 IP 주소와 연결 시각·통신량을 볼 수 있습니다.');
+  });
 });
 
 test('chat live status text is written only when its displayed value changes', () => {

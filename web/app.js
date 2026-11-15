@@ -54,6 +54,7 @@ let pollGeneration = 0;
 let lastPhase = '';
 let sendingMessage = false;
 let chatViewGeneration = 0;
+let pendingConfirmationFocus = null;
 const chatDrafts = new Map();
 let selectedHistoryPeer = '';
 let selectedHistoryMessages = [];
@@ -429,13 +430,17 @@ async function refreshIdentity() {
   const response = await request('/api/identity/status');
   if (response.status === 401) {
     identitySessionGeneration += 1;
+    pendingConfirmationFocus = null;
     show('entry');
     return false;
   }
   if (!response.ok) throw new Error('status failed');
   const currentIdentityId = await response.text();
   const previousIdentityId = identityId.textContent.trim();
-  if (previousIdentityId !== currentIdentityId) identitySessionGeneration += 1;
+  if (previousIdentityId !== currentIdentityId) {
+    identitySessionGeneration += 1;
+    pendingConfirmationFocus = null;
+  }
   if (previousIdentityId && previousIdentityId !== currentIdentityId) {
     clearChatDrafts();
     sendStatus.textContent = '';
@@ -1005,13 +1010,20 @@ function updateChatView(snapshot) {
   const confirmPeer = document.querySelector('#confirm-peer');
   const phaseChanged = phase !== previousPhase;
   if (!chatView.hidden && phaseChanged && previousPhase === 'verification'
-    && phase === 'confirming' && focusedElement === confirmPeer) {
+    && phase === 'confirming'
+    && (focusedElement === confirmPeer
+      || (pendingConfirmationFocus?.operationId === operationId
+        && pendingConfirmationFocus.viewGeneration === chatViewGeneration
+        && focusedElement === document.body))) {
     chatStatus.focus();
   } else if (!chatView.hidden && phaseChanged && phase === 'connected'
     && ['connecting', 'verification', 'confirming'].includes(previousPhase)
     && (focusedElement === document.body || focusedElement === chatStatus
       || focusedElement === document.querySelector('#chat-title') || focusedElement === confirmPeer)) {
     chatText.focus();
+  }
+  if (phaseChanged && ['confirming', 'connected', 'failed', 'disconnected', 'closed'].includes(phase)) {
+    pendingConfirmationFocus = null;
   }
   if (terminal && !merging) {
     stopPolling();
@@ -1077,6 +1089,7 @@ async function attachChat(id) {
   }
   stopPolling();
   chatViewGeneration += 1;
+  pendingConfirmationFocus = null;
   sendingMessage = false;
   sendStatus.textContent = '';
   sendStatus.hidden = true;
@@ -1318,6 +1331,7 @@ loginForm.addEventListener('submit', async (event) => {
 document.querySelector('#logout').addEventListener('click', async () => {
   identitySessionGeneration += 1;
   chatViewGeneration += 1;
+  pendingConfirmationFocus = null;
   sendingMessage = false;
   clearChatDrafts();
   sendStatus.textContent = '';
@@ -1352,6 +1366,7 @@ document.querySelector('#logout').addEventListener('click', async () => {
 document.querySelectorAll('.disconnect').forEach((button) => button.addEventListener('click', async () => {
   identitySessionGeneration += 1;
   chatViewGeneration += 1;
+  pendingConfirmationFocus = null;
   try {
     const response = await request('/api/disconnect');
     if (!response.ok && response.status !== 401) throw new Error('disconnect failed');
@@ -1426,12 +1441,40 @@ joinForm.addEventListener('submit', async (event) => {
 
 document.querySelector('#confirm-peer').addEventListener('click', async () => {
   if (!operationId) return;
+  const confirmPeer = document.querySelector('#confirm-peer');
+  const confirmingOperationId = operationId;
+  const confirmingIdentityId = identityId.textContent.trim();
+  const confirmingToken = token;
+  const confirmingSessionGeneration = identitySessionGeneration;
+  const confirmingViewGeneration = chatViewGeneration;
+  const isCurrentConfirmation = () => operationId === confirmingOperationId
+    && identityId.textContent.trim() === confirmingIdentityId
+    && token === confirmingToken
+    && identitySessionGeneration === confirmingSessionGeneration
+    && chatViewGeneration === confirmingViewGeneration;
+  pendingConfirmationFocus = {
+    operationId: confirmingOperationId,
+    viewGeneration: confirmingViewGeneration,
+  };
+  confirmPeer.disabled = true;
   try {
-    const response = await request('/api/chat/confirm', operationId);
+    const response = await request('/api/chat/confirm', confirmingOperationId, confirmingToken);
+    if (!isCurrentConfirmation()) return;
     if (!response.ok) throw new Error('confirmation failed');
-    chatStatus.textContent = '상대 확인 응답을 기다리는 중입니다.';
-    document.querySelector('#confirm-peer').disabled = true;
-  } catch (_) { chatStatus.textContent = '확인 요청을 보내지 못했습니다.'; }
+    if (['verification', 'confirming'].includes(lastPhase)) {
+      if (!chatView.hidden && lastPhase === 'verification') {
+        setTextIfChanged(chatStatus, '상대 확인 응답을 기다리는 중입니다.');
+      }
+      confirmPeer.disabled = true;
+    }
+  } catch (_) {
+    if (!isCurrentConfirmation()) return;
+    if (lastPhase === 'verification') {
+      confirmPeer.disabled = false;
+      pendingConfirmationFocus = null;
+      if (!chatView.hidden) setTextIfChanged(chatStatus, '확인 요청을 보내지 못했습니다.');
+    }
+  }
 });
 
 document.querySelector('#identity-transition-dismiss').addEventListener('click', () => {
@@ -1574,6 +1617,7 @@ document.querySelector('#close-chat').addEventListener('click', async () => {
   sendStatus.textContent = '';
   sendStatus.hidden = true;
   chatViewGeneration += 1;
+  pendingConfirmationFocus = null;
   sendingMessage = false;
   operationId = null;
   canReturnToChat = false;
