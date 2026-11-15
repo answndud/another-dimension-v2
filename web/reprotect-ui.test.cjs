@@ -217,6 +217,115 @@ async function waitForRequest(getRequest) {
   assert.fail('expected request was not issued');
 }
 
+async function attachChatInHarness(h, operationId) {
+  const attaching = h.evaluate(`attachChat('${operationId}')`);
+  const statusRequest = await waitForRequest(() => h.requests.findLast((item) => item.path === '/api/chat/status'));
+  statusRequest.resolve(response(JSON.stringify({ phase: 'connected', messageCount: 0, messageEpoch: 1 })));
+  await attaching;
+  h.evaluate('stopPolling()');
+}
+
+function submitChat(h) {
+  return h.element('#send-form').listeners.submit({ preventDefault() {} });
+}
+
+function inputChat(h, value) {
+  h.element('#chat-text').value = value;
+  h.element('#chat-text').listeners.input();
+}
+
+test('chat drafts stay with one operation through home and disconnect but not close or another operation', async () => {
+  const h = createHarness();
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  await attachChatInHarness(h, 'operation-A');
+  inputChat(h, 'A draft');
+
+  await h.click('#brand-home');
+  await h.click('#return-to-chat');
+  assert.equal(h.element('#chat-text').value, 'A draft');
+
+  h.evaluate("updateChatView({ phase: 'disconnected', messageCount: 0, messageEpoch: 1 })");
+  assert.equal(h.element('#chat-text').value, 'A draft');
+
+  const closing = h.click('#close-chat');
+  h.requestFor('/api/chat/cancel').resolve(response('ok'));
+  await closing;
+  await attachChatInHarness(h, 'operation-B');
+  assert.equal(h.element('#chat-text').value, '');
+});
+
+test('late send success, failure, or body from A cannot change B controls, status, focus, or draft', async () => {
+  for (const lateResult of ['success', 'failure', 'body']) {
+    const h = createHarness();
+    h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+    await attachChatInHarness(h, 'operation-A');
+    inputChat(h, 'A message');
+    const sendingA = submitChat(h);
+    const requestA = await waitForRequest(() => h.requestFor('/api/chat/send'));
+
+    let lateBody;
+    let bodyStarted;
+    if (lateResult === 'body') {
+      lateBody = deferred();
+      let bodyStartedResolve;
+      bodyStarted = new Promise((resolve) => { bodyStartedResolve = resolve; });
+      requestA.resolve({
+        ok: false, status: 409,
+        text: () => { bodyStartedResolve(); return lateBody.promise; },
+      });
+      await bodyStarted;
+    }
+
+    await attachChatInHarness(h, 'operation-B');
+    h.element('#chat-status').textContent = 'B status';
+    inputChat(h, 'B draft');
+    const sendingB = submitChat(h);
+    const requests = h.requests.filter((item) => item.path === '/api/chat/send');
+    const requestB = requests[1];
+    assert.equal(h.element('#send-form').querySelector('button').disabled, true);
+
+    if (lateResult === 'success') requestA.resolve(response('ok'));
+    else if (lateResult === 'failure') requestA.reject(new Error('late network failure'));
+
+    if (lateResult === 'body') {
+      lateBody.resolve('A 늦은 거절');
+      await sendingA;
+      assert.equal(h.element('#chat-text').value, 'B draft');
+      assert.equal(h.element('#chat-status').textContent, 'B status');
+      assert.equal(h.element('#chat-text').focused, undefined);
+      assert.equal(h.element('#send-form').querySelector('button').disabled, true);
+      requestB.resolve(response('ok'));
+      await sendingB;
+      assert.equal(h.element('#chat-text').value, '');
+      continue;
+    }
+
+    await sendingA;
+
+    assert.equal(h.element('#chat-text').value, 'B draft');
+    assert.equal(h.element('#chat-status').textContent, 'B status');
+    assert.equal(h.element('#chat-text').focused, undefined);
+    assert.equal(h.element('#send-form').querySelector('button').disabled, true);
+
+    requestB.resolve(response('ok'));
+    await sendingB;
+    assert.equal(h.element('#chat-text').value, '');
+  }
+});
+
+test('a successful send does not clear text entered while that send was pending', async () => {
+  const h = createHarness();
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  await attachChatInHarness(h, 'operation-A');
+  inputChat(h, 'first message');
+  const sending = submitChat(h);
+  const request = await waitForRequest(() => h.requestFor('/api/chat/send'));
+  inputChat(h, 'new draft');
+  request.resolve(response('ok'));
+  await sending;
+  assert.equal(h.element('#chat-text').value, 'new draft');
+});
+
 test('dashboard menu closes on outside click and Escape; management dialog reuses the selected pane and restores focus', async () => {
   const harness = createHarness();
   const menu = harness.element('#identity-menu');

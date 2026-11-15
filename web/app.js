@@ -52,6 +52,8 @@ let pollTimer = null;
 let pollGeneration = 0;
 let lastPhase = '';
 let sendingMessage = false;
+let chatViewGeneration = 0;
+const chatDrafts = new Map();
 let selectedHistoryPeer = '';
 let selectedHistoryMessages = [];
 let selectedHistoryIndices = new Set();
@@ -77,6 +79,15 @@ let historySummaries = [];
 let dismissedTransitionKey = '';
 let activeNetworkMode = 'general';
 let addedCodeSaved = false;
+
+function chatDraftKey(identity = identityId.textContent.trim(), operation = operationId, session = identitySessionGeneration) {
+  return identity && operation ? `${session}:${identity}:${operation}` : '';
+}
+
+function clearChatDrafts() {
+  chatDrafts.clear();
+  chatText.value = '';
+}
 
 function applyTheme(theme, persist = true) {
   const selected = theme === 'dark' ? 'dark' : 'light';
@@ -425,6 +436,8 @@ async function refreshIdentity() {
   const previousIdentityId = identityId.textContent.trim();
   if (previousIdentityId !== currentIdentityId) identitySessionGeneration += 1;
   if (previousIdentityId && previousIdentityId !== currentIdentityId) {
+    clearChatDrafts();
+    chatViewGeneration += 1;
     if (latestChatSnapshot && ['merge-queued', 'merging'].includes(latestChatSnapshot.historyRestoreState) && operationId) {
       rememberRestoreJob(operationId);
     }
@@ -1016,8 +1029,16 @@ async function pollChat() {
 }
 
 async function attachChat(id) {
+  if (operationId && operationId !== id) {
+    const previousDraftKey = chatDraftKey();
+    if (previousDraftKey) chatDrafts.delete(previousDraftKey);
+  }
   stopPolling();
+  chatViewGeneration += 1;
+  sendingMessage = false;
   operationId = id;
+  const draftKey = chatDraftKey();
+  chatText.value = draftKey ? (chatDrafts.get(draftKey) || '') : '';
   canReturnToChat = true;
   latestChatSnapshot = null;
   syncChatReturnButton();
@@ -1237,6 +1258,9 @@ loginForm.addEventListener('submit', async (event) => {
 
 document.querySelector('#logout').addEventListener('click', async () => {
   identitySessionGeneration += 1;
+  chatViewGeneration += 1;
+  sendingMessage = false;
+  clearChatDrafts();
   try {
     if (latestChatSnapshot && ['merge-queued', 'merging'].includes(latestChatSnapshot.historyRestoreState) && operationId) {
       rememberRestoreJob(operationId);
@@ -1266,6 +1290,7 @@ document.querySelector('#logout').addEventListener('click', async () => {
 
 document.querySelectorAll('.disconnect').forEach((button) => button.addEventListener('click', async () => {
   identitySessionGeneration += 1;
+  chatViewGeneration += 1;
   try {
     const response = await request('/api/disconnect');
     if (!response.ok && response.status !== 401) throw new Error('disconnect failed');
@@ -1273,6 +1298,8 @@ document.querySelectorAll('.disconnect').forEach((button) => button.addEventList
   token = null;
   stopPolling();
   operationId = null;
+  sendingMessage = false;
+  clearChatDrafts();
   canReturnToChat = false;
   latestChatSnapshot = null;
   conversation.replaceChildren();
@@ -1414,30 +1441,54 @@ document.querySelector('#history-restore-decline').addEventListener('click', () 
 sendForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   if (!operationId || sendingMessage || !chatText.value.trim()) return;
+  const sentOperationId = operationId;
+  const sentIdentityId = identityId.textContent.trim();
+  const sentSessionGeneration = identitySessionGeneration;
+  const sentViewGeneration = chatViewGeneration;
   const text = chatText.value;
-  const body = `${operationId}\n${text}`;
+  const body = `${sentOperationId}\n${text}`;
   const button = sendForm.querySelector('button');
+  const isCurrentSend = () => operationId === sentOperationId
+    && identityId.textContent.trim() === sentIdentityId
+    && identitySessionGeneration === sentSessionGeneration
+    && chatViewGeneration === sentViewGeneration;
   sendingMessage = true;
   button.disabled = true;
   try {
     const response = await request('/api/chat/send', body);
+    if (!isCurrentSend()) return;
     if (!response.ok) {
       const detail = await response.text();
+      if (!isCurrentSend()) return;
       if (response.status === 409 && detail) {
         chatStatus.textContent = detail;
         return;
       }
       throw new Error('send failed');
     }
-    if (chatText.value === text) chatText.value = '';
-    chatText.focus();
+    if (!isCurrentSend()) return;
+    if (chatText.value === text) {
+      chatText.value = '';
+      const draftKey = chatDraftKey(sentIdentityId, sentOperationId, sentSessionGeneration);
+      if (draftKey) chatDrafts.set(draftKey, '');
+    }
+    if (isCurrentSend()) chatText.focus();
   } catch (_) {
-    sendForm.hidden = false;
-    chatStatus.textContent = '전송 결과를 확인하지 못했습니다. 입력을 보존했습니다. 다시 보내면 중복될 수 있습니다.';
+    if (isCurrentSend()) {
+      sendForm.hidden = false;
+      chatStatus.textContent = '전송 결과를 확인하지 못했습니다. 입력을 보존했습니다. 다시 보내면 중복될 수 있습니다.';
+    }
   } finally {
-    sendingMessage = false;
-    button.disabled = lastPhase !== 'connected';
+    if (isCurrentSend()) {
+      sendingMessage = false;
+      button.disabled = lastPhase !== 'connected';
+    }
   }
+});
+
+chatText.addEventListener('input', () => {
+  const draftKey = chatDraftKey();
+  if (draftKey) chatDrafts.set(draftKey, chatText.value);
 });
 
 document.querySelector('#close-chat').addEventListener('click', async () => {
@@ -1445,11 +1496,18 @@ document.querySelector('#close-chat').addEventListener('click', async () => {
     rememberRestoreJob(operationId);
   }
   const closingOperationId = operationId;
-  stopPolling();
-  if (closingOperationId) await request('/api/chat/cancel', closingOperationId).catch(() => {});
+  const closingDraftKey = chatDraftKey();
+  if (closingDraftKey) chatDrafts.delete(closingDraftKey);
+  chatText.value = '';
+  chatViewGeneration += 1;
+  sendingMessage = false;
   operationId = null;
   canReturnToChat = false;
+  syncChatReturnButton();
+  sendForm.querySelector('button').disabled = true;
   sessionStorage.removeItem(operationKey);
+  stopPolling();
+  if (closingOperationId) await request('/api/chat/cancel', closingOperationId).catch(() => {});
   latestChatSnapshot = null;
   conversation.replaceChildren();
   show('active');
