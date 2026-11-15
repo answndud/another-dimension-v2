@@ -1865,6 +1865,119 @@ test('attaching a new chat clears only the previous relay and storage status bef
   assert.equal(next.element('#storage-status').hidden, false);
 });
 
+test('invite room creation keeps the code until an operation id is received and ignores duplicate clicks', async () => {
+  const h = createHarness();
+  const invite = 'ADI3-SYNTHETIC-CODE';
+  h.evaluate(`identityId.textContent = 'identity-A'; token = 'session-A'; currentInvite = ${JSON.stringify(invite)}; inviteCode.value = currentInvite; show('invite')`);
+  const creating = h.click('#start-room');
+  await new Promise((resolve) => setImmediate(resolve));
+  const createRequest = h.requestFor('/api/chat/create');
+  assert.equal(createRequest.init.body, invite);
+  assert.equal(createRequest.init.headers.Authorization, 'Bearer session-A');
+  assert.equal(h.evaluate('currentInvite'), invite);
+  assert.equal(h.element('#invite-code').value, invite);
+  assert.equal(h.element('#start-room').disabled, true);
+  await h.click('#start-room');
+  assert.equal(h.requests.filter((item) => item.path === '/api/chat/create').length, 1);
+
+  createRequest.resolve(response('operation-created'));
+  const statusRequest = await waitForRequest(() => h.requests.findLast((item) => item.path === '/api/chat/status'));
+  assert.equal(h.evaluate('currentInvite'), '');
+  assert.equal(h.element('#invite-code').value, '');
+  statusRequest.resolve(response(JSON.stringify({ phase: 'connecting', messageCount: 0, messageEpoch: 1 })));
+  await creating;
+  h.evaluate('stopPolling()');
+  assert.equal(h.evaluate('operationId'), 'operation-created');
+  assert.equal(h.element('#chat-view').hidden, false);
+  assert.equal(h.element('#invite-view').hidden, true);
+});
+
+test('room creation explicit failures preserve the invite and response loss is reported as unknown', async (t) => {
+  const failures = [
+    [400, /유효하지 않은 형식/],
+    [401, /로그인이 필요/],
+    [409, /작업 생성 전에 반환.*다시 시도할 수 있습니다/],
+    [500, /연결 작업 생성 여부.*안전성은.*확인할 수 없습니다/],
+  ];
+  for (const [status, messagePattern] of failures) {
+    await t.test(`HTTP ${status}`, async () => {
+      const h = createHarness();
+      const invite = 'ADI3-PRESERVED-CODE';
+      h.evaluate(`identityId.textContent = 'identity-A'; token = 'session-A'; currentInvite = ${JSON.stringify(invite)}; inviteCode.value = currentInvite; show('invite')`);
+      const creating = h.click('#start-room');
+      await new Promise((resolve) => setImmediate(resolve));
+      h.requestFor('/api/chat/create').resolve(response('rejected', status));
+      await creating;
+      assert.equal(h.element('#invite-view').hidden, false);
+      assert.equal(h.evaluate('currentInvite'), invite);
+      assert.equal(h.element('#invite-code').value, invite);
+      assert.match(h.element('#message').textContent, messagePattern);
+      assert.equal(h.element('#start-room').disabled, false);
+      assert.equal(h.evaluate('operationId'), null);
+    });
+  }
+
+  for (const lostResponse of ['fetch rejection', 'unreadable operation id']) {
+    await t.test(lostResponse, async () => {
+      const h = createHarness();
+      const invite = 'ADI3-UNCERTAIN-CODE';
+      h.evaluate(`identityId.textContent = 'identity-A'; token = 'session-A'; currentInvite = ${JSON.stringify(invite)}; inviteCode.value = currentInvite; show('invite')`);
+      const creating = h.click('#start-room');
+      await new Promise((resolve) => setImmediate(resolve));
+      const createRequest = h.requestFor('/api/chat/create');
+      if (lostResponse === 'fetch rejection') createRequest.reject(new Error('connection lost'));
+      else createRequest.resolve({ ok: true, status: 200, text: async () => { throw new Error('body lost'); } });
+      await creating;
+      assert.equal(h.element('#invite-view').hidden, false);
+      assert.equal(h.evaluate('currentInvite'), invite);
+      assert.equal(h.element('#invite-code').value, invite);
+      assert.match(h.element('#message').textContent, /방 생성 결과를 확인하지 못했습니다.*시작했을 수 있습니다/);
+      assert.match(h.element('#message').textContent, /같은 코드로 다시 시도해도 안전하다고 확인할 수 없/);
+      assert.equal(h.evaluate('operationId'), null);
+    });
+  }
+});
+
+test('late room creation results cannot replace a newer invite or another identity screen', async (t) => {
+  await t.test('new invite wins over older room response', async () => {
+    const h = createHarness();
+    h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'; currentInvite = 'ADI3-OLD'; inviteCode.value = currentInvite; show('invite')");
+    const oldRoom = h.click('#start-room');
+    await new Promise((resolve) => setImmediate(resolve));
+    const oldRequest = h.requestFor('/api/chat/create');
+
+    await h.click('#brand-home');
+    const newInvite = h.click('#create-invite');
+    await new Promise((resolve) => setImmediate(resolve));
+    const inviteRequest = h.requestFor('/api/invite/create');
+    inviteRequest.resolve(response('ADI3-NEW'));
+    await newInvite;
+    oldRequest.resolve(response('old-operation'));
+    await oldRoom;
+
+    assert.equal(h.evaluate('currentInvite'), 'ADI3-NEW');
+    assert.equal(h.element('#invite-code').value, 'ADI3-NEW');
+    assert.equal(h.element('#invite-view').hidden, false);
+    assert.equal(h.evaluate('operationId'), null);
+    assert.equal(h.requests.filter((item) => item.path === '/api/chat/status').length, 0);
+  });
+
+  await t.test('identity change discards an older room result', async () => {
+    const h = createHarness();
+    h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'; currentInvite = 'ADI3-OLD'; inviteCode.value = currentInvite; show('invite')");
+    const oldRoom = h.click('#start-room');
+    await new Promise((resolve) => setImmediate(resolve));
+    const oldRequest = h.requestFor('/api/chat/create');
+    h.evaluate("identityId.textContent = 'identity-B'; token = 'session-B'; identitySessionGeneration += 1; show('entry'); message.textContent = '다른 신원 화면'");
+    oldRequest.resolve(response('old-operation'));
+    await oldRoom;
+    assert.equal(h.element('#message').textContent, '다른 신원 화면');
+    assert.equal(h.element('#identity-entry').hidden, false);
+    assert.equal(h.evaluate('operationId'), null);
+    assert.equal(h.requests.filter((item) => item.path === '/api/chat/status').length, 0);
+  });
+});
+
 test('actual UI: chat phases show only the actions available at each step', async () => {
   const h = createHarness();
   h.evaluate("operationId = 'operation-phases'; identityId.textContent = 'identity-test'");

@@ -44,6 +44,9 @@ const historyDeleteJobKey = 'local-history-delete-jobs';
 const themeStorageKey = 'another-dimension-theme';
 let token = sessionStorage.getItem(sessionKey);
 let currentInvite = '';
+let inviteFlowGeneration = 0;
+let inviteCreationPending = false;
+let roomCreationPending = false;
 let operationId = null;
 let canReturnToChat = false;
 let latestChatSnapshot = null;
@@ -300,6 +303,7 @@ function discardReprotectOutput() {
 
 function show(view) {
   if (managementDialog.open && !confirmAddedCodeDismissal()) return false;
+  if (view !== 'invite') invalidateInviteFlow();
   identityMenu.open = false;
   bridgeForm.hidden = view !== 'bridge';
   entry.hidden = view !== 'entry';
@@ -315,6 +319,14 @@ function show(view) {
   }
   if (view !== 'active') clearAddedCodeDisplay();
   return true;
+}
+
+function invalidateInviteFlow() {
+  inviteFlowGeneration += 1;
+  inviteCreationPending = false;
+  roomCreationPending = false;
+  document.querySelector('#create-invite').disabled = false;
+  document.querySelector('#start-room').disabled = false;
 }
 
 function syncChatReturnButton() {
@@ -1389,15 +1401,41 @@ document.querySelectorAll('.disconnect').forEach((button) => button.addEventList
 }));
 
 document.querySelector('#create-invite').addEventListener('click', async () => {
+  if (inviteCreationPending) return;
+  const requestGeneration = ++inviteFlowGeneration;
+  const requestIdentityId = identityId.textContent.trim();
+  const requestToken = token;
+  const requestSessionGeneration = identitySessionGeneration;
+  const isCurrentRequest = () => inviteFlowGeneration === requestGeneration
+    && identityId.textContent.trim() === requestIdentityId
+    && token === requestToken
+    && identitySessionGeneration === requestSessionGeneration;
+  inviteCreationPending = true;
+  currentInvite = '';
+  inviteCode.value = '';
+  document.querySelector('#create-invite').disabled = true;
   message.textContent = '';
   try {
-    const response = await request('/api/invite/create');
+    const response = await request('/api/invite/create', '', requestToken);
+    if (!isCurrentRequest()) return;
     if (response.status === 409) { message.textContent = '연결 모드 설정을 적용하려면 프로그램을 다시 실행하세요.'; return; }
+    if (response.status === 401) { message.textContent = '초대 코드를 만들려면 먼저 로그인하세요.'; return; }
     if (!response.ok) throw new Error('invite generation failed');
-    currentInvite = await response.text();
+    const generatedInvite = await response.text();
+    if (!isCurrentRequest()) return;
+    if (!generatedInvite.trim()) throw new Error('empty invite response');
+    currentInvite = generatedInvite;
     inviteCode.value = currentInvite;
+    message.textContent = '';
     show('invite');
-  } catch (_) { message.textContent = '초대 코드를 생성할 수 없습니다.'; }
+  } catch (_) {
+    if (isCurrentRequest()) message.textContent = '초대 코드를 생성할 수 없습니다. 다시 생성해 주세요.';
+  } finally {
+    if (inviteFlowGeneration === requestGeneration) {
+      inviteCreationPending = false;
+      document.querySelector('#create-invite').disabled = false;
+    }
+  }
 });
 
 document.querySelector('#copy-invite').addEventListener('click', async () => {
@@ -1416,13 +1454,68 @@ document.querySelector('#save-invite').addEventListener('click', () => {
 });
 
 document.querySelector('#start-room').addEventListener('click', async () => {
+  if (roomCreationPending) return;
   const code = currentInvite;
-  inviteCode.value = '';
-  currentInvite = '';
-  await startChat('/api/chat/create', code);
+  if (!code) {
+    message.textContent = '사용할 초대 코드가 없습니다. 새 초대 코드를 생성하세요.';
+    return;
+  }
+  const requestGeneration = ++inviteFlowGeneration;
+  const requestIdentityId = identityId.textContent.trim();
+  const requestToken = token;
+  const requestSessionGeneration = identitySessionGeneration;
+  const isCurrentRequest = () => inviteFlowGeneration === requestGeneration
+    && identityId.textContent.trim() === requestIdentityId
+    && token === requestToken
+    && identitySessionGeneration === requestSessionGeneration
+    && currentInvite === code
+    && !inviteView.hidden;
+  const unknownResult = () => {
+    message.textContent = '방 생성 결과를 확인하지 못했습니다. 서버에서 연결 작업을 시작했을 수 있습니다. 초대 코드는 보존했습니다. 같은 코드로 다시 시도해도 안전하다고 확인할 수 없으므로 반복 요청하지 말고, 새 초대 코드로 다시 시작하세요.';
+  };
+  roomCreationPending = true;
+  const startRoomButton = document.querySelector('#start-room');
+  startRoomButton.disabled = true;
+  message.textContent = '방 생성 요청 중입니다.';
+  try {
+    const response = await request('/api/chat/create', code, requestToken);
+    if (!isCurrentRequest()) return;
+    if (!response.ok) {
+      if (response.status === 400) {
+        message.textContent = '서버가 초대 코드를 유효하지 않은 형식으로 거부했습니다. 코드는 화면에 보존했습니다. 새 초대 코드를 생성해 다시 시작하세요.';
+      } else if (response.status === 401) {
+        message.textContent = '로그인이 필요해 방 생성을 거부했습니다. 초대 코드는 화면에 보존했습니다. 로그인 상태를 확인한 뒤 진행하세요.';
+      } else if (response.status === 409) {
+        message.textContent = '연결 설정이 적용되지 않아 방 생성을 거부했습니다. 이 응답은 연결 작업 생성 전에 반환됩니다. 프로그램을 다시 실행한 뒤 화면에 보존된 같은 초대 코드로 다시 시도할 수 있습니다.';
+      } else {
+        message.textContent = `서버가 HTTP ${response.status} 응답을 반환했습니다. 초대 코드는 보존했습니다. 연결 작업 생성 여부와 같은 코드 재시도의 안전성은 이 응답만으로 확인할 수 없습니다.`;
+      }
+      return;
+    }
+    const createdOperationId = await response.text();
+    if (!isCurrentRequest()) return;
+    if (!createdOperationId.trim()) {
+      unknownResult();
+      return;
+    }
+    currentInvite = '';
+    inviteCode.value = '';
+    message.textContent = '';
+    roomCreationPending = false;
+    startRoomButton.disabled = false;
+    await attachChat(createdOperationId.trim());
+  } catch (_) {
+    if (isCurrentRequest()) unknownResult();
+  } finally {
+    if (inviteFlowGeneration === requestGeneration) {
+      roomCreationPending = false;
+      startRoomButton.disabled = false;
+    }
+  }
 });
 
 document.querySelector('#discard-invite').addEventListener('click', () => {
+  invalidateInviteFlow();
   inviteCode.value = '';
   currentInvite = '';
   show('active');
