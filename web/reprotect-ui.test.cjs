@@ -1896,7 +1896,7 @@ test('room creation explicit failures preserve the invite and response loss is r
   const failures = [
     [400, /유효하지 않은 형식/],
     [401, /로그인이 필요/],
-    [409, /작업 생성 전에 반환.*다시 시도할 수 있습니다/],
+    [409, /연결 작업이 생성되지 않았습니다.*재시작 후 복원되지 않습니다.*새 초대 코드를 생성해 상대에게 다시 전달/],
     [500, /연결 작업 생성 여부.*안전성은.*확인할 수 없습니다/],
   ];
   for (const [status, messagePattern] of failures) {
@@ -1914,6 +1914,9 @@ test('room creation explicit failures preserve the invite and response loss is r
       assert.match(h.element('#message').textContent, messagePattern);
       assert.equal(h.element('#start-room').disabled, false);
       assert.equal(h.evaluate('operationId'), null);
+      if (status === 409) {
+        assert.doesNotMatch(h.element('#message').textContent, /같은 초대 코드.*다시 시도/);
+      }
     });
   }
 
@@ -1931,14 +1934,35 @@ test('room creation explicit failures preserve the invite and response loss is r
       assert.equal(h.element('#invite-view').hidden, false);
       assert.equal(h.evaluate('currentInvite'), invite);
       assert.equal(h.element('#invite-code').value, invite);
-      assert.match(h.element('#message').textContent, /방 생성 결과를 확인하지 못했습니다.*시작했을 수 있습니다/);
-      assert.match(h.element('#message').textContent, /같은 코드로 다시 시도해도 안전하다고 확인할 수 없/);
+      assert.match(h.element('#message').textContent, /방 생성 결과를 확인하지 못했습니다.*시작했을 수 있고/);
+      assert.match(h.element('#message').textContent, /화면에서는 그 작업의 진행 여부를 조회할 수 없습니다/);
+      assert.match(h.element('#message').textContent, /프로그램을 종료한 뒤 다시 실행/);
+      assert.match(h.element('#message').textContent, /이미 relay에 전달된 내용이 있는지는 확인할 수 없습니다/);
       assert.equal(h.evaluate('operationId'), null);
     });
   }
 });
 
 test('late room creation results cannot replace a newer invite or another identity screen', async (t) => {
+  await t.test('leaving the invite view best-effort cancels an operation whose id arrives later', async () => {
+    const h = createHarness();
+    h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'; currentInvite = 'ADI3-OLD'; inviteCode.value = currentInvite; show('invite')");
+    const oldRoom = h.click('#start-room');
+    await new Promise((resolve) => setImmediate(resolve));
+    const oldRequest = h.requestFor('/api/chat/create');
+    await h.click('#discard-invite');
+    assert.equal(h.element('#invite-view').hidden, true);
+
+    oldRequest.resolve(response('abandoned-operation'));
+    await oldRoom;
+    const cancelRequest = h.requests.find((item) => item.path === '/api/chat/cancel');
+    assert.ok(cancelRequest);
+    assert.equal(cancelRequest.init.body, 'abandoned-operation');
+    assert.equal(cancelRequest.init.headers.Authorization, 'Bearer session-A');
+    assert.equal(h.evaluate('operationId'), null);
+    assert.equal(h.requests.some((item) => item.path === '/api/chat/status'), false);
+  });
+
   await t.test('new invite wins over older room response', async () => {
     const h = createHarness();
     h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'; currentInvite = 'ADI3-OLD'; inviteCode.value = currentInvite; show('invite')");
@@ -1954,6 +1978,10 @@ test('late room creation results cannot replace a newer invite or another identi
     await newInvite;
     oldRequest.resolve(response('old-operation'));
     await oldRoom;
+    const staleCancel = h.requests.find((item) => item.path === '/api/chat/cancel');
+    assert.ok(staleCancel, 'stale operation is best-effort cancelled while the original session still owns it');
+    assert.equal(staleCancel.init.body, 'old-operation');
+    assert.equal(staleCancel.init.headers.Authorization, 'Bearer session-A');
 
     assert.equal(h.evaluate('currentInvite'), 'ADI3-NEW');
     assert.equal(h.element('#invite-code').value, 'ADI3-NEW');
@@ -1975,6 +2003,7 @@ test('late room creation results cannot replace a newer invite or another identi
     assert.equal(h.element('#identity-entry').hidden, false);
     assert.equal(h.evaluate('operationId'), null);
     assert.equal(h.requests.filter((item) => item.path === '/api/chat/status').length, 0);
+    assert.equal(h.requests.filter((item) => item.path === '/api/chat/cancel').length, 0);
   });
 });
 

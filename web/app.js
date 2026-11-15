@@ -1471,7 +1471,7 @@ document.querySelector('#start-room').addEventListener('click', async () => {
     && currentInvite === code
     && !inviteView.hidden;
   const unknownResult = () => {
-    message.textContent = '방 생성 결과를 확인하지 못했습니다. 서버에서 연결 작업을 시작했을 수 있습니다. 초대 코드는 보존했습니다. 같은 코드로 다시 시도해도 안전하다고 확인할 수 없으므로 반복 요청하지 말고, 새 초대 코드로 다시 시작하세요.';
+    message.textContent = '방 생성 결과를 확인하지 못했습니다. 서버에서 연결 작업을 시작했을 수 있고, 이 화면에서는 그 작업의 진행 여부를 조회할 수 없습니다. 초대 코드는 보존했습니다. 이 연결 시도를 정리하려면 프로그램을 종료한 뒤 다시 실행하세요. 이후 새 초대 코드를 생성해 상대에게 전달할 수 있습니다. 이미 relay에 전달된 내용이 있는지는 확인할 수 없습니다.';
   };
   roomCreationPending = true;
   const startRoomButton = document.querySelector('#start-room');
@@ -1479,23 +1479,29 @@ document.querySelector('#start-room').addEventListener('click', async () => {
   message.textContent = '방 생성 요청 중입니다.';
   try {
     const response = await request('/api/chat/create', code, requestToken);
-    if (!isCurrentRequest()) return;
     if (!response.ok) {
+      if (!isCurrentRequest()) return;
       if (response.status === 400) {
         message.textContent = '서버가 초대 코드를 유효하지 않은 형식으로 거부했습니다. 코드는 화면에 보존했습니다. 새 초대 코드를 생성해 다시 시작하세요.';
       } else if (response.status === 401) {
         message.textContent = '로그인이 필요해 방 생성을 거부했습니다. 초대 코드는 화면에 보존했습니다. 로그인 상태를 확인한 뒤 진행하세요.';
       } else if (response.status === 409) {
-        message.textContent = '연결 설정이 적용되지 않아 방 생성을 거부했습니다. 이 응답은 연결 작업 생성 전에 반환됩니다. 프로그램을 다시 실행한 뒤 화면에 보존된 같은 초대 코드로 다시 시도할 수 있습니다.';
+        message.textContent = '연결 설정이 적용되지 않아 방 생성을 거부했습니다. 이 응답에서는 연결 작업이 생성되지 않았습니다. 현재 초대 코드는 재시작 후 복원되지 않습니다. 프로그램을 다시 실행한 뒤 새 초대 코드를 생성해 상대에게 다시 전달하세요.';
       } else {
         message.textContent = `서버가 HTTP ${response.status} 응답을 반환했습니다. 초대 코드는 보존했습니다. 연결 작업 생성 여부와 같은 코드 재시도의 안전성은 이 응답만으로 확인할 수 없습니다.`;
       }
       return;
     }
-    const createdOperationId = await response.text();
-    if (!isCurrentRequest()) return;
-    if (!createdOperationId.trim()) {
+    const createdOperationId = (await response.text()).trim();
+    if (!createdOperationId) {
       unknownResult();
+      return;
+    }
+    if (!isCurrentRequest()) {
+      const stillOwnsSession = identityId.textContent.trim() === requestIdentityId
+        && token === requestToken
+        && identitySessionGeneration === requestSessionGeneration;
+      if (stillOwnsSession) request('/api/chat/cancel', createdOperationId, requestToken).catch(() => {});
       return;
     }
     currentInvite = '';
