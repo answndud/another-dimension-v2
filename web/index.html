@@ -145,7 +145,7 @@
     .entry.system { border-style: dashed; color: var(--muted); background: var(--surface-muted); }
     .entry time { display: block; margin-bottom: var(--space-1); color: var(--muted); font-size: 12px; }
     main:has(#chat-view:not([hidden])) { display: flex; flex-direction: column; width: min(100%, 960px); min-height: 0; height: calc(100vh - 72px - var(--space-12)); height: calc(100dvh - 72px - var(--space-12)); margin: 0 auto; }
-    #chat-view { display: grid; grid-template-rows: auto auto auto minmax(0, 1fr) auto; flex: 1 1 auto; width: 100%; max-width: none; min-width: 0; min-height: 0; margin: 0; padding: 0; overflow: visible; border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); box-shadow: 0 1px 3px var(--shadow); }
+    #chat-view { display: grid; grid-template-rows: auto auto auto minmax(0, 1fr) auto auto; flex: 1 1 auto; width: 100%; max-width: none; min-width: 0; min-height: 0; margin: 0; padding: 0; overflow: visible; border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); box-shadow: 0 1px 3px var(--shadow); }
     #chat-view[hidden] { display: none !important; }
     .chat-header { grid-row: 1; display: flex; min-height: 72px; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) 20px; border-bottom: 1px solid var(--border-soft); }
     .chat-heading { min-width: 0; }
@@ -183,9 +183,10 @@
     #chat-view .message-external-link { color: var(--link); }
     #chat-view .entry.mine .message-external-link { color: inherit; }
     #chat-view .message-select { align-self: start; }
-    #send-form { grid-row: 5; display: grid; grid-template-columns: minmax(0, 1fr) 88px; align-items: end; gap: var(--space-2); margin: 0; padding: var(--space-3) 20px; border-top: 1px solid var(--border-soft); background: var(--surface); }
+    #send-form { grid-row: 6; display: grid; grid-template-columns: minmax(0, 1fr) 88px; align-items: end; gap: var(--space-2); margin: 0; padding: var(--space-3) 20px; border-top: 1px solid var(--border-soft); background: var(--surface); }
     #send-form[hidden] { display: none !important; }
-    #send-status { grid-column: 1 / -1; margin: 0; padding: var(--space-2) var(--space-3); border: 1px solid var(--danger-border); border-radius: var(--radius-control); color: var(--danger); background: var(--danger-surface); font-size: 13px; overflow-wrap: anywhere; }
+    #send-status { grid-row: 5; align-self: end; margin: 0 20px var(--space-2); padding: var(--space-2) var(--space-3); border: 1px solid var(--danger-border); border-radius: var(--radius-control); color: var(--danger); background: var(--danger-surface); font-size: 13px; overflow-wrap: anywhere; }
+    #send-status[hidden] { display: none !important; }
     #send-form label { grid-column: 1 / -1; margin: 0; }
     #chat-text { width: 100%; min-width: 0; min-height: 48px; max-height: 160px; margin: 0; overflow-y: auto; resize: none; }
     #send-form button { width: 100%; height: 48px; min-height: 48px; }
@@ -336,6 +337,7 @@
       #chat-view #conversation { padding-right: 16px; padding-left: 16px; }
       #chat-view .entry { max-width: 88%; }
       #send-form { padding-right: 16px; padding-left: 16px; }
+      #send-status { margin-right: 16px; margin-left: 16px; }
       .history-detail-header { grid-template-columns: minmax(0, 1fr); padding: var(--space-4); }
       .history-header-actions { justify-content: flex-start; }
       .history-reconnect-note { grid-column: 1; }
@@ -361,6 +363,7 @@
       #chat-view #conversation { gap: var(--space-2); padding: var(--space-3); }
       #chat-view .entry { max-width: 92%; padding: var(--space-3); }
       #send-form { grid-template-columns: minmax(0, 1fr) 76px; gap: var(--space-2); padding: var(--space-2) var(--space-3); }
+      #send-status { margin-right: var(--space-3); margin-left: var(--space-3); }
       #chat-text { min-height: 44px; }
       #send-form button { height: 44px; min-height: 44px; padding: var(--space-2); }
       #identity-transition-panel .actions, #history-restore-panel .actions { align-items: stretch; flex-direction: column; }
@@ -643,8 +646,8 @@
         </div>
       </div>
       <div id="conversation" class="conversation" aria-live="polite" aria-label="대화 메시지"></div>
+      <p id="send-status" role="status" aria-live="polite" hidden></p>
       <form id="send-form" hidden>
-        <p id="send-status" role="status" aria-live="polite" hidden></p>
         <label class="visually-hidden" for="chat-text">메시지</label>
         <textarea id="chat-text" maxlength="4078" required placeholder="메시지를 입력하세요."></textarea>
         <button type="submit" class="primary">전송</button>

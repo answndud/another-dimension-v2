@@ -481,7 +481,10 @@ test('dashboard menu closes on outside click and Escape; management dialog reuse
   assert.match(html, /\.chat-status-strip\s*\{[^}]*grid-row:\s*2/);
   assert.match(html, /\.chat-workflows\s*\{[^}]*grid-row:\s*3/);
   assert.match(html, /#chat-view\s+#conversation\s*\{[^}]*grid-row:\s*4/);
-  assert.match(html, /#send-form\s*\{[^}]*grid-row:\s*5/);
+  assert.match(html, /#send-form\s*\{[^}]*grid-row:\s*6/);
+  assert.match(html, /#send-status\s*\{[^}]*grid-row:\s*5/);
+  assert.match(html, /#chat-view\s*\{[^}]*grid-template-rows:\s*auto auto auto minmax\(0, 1fr\) auto auto/);
+  assert.match(html, /<div id="conversation"[^>]*><\/div>\s*<p id="send-status"[^>]*><\/p>\s*<form id="send-form"/);
   assert.match(html, /main:has\(#chat-view:not\(\[hidden\]\)\)\s+#message\s*\{[^}]*flex:\s*0 0 52px;[^}]*width:\s*100%/);
   assert.match(html, /#connect-form\s+h2/);
   assert.match(html, /#connect-form\s*>\s*button,\s*#login-form\s+button\s*\{[^}]*width:\s*100%/);
@@ -1802,6 +1805,58 @@ test('send error, aggregate relay acknowledgement, and local storage error remai
   assert.match(h.element('#storage-status').textContent, /^이 기기의 기록 처리·저장 상태: 기록 파일 쓰기 실패$/);
   assert.equal(h.element('#delivery-status').hidden, false);
   assert.equal(h.element('#storage-status').hidden, false);
+});
+
+test('send errors remain visible outside the hidden form after disconnect and emptying the draft', async (t) => {
+  for (const failure of ['409', 'unknown']) {
+    await t.test(failure, async () => {
+      const h = createHarness();
+      h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+      await attachChatInHarness(h, 'operation-A');
+      inputChat(h, 'in-flight message');
+      const sending = submitChat(h);
+      const request = await waitForRequest(() => h.requestFor('/api/chat/send'));
+
+      inputChat(h, '');
+      h.evaluate("updateChatView({ phase: 'disconnected', error: '연결이 끊겼습니다.', messageCount: 0, messageEpoch: 1 })");
+      assert.equal(h.element('#send-form').hidden, true);
+      assert.equal(h.element('#send-form').querySelector('button').disabled, true);
+
+      let body;
+      if (failure === '409') {
+        body = deferred();
+        let bodyStartedResolve;
+        const bodyStarted = new Promise((resolve) => { bodyStartedResolve = resolve; });
+        request.resolve({
+          ok: false, status: 409,
+          text: () => { bodyStartedResolve(); return body.promise; },
+        });
+        await bodyStarted;
+        body.resolve('현재 병합 중이어서 전송하지 않았습니다.');
+      } else {
+        request.reject(new Error('response lost'));
+      }
+      await sending;
+
+      assert.equal(h.element('#chat-view').hidden, false);
+      assert.equal(h.element('#send-status').hidden, false);
+      assert.equal(h.element('#send-status').textContent, failure === '409'
+        ? '현재 병합 중이어서 전송하지 않았습니다.'
+        : '전송 결과를 확인하지 못했습니다. 입력을 보존했습니다. 다시 보내면 중복될 수 있습니다.');
+      assert.equal(h.element('#send-form').hidden, true);
+      assert.equal(h.element('#send-form').querySelector('button').disabled, true);
+      assert.equal(h.element('#chat-status').textContent, '연결이 끊겼습니다.');
+
+      h.evaluate("updateChatView({ phase: 'disconnected', error: '연결이 계속 끊겨 있습니다.', messageCount: 0, messageEpoch: 1 })");
+      assert.equal(h.element('#send-status').hidden, false);
+      assert.equal(h.element('#send-form').hidden, true);
+      assert.equal(h.element('#send-form').querySelector('button').disabled, true);
+
+      h.evaluate("updateChatView({ phase: 'verification', messageCount: 0, messageEpoch: 1 })");
+      assert.equal(h.element('#verification').hidden, false);
+      assert.equal(h.element('#send-form').querySelector('button').disabled, true);
+    });
+  }
 });
 
 test('actual UI: relay settings display the active relay list and save edited lists', async (t) => {

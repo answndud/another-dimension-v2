@@ -1491,7 +1491,6 @@ sendForm.addEventListener('submit', async (event) => {
       && document.activeElement === sentFocusTarget && focusIsStillInSendForm) chatText.focus();
   } catch (_) {
     if (isCurrentSend()) {
-      sendForm.hidden = false;
       sendStatus.textContent = '전송 결과를 확인하지 못했습니다. 입력을 보존했습니다. 다시 보내면 중복될 수 있습니다.';
       sendStatus.hidden = false;
     }
