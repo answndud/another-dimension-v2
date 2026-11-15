@@ -882,12 +882,12 @@ function updateChatView(snapshot) {
   };
   const titles = {
     connecting: '대화 연결',
-    verification: '상대 신원 확인',
-    confirming: '상대 확인 응답 대기',
+    verification: '대화 연결',
+    confirming: '대화 연결',
     connected: '대화',
-    disconnected: '연결 끊김',
-    failed: '연결 실패',
-    closed: '연결 종료'
+    disconnected: '대화',
+    failed: '대화',
+    closed: '대화'
   };
   document.querySelector('#chat-title').textContent = titles[phase] || '대화 연결';
   chatStatus.textContent = labels[phase] || snapshot.error || '연결 상태를 확인하는 중입니다.';

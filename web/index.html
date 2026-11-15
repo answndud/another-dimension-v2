@@ -155,6 +155,8 @@
     #chat-view[data-phase="disconnected"][data-chat-body="draft"], #chat-view[data-phase="failed"][data-chat-body="draft"], #chat-view[data-phase="closed"][data-chat-body="draft"] { grid-template-rows: auto auto 0 0 auto auto; }
     #chat-view[data-phase="disconnected"][data-workflow-visible="true"][data-chat-body="messages"], #chat-view[data-phase="failed"][data-workflow-visible="true"][data-chat-body="messages"], #chat-view[data-phase="closed"][data-workflow-visible="true"][data-chat-body="messages"] { grid-template-rows: auto auto auto minmax(0, 1fr) auto auto; }
     #chat-view[data-phase="disconnected"][data-workflow-visible="true"][data-chat-body="draft"], #chat-view[data-phase="failed"][data-workflow-visible="true"][data-chat-body="draft"], #chat-view[data-phase="closed"][data-workflow-visible="true"][data-chat-body="draft"] { grid-template-rows: auto auto auto 0 auto auto; }
+    #chat-view[data-phase="connecting"], #chat-view[data-phase="verification"], #chat-view[data-phase="confirming"], #chat-view[data-phase="disconnected"], #chat-view[data-phase="failed"], #chat-view[data-phase="closed"] { align-content: start; flex: 0 0 auto; }
+    #chat-view[data-phase="disconnected"][data-chat-body="messages"], #chat-view[data-phase="failed"][data-chat-body="messages"], #chat-view[data-phase="closed"][data-chat-body="messages"] { align-content: stretch; flex: 1 1 auto; min-height: 0; }
     .chat-header { grid-row: 1; display: flex; min-height: 72px; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) 20px; border-bottom: 1px solid var(--border-soft); }
     .chat-heading { min-width: 0; }
     .chat-heading h2 { margin: 0 0 var(--space-1); font-size: 18px; font-weight: 650; }

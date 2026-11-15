@@ -1829,7 +1829,7 @@ test('actual UI: chat phases show only the actions available at each step', asyn
   const peer = 'ab'.repeat(32);
   const fingerprint = 'cd'.repeat(32);
   showPhase('verification', { peerId: peer, fingerprint });
-  assert.equal(h.element('#chat-title').textContent, '상대 신원 확인');
+  assert.equal(h.element('#chat-title').textContent, '대화 연결');
   assert.equal(h.element('#verification').hidden, false);
   assert.equal(h.element('#peer-id').textContent, peer);
   assert.equal(h.element('#fingerprint').textContent, fingerprint);
@@ -1841,6 +1841,8 @@ test('actual UI: chat phases show only the actions available at each step', asyn
   assert.match(html, /<p class="verification-warning">하나라도 다르면 확인하지 마세요\.<\/p>\s*<button id="confirm-peer"/);
   assert.match(html, /id="confirm-peer"[^>]*>두 값을 비교했고 일치함을 확인했습니다</);
   assert.match(html, /#chat-view\[data-phase="verification"\] \.chat-workflows\s*\{[^}]*max-height:\s*none;[^}]*overflow:\s*visible;/);
+  assert.match(html, /#chat-view\[data-phase="connecting"\].*#chat-view\[data-phase="closed"\]\s*\{[^}]*align-content:\s*start;[^}]*flex:\s*0 0 auto;/);
+  assert.match(html, /#chat-view\[data-phase="disconnected"\]\[data-chat-body="messages"\].*#chat-view\[data-phase="closed"\]\[data-chat-body="messages"\]\s*\{[^}]*align-content:\s*stretch;[^}]*flex:\s*1 1 auto;[^}]*min-height:\s*0;/);
   assert.match(html, /#chat-view #conversation\[hidden\]\s*\{[^}]*display:\s*none\s*!important;/);
 
   const confirmTask = h.click('#confirm-peer');
@@ -1848,7 +1850,7 @@ test('actual UI: chat phases show only the actions available at each step', asyn
   h.requestFor('/api/chat/confirm').resolve(response('ok'));
   await confirmTask;
   showPhase('confirming');
-  assert.equal(h.element('#chat-title').textContent, '상대 확인 응답 대기');
+  assert.equal(h.element('#chat-title').textContent, '대화 연결');
   assert.match(h.element('#chat-status').textContent, /상대 확인 응답을 기다리는 중/);
   assert.equal(h.element('#confirm-peer').disabled, true);
   assert.equal(h.element('#conversation').hidden, true);
@@ -1867,7 +1869,7 @@ test('actual UI: chat phases show only the actions available at each step', asyn
 
   h.evaluate("appendMessages([{ sender: '상대', time: 1700000000, text: '기존 메시지 https://example.test/' }]); chatText.value = '연결이 끊겼을 때 남길 초안'");
   showPhase('disconnected', { error: '연결이 끊겼습니다.' });
-  assert.equal(h.element('#chat-title').textContent, '연결 끊김');
+  assert.equal(h.element('#chat-title').textContent, '대화');
   assert.equal(h.element('#chat-status').textContent, '연결이 끊겼습니다.');
   assert.equal(h.element('#conversation').hidden, false);
   assert.equal(h.element('#conversation').children.length, 1);
@@ -1878,7 +1880,7 @@ test('actual UI: chat phases show only the actions available at each step', asyn
   assert.equal(h.element('#close-chat').hidden, false);
 
   showPhase('failed', { error: '연결에 실패했습니다.' });
-  assert.equal(h.element('#chat-title').textContent, '연결 실패');
+  assert.equal(h.element('#chat-title').textContent, '대화');
   assert.equal(h.element('#conversation').children.length, 1);
   assert.equal(h.element('#chat-text').value, '연결이 끊겼을 때 남길 초안');
 
