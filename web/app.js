@@ -1862,29 +1862,33 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     && identityId.textContent.trim() === importIdentityId
     && token === importSession;
   const importStatus = document.querySelector('#history-backup-import-result');
-  const setImportResult = (result) => {
+  const setImportResult = (result, detail = '') => {
     importStatus.dataset.result = result;
-    importStatus.textContent = result === 'success' ? '백업 가져오기 성공'
+    const title = result === 'success' ? '백업 가져오기 성공'
       : result === 'cleanup-warning' ? '가져오기 완료 · 임시 파일 정리 실패'
         : result === 'unknown' ? '가져오기 결과 확인 필요'
         : '백업 가져오기 실패';
+    importStatus.textContent = detail ? `${title}. ${detail}` : title;
     importStatus.hidden = false;
   };
   importStatus.hidden = true;
   importStatus.textContent = '';
+  delete importStatus.dataset.result;
   const file = document.querySelector('#history-backup-file').files[0];
   const passwordField = document.querySelector('#history-backup-import-password');
   const password = passwordField.value;
   if (!file) {
     passwordField.value = '';
-    setImportResult('failure');
-    message.textContent = '가져올 백업 파일을 선택하세요.';
+    const detail = '가져올 백업 파일을 선택하세요.';
+    setImportResult('failure', detail);
+    message.textContent = detail;
     return;
   }
   if (password && [...password].length < 12) {
     passwordField.value = '';
-    setImportResult('failure');
-    message.textContent = '백업 비밀번호는 12자 이상이어야 합니다.';
+    const detail = '백업 비밀번호는 12자 이상이어야 합니다.';
+    setImportResult('failure', detail);
+    message.textContent = detail;
     return;
   }
   let transferId = null;
@@ -1909,21 +1913,29 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     const response = await request('/api/history/backup-transfer', JSON.stringify({ action: 'import', transferId, password }), importSession);
     transferId = null;
     if (!isCurrentImport()) return;
-    if (response.status === 409) { setImportResult('failure'); message.textContent = '먼저 모든 대화 연결을 종료한 뒤 다시 시도하세요.'; return; }
+    if (response.status === 409) {
+      const detail = '먼저 모든 대화 연결을 종료한 뒤 다시 시도하세요.';
+      setImportResult('failure', detail);
+      message.textContent = detail;
+      return;
+    }
     if (!response.ok) {
       const detail = (await response.text()) || '백업을 검증하거나 저장하지 못했습니다.';
       if (!isCurrentImport()) return;
       const partial = detail.match(/backup bundle failed after applying (\d+) conversation\(s\):/i);
       const cleanupWarning = detail.startsWith('backup import completed but temporary upload cleanup failed');
-      setImportResult('failure');
       if (partial && Number(partial[1]) > 0) {
-        message.textContent = `${detail} 기록 목록을 새로고침해 적용된 대화를 확인하고, 원본 백업 파일은 보관하세요. 미적용 대화만 선택해 재시도하는 기능은 없습니다.`;
+        const guidance = `${detail} 기록 목록을 새로고침해 적용된 대화를 확인하고, 원본 백업 파일은 보관하세요. 미적용 대화만 선택해 재시도하는 기능은 없습니다.`;
+        setImportResult('failure', guidance);
+        message.textContent = guidance;
         try { await refreshHistoryList(isCurrentImport); } catch (_) { /* preserve the server's partial-application result */ }
       } else if (cleanupWarning) {
-        setImportResult('cleanup-warning');
-        message.textContent = `${detail} 가져온 대화를 기록 목록에서 확인하세요. 임시 업로드 파일은 자동 정리되지 않았을 수 있습니다. 앱을 모두 종료한 뒤 README의 수동 정리 안내를 확인하세요.`;
+        const guidance = `${detail} 가져온 대화를 기록 목록에서 확인하세요. 임시 업로드 파일은 자동 정리되지 않았을 수 있습니다. 앱을 모두 종료한 뒤 README의 수동 정리 안내를 확인하세요.`;
+        setImportResult('cleanup-warning', guidance);
+        message.textContent = guidance;
         try { await refreshHistoryList(isCurrentImport); } catch (_) { /* import completed; keep the cleanup warning visible */ }
       } else {
+        setImportResult('failure', detail);
         message.textContent = detail;
       }
       return;
@@ -1933,29 +1945,32 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     imported = true;
     await refreshHistoryList(isCurrentImport);
     if (!isCurrentImport()) return;
-    setImportResult('success');
     document.querySelector('#history-backup-file').value = '';
     if (Array.isArray(result.conversations)) {
       const linked = result.conversations.filter(item => item.linkedIdentityRestored).length;
       message.textContent = `${result.conversations.length}개 대화 백업을 기존 기록과 병합했습니다.${linked ? ` ${linked}개 대화의 인증된 이전 신원 관계도 복원했습니다.` : ''}`;
+      setImportResult('success', message.textContent);
     } else {
-      await openHistory(result.peerId, isCurrentImport);
-      if (!isCurrentImport()) return;
       message.textContent = result.linkedIdentityRestored
         ? '백업을 확인해 기존 기록과 인증된 이전 신원 관계를 복원했습니다.'
         : '백업을 확인해 기존 기록과 병합했습니다.';
+      setImportResult('success', message.textContent);
     }
   } catch (_) {
     if (!isCurrentImport()) return;
     if (imported) {
-      message.textContent = '백업은 가져왔지만 화면을 갱신하지 못했습니다. 기록을 다시 불러오세요.';
+      const detail = '백업은 가져왔지만 화면을 갱신하지 못했습니다. 기록을 다시 불러오세요.';
+      setImportResult('success', detail);
+      message.textContent = detail;
     } else if (importRequestStarted) {
-      setImportResult('unknown');
-      message.textContent = '가져오기 요청을 보낸 뒤 결과를 확인하지 못했습니다. 기록 목록을 새로고침해 적용 여부를 확인하고, 선택한 원본 백업 파일은 보관하세요. 전체 묶음을 다시 가져와도 안전한 재개라고 보장되지 않습니다.';
+      const detail = '가져오기 요청을 보낸 뒤 결과를 확인하지 못했습니다. 기록 목록을 새로고침해 적용 여부를 확인하고, 선택한 원본 백업 파일은 보관하세요. 전체 묶음을 다시 가져와도 안전한 재개라고 보장되지 않습니다.';
+      setImportResult('unknown', detail);
+      message.textContent = detail;
       try { await refreshHistoryList(isCurrentImport); } catch (_) { /* preserve the unknown import result */ }
     } else {
-      setImportResult('failure');
-      message.textContent = '가져오기 요청 전에 백업 파일을 읽거나 업로드하지 못했습니다. 기록 가져오기는 시작되지 않았으며 선택한 원본 백업 파일은 유지됩니다.';
+      const detail = '가져오기 요청 전에 백업 파일을 읽거나 업로드하지 못했습니다. 기록 가져오기는 시작되지 않았으며 선택한 원본 백업 파일은 유지됩니다.';
+      setImportResult('failure', detail);
+      message.textContent = detail;
     }
   } finally {
     if (transferId) {

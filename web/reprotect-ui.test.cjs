@@ -1048,6 +1048,28 @@ test('backup restore asks before applying authenticated linked identity data', a
   assert.equal(h.requests.some((item) => item.path === '/api/history/backup-transfer' && JSON.parse(item.init.body).action === 'import'), false);
 });
 
+test('backup import result stays visible without hover or focus', () => {
+  const html = fs.readFileSync(require.resolve('./index.html'), 'utf8');
+  assert.match(html, /<div id="history-backup-import-result" class="history-import-result" role="status" aria-live="polite" hidden><\/div>/);
+  assert.match(html, /\.history-import-result\s*\{[^}]*display:\s*block/);
+  assert.match(html, /\.history-import-result\[hidden\]\s*\{\s*display:\s*none\s*!important;/);
+  assert.doesNotMatch(html, /\.history-import-action:(?:hover|focus-within).*history-import-result/);
+  assert.doesNotMatch(html, /\.history-import-result:not\(\[hidden\]\)\s*\{\s*display:\s*none/);
+});
+
+test('backup import keeps a general server failure detail in the result region', async () => {
+  const detail = 'backup authentication failed: invalid password';
+  const h = createHarness({ importFailure: detail });
+  h.element('#history-backup-file').files = [file('backup.adbak', 'ADBACK7\0payload')];
+  h.window.confirm = () => true;
+  const task = h.click('#history-backup-import');
+  await new Promise((resolve) => setImmediate(resolve));
+  await task;
+  assert.equal(h.element('#history-backup-import-result').dataset.result, 'failure');
+  assert.match(h.element('#history-backup-import-result').textContent, /백업 가져오기 실패/);
+  assert.ok(h.element('#history-backup-import-result').textContent.includes(detail));
+});
+
 test('legacy streaming backup formats warn about their integrity and privacy limits', async () => {
   for (const magic of ['ADBACK6\0', 'ADPACK2\0']) {
     const h = createHarness();
@@ -1078,9 +1100,12 @@ test('backup import presents the server-reported partial bundle count', async ()
   }])));
   await task;
   assert.equal(h.element('#message').textContent, `${detail} 기록 목록을 새로고침해 적용된 대화를 확인하고, 원본 백업 파일은 보관하세요. 미적용 대화만 선택해 재시도하는 기능은 없습니다.`);
-  assert.equal(h.element('#history-backup-import-result').textContent, '백업 가져오기 실패');
+  assert.match(h.element('#history-backup-import-result').textContent, /^백업 가져오기 실패/);
   assert.equal(h.element('#history-backup-import-result').dataset.result, 'failure');
   assert.equal(h.element('#history-backup-import-result').hidden, false);
+  assert.ok(h.element('#history-backup-import-result').textContent.includes(detail));
+  assert.match(h.element('#history-backup-import-result').textContent, /기록 목록을 새로고침해 적용된 대화를 확인/);
+  assert.match(h.element('#history-backup-import-result').textContent, /원본 백업 파일은 보관/);
   assert.equal(h.element('#history-list').children.length, 1);
   assert.equal(h.element('#history-list').children[0].children[1].children[0].textContent, '대화 cdcdcdcdcdcd');
   assert.equal(h.element('#history-backup-file').files[0], original);
@@ -1105,6 +1130,8 @@ test('partial import error remains visible when the follow-up list request or re
       assert.match(h.element('#message').textContent, /backup bundle failed after applying 2 conversation\(s\): disk write failed/);
       assert.match(h.element('#message').textContent, /기록 목록을 새로고침해 적용된 대화를 확인/);
       assert.equal(h.element('#history-backup-import-result').dataset.result, 'failure');
+      assert.ok(h.element('#history-backup-import-result').textContent.includes(detail));
+      assert.match(h.element('#history-backup-import-result').textContent, /기록 목록을 새로고침해 적용된 대화를 확인/);
       assert.equal(h.element('#history-backup-file').files[0].name, 'bundle.adpak');
     });
   }
@@ -1123,7 +1150,10 @@ test('completed import with upload cleanup failure refreshes the list and explai
   listRequest.resolve(response(JSON.stringify([{ peerId: '12'.repeat(32), messageCount: 6, verified: true }])));
   await task;
   assert.equal(h.element('#history-backup-import-result').dataset.result, 'cleanup-warning');
-  assert.equal(h.element('#history-backup-import-result').textContent, '가져오기 완료 · 임시 파일 정리 실패');
+  assert.match(h.element('#history-backup-import-result').textContent, /^가져오기 완료 · 임시 파일 정리 실패/);
+  assert.ok(h.element('#history-backup-import-result').textContent.includes(detail));
+  assert.match(h.element('#history-backup-import-result').textContent, /기록 목록에서 확인/);
+  assert.match(h.element('#history-backup-import-result').textContent, /README의 수동 정리 안내/);
   assert.match(h.element('#message').textContent, /backup import completed but temporary upload cleanup failed/);
   assert.match(h.element('#message').textContent, /기록 목록에서 확인/);
   assert.match(h.element('#message').textContent, /앱을 모두 종료한 뒤 README의 수동 정리 안내/);
@@ -1145,7 +1175,10 @@ test('backup import distinguishes an unconfirmed server result from pre-request 
       listRequest.resolve(response('[]'));
       await task;
       assert.equal(h.element('#history-backup-import-result').dataset.result, 'unknown');
-      assert.equal(h.element('#history-backup-import-result').textContent, '가져오기 결과 확인 필요');
+      assert.match(h.element('#history-backup-import-result').textContent, /가져오기 결과 확인 필요/);
+      assert.match(h.element('#history-backup-import-result').textContent, /가져오기 요청을 보낸 뒤 결과를 확인하지 못했습니다/);
+      assert.match(h.element('#history-backup-import-result').textContent, /기록 목록을 새로고침해 적용 여부를 확인/);
+      assert.match(h.element('#history-backup-import-result').textContent, /원본 백업 파일은 보관/);
       assert.match(h.element('#message').textContent, /가져오기 요청을 보낸 뒤 결과를 확인하지 못했습니다/);
       assert.match(h.element('#message').textContent, /기록 목록을 새로고침해 적용 여부를 확인/);
       assert.match(h.element('#message').textContent, /원본 백업 파일은 보관/);
@@ -1161,6 +1194,7 @@ test('backup import distinguishes an unconfirmed server result from pre-request 
     await task;
     assert.equal(h.requestForAction('import'), undefined);
     assert.equal(h.element('#history-backup-import-result').dataset.result, 'failure');
+    assert.match(h.element('#history-backup-import-result').textContent, /가져오기 요청 전에 백업 파일을 읽거나 업로드하지 못했습니다/);
     assert.match(h.element('#message').textContent, /가져오기 요청 전에 백업 파일을 읽거나 업로드하지 못했습니다/);
     assert.match(h.element('#message').textContent, /기록 가져오기는 시작되지 않았으며/);
     assert.doesNotMatch(h.element('#message').textContent, /기존 기록과 선택한 원본 파일은 보존됩니다/);
@@ -1265,7 +1299,7 @@ test('a superseded import cannot clear the newer import file or password', async
 
   assert.equal(h.element('#history-backup-file').files[0].name, 'next.adbak');
   assert.equal(h.element('#history-backup-import-password').value, 'password-for-the-next-import');
-  assert.equal(h.element('#history-backup-import-result').textContent, '백업 가져오기 성공');
+  assert.match(h.element('#history-backup-import-result').textContent, /^백업 가져오기 성공/);
 });
 
 test('superseded upload cleanup uses the session that created its transfer', async () => {
@@ -1293,9 +1327,25 @@ test('backup import exposes success on the import control after a successful res
   await new Promise((resolve) => setImmediate(resolve));
   h.requestFor('/api/history/list').resolve(response('[]'));
   await task;
-  assert.equal(h.element('#history-backup-import-result').textContent, '백업 가져오기 성공');
+  assert.match(h.element('#history-backup-import-result').textContent, /백업 가져오기 성공/);
+  assert.match(h.element('#history-backup-import-result').textContent, /0개 대화 백업을 기존 기록과 병합했습니다/);
   assert.equal(h.element('#history-backup-import-result').dataset.result, 'success');
   assert.equal(h.element('#history-backup-import-result').hidden, false);
+});
+
+test('single-backup import leaves its success result visible in the management dialog', async () => {
+  const h = createHarness({ importResult: JSON.stringify({ peerId: 'ab'.repeat(32), linkedIdentityRestored: false }) });
+  h.element('#management-dialog').open = true;
+  h.element('#history-detail').hidden = true;
+  h.element('#history-backup-file').files = [file('backup.adbak', 'ADBACK7\0payload')];
+  h.window.confirm = () => true;
+  const task = h.click('#history-backup-import');
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/history/list').resolve(response('[]'));
+  await task;
+  assert.equal(h.element('#management-dialog').open, true);
+  assert.equal(h.element('#history-detail').hidden, true);
+  assert.match(h.element('#history-backup-import-result').textContent, /기존 기록과 병합했습니다/);
 });
 
 function createOutputHandle() {

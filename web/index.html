@@ -310,12 +310,12 @@
     .history-tool-card input:not([type="checkbox"]):not([type="radio"]) { min-width: 0; }
     .history-tool-card input[type="file"] { max-width: 100%; padding: var(--space-2); font-size: 13px; }
     .history-import-card { max-width: 100%; }
-    .history-import-action { position: relative; justify-self: start; }
-    .history-import-result { position: absolute; z-index: 5; right: 0; bottom: calc(100% + var(--space-2)); width: max-content; max-width: min(22rem, calc(100vw - 48px)); padding: var(--space-2) var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-control); color: var(--text); background: var(--surface); box-shadow: 0 4px 16px var(--shadow); font-size: 13px; line-height: 1.4; }
-    .history-import-action:hover .history-import-result:not([hidden]), .history-import-action:focus-within .history-import-result:not([hidden]) { display: block; }
+    .history-import-action { display: grid; justify-self: stretch; gap: var(--space-2); }
+    .history-import-action > button { justify-self: start; }
+    .history-import-result { display: block; width: 100%; min-width: 0; margin: 0; padding: var(--space-3); border: 1px solid var(--border-soft); border-radius: var(--radius-control); color: var(--text); background: var(--surface); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; white-space: pre-wrap; }
+    .history-import-result[hidden] { display: none !important; }
     .history-import-result[data-result="failure"] { border-color: var(--danger-border); color: var(--danger); background: var(--danger-surface); }
     .history-import-result[data-result="cleanup-warning"], .history-import-result[data-result="unknown"] { border-color: var(--border); color: var(--text); background: var(--surface-muted); }
-    .history-import-result:not([hidden]) { display: none; }
     .history-reprotect-card { max-width: 100%; }
     .history-reprotect-steps { display: flex; flex-wrap: wrap; gap: var(--space-2); color: var(--muted); font-size: 12px; }
     .history-reprotect-steps span { padding: var(--space-1) var(--space-2); border: 1px solid var(--border-soft); border-radius: 999px; background: var(--surface); }
@@ -736,7 +736,7 @@
               <input id="history-backup-import-password" type="password" autocomplete="current-password" maxlength="1024">
               <div class="history-import-action">
                 <button id="history-backup-import" type="button">파일 가져오기</button>
-                <span id="history-backup-import-result" class="history-import-result" role="status" aria-live="polite" hidden></span>
+                <div id="history-backup-import-result" class="history-import-result" role="status" aria-live="polite" hidden></div>
               </div>
             </div>
           </section>
