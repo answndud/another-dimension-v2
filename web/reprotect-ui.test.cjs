@@ -1769,7 +1769,7 @@ test('send request errors stay separate from connection polling and clear on ret
     assert.equal(h.element('#chat-text').value, 'keep my draft');
 
     h.evaluate(`updateChatView({ phase: 'connected', messageCount: 0, messageEpoch: 1 })`);
-    assert.equal(h.element('#chat-status').textContent, '연결되었습니다. relay는 IP 주소와 연결 시각·통신량을 볼 수 있습니다.');
+    assert.equal(h.element('#chat-status').textContent, '대화 연결이 활성화되었습니다. relay는 IP 주소와 연결 시각·통신량을 볼 수 있습니다.');
     assert.equal(h.element('#send-status').textContent, errorText);
 
     inputChat(h, 'retry text');
@@ -1798,13 +1798,105 @@ test('send error, aggregate relay acknowledgement, and local storage error remai
     pendingSends: 2, relayAck: 'accepted', storageError: '기록 파일 쓰기 실패',
   })`);
 
-  assert.equal(h.element('#chat-status').textContent, '연결되었습니다. relay는 IP 주소와 연결 시각·통신량을 볼 수 있습니다.');
+  assert.equal(h.element('#chat-status').textContent, '대화 연결이 활성화되었습니다. relay는 IP 주소와 연결 시각·통신량을 볼 수 있습니다.');
   assert.equal(h.element('#send-status').textContent, '전송 결과를 확인하지 못했습니다.');
   assert.match(h.element('#delivery-status').textContent, /relay 접수 확인 대기 중 \(2건\)/);
   assert.match(h.element('#delivery-status').textContent, /상대방의 수신이나 저장은 확인되지 않습니다/);
   assert.match(h.element('#storage-status').textContent, /^이 기기의 기록 처리·저장 상태: 기록 파일 쓰기 실패$/);
   assert.equal(h.element('#delivery-status').hidden, false);
   assert.equal(h.element('#storage-status').hidden, false);
+});
+
+test('actual UI: chat phases show only the actions available at each step', async () => {
+  const h = createHarness();
+  h.evaluate("operationId = 'operation-phases'; identityId.textContent = 'identity-test'");
+
+  const showPhase = (phase, extras = {}) => h.evaluate(`updateChatView({
+    phase: ${JSON.stringify(phase)}, messageCount: 0, messageEpoch: 1,
+    identityTransition: [], ...${JSON.stringify(extras)}
+  })`);
+
+  showPhase('connecting');
+  assert.equal(h.element('#chat-title').textContent, '대화 연결');
+  assert.match(h.element('#chat-status').textContent, /relay에 연결하고 상대를 찾는 중/);
+  assert.equal(h.element('#close-chat').hidden, false);
+  assert.equal(h.element('#verification').hidden, true);
+  assert.equal(h.element('#conversation').hidden, true);
+  assert.equal(h.element('#send-form').hidden, true);
+  assert.equal(h.element('#history-restore-request').hidden, true);
+  assert.equal(h.element('#send-form').querySelector('button').disabled, true);
+
+  const peer = 'ab'.repeat(32);
+  const fingerprint = 'cd'.repeat(32);
+  showPhase('verification', { peerId: peer, fingerprint });
+  assert.equal(h.element('#chat-title').textContent, '상대 신원 확인');
+  assert.equal(h.element('#verification').hidden, false);
+  assert.equal(h.element('#peer-id').textContent, peer);
+  assert.equal(h.element('#fingerprint').textContent, fingerprint);
+  assert.equal(h.element('#conversation').hidden, true);
+  assert.equal(h.element('#send-form').hidden, true);
+  assert.equal(h.element('#history-restore-request').hidden, true);
+  assert.equal(h.element('#confirm-peer').disabled, false);
+  const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
+  assert.match(html, /<p class="verification-warning">하나라도 다르면 확인하지 마세요\.<\/p>\s*<button id="confirm-peer"/);
+  assert.match(html, /id="confirm-peer"[^>]*>두 값을 비교했고 일치함을 확인했습니다</);
+  assert.match(html, /#chat-view\[data-phase="verification"\] \.chat-workflows\s*\{[^}]*max-height:\s*none;[^}]*overflow:\s*visible;/);
+  assert.match(html, /#chat-view #conversation\[hidden\]\s*\{[^}]*display:\s*none\s*!important;/);
+
+  const confirmTask = h.click('#confirm-peer');
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/chat/confirm').resolve(response('ok'));
+  await confirmTask;
+  showPhase('confirming');
+  assert.equal(h.element('#chat-title').textContent, '상대 확인 응답 대기');
+  assert.match(h.element('#chat-status').textContent, /상대 확인 응답을 기다리는 중/);
+  assert.equal(h.element('#confirm-peer').disabled, true);
+  assert.equal(h.element('#conversation').hidden, true);
+  assert.equal(h.element('#send-form').hidden, true);
+  assert.equal(h.element('#history-restore-request').hidden, true);
+
+  showPhase('connected', { pendingSends: 1, relayAck: 'pending', storageError: '기록 파일 쓰기 실패' });
+  assert.equal(h.element('#chat-title').textContent, '대화');
+  assert.match(h.element('#chat-status').textContent, /대화 연결이 활성화/);
+  assert.equal(h.element('#conversation').hidden, false);
+  assert.equal(h.element('#send-form').hidden, false);
+  assert.equal(h.element('#send-form').querySelector('button').disabled, false);
+  assert.equal(h.element('#history-restore-request').hidden, false);
+  assert.match(h.element('#delivery-status').textContent, /relay 접수 확인 대기/);
+  assert.match(h.element('#storage-status').textContent, /이 기기의 기록 처리·저장 상태/);
+
+  h.evaluate("appendMessages([{ sender: '상대', time: 1700000000, text: '기존 메시지 https://example.test/' }]); chatText.value = '연결이 끊겼을 때 남길 초안'");
+  showPhase('disconnected', { error: '연결이 끊겼습니다.' });
+  assert.equal(h.element('#chat-title').textContent, '연결 끊김');
+  assert.equal(h.element('#chat-status').textContent, '연결이 끊겼습니다.');
+  assert.equal(h.element('#conversation').hidden, false);
+  assert.equal(h.element('#conversation').children.length, 1);
+  assert.equal(h.element('#send-form').hidden, false);
+  assert.equal(h.element('#send-form').querySelector('button').disabled, true);
+  assert.equal(h.element('#chat-text').value, '연결이 끊겼을 때 남길 초안');
+  assert.equal(h.element('#history-restore-request').hidden, true);
+  assert.equal(h.element('#close-chat').hidden, false);
+
+  showPhase('failed', { error: '연결에 실패했습니다.' });
+  assert.equal(h.element('#chat-title').textContent, '연결 실패');
+  assert.equal(h.element('#conversation').children.length, 1);
+  assert.equal(h.element('#chat-text').value, '연결이 끊겼을 때 남길 초안');
+
+  showPhase('disconnected', {
+    error: '연결이 끊겼습니다.', historyRestoreState: 'merging',
+    historyRestoreInProgress: true, historyRestoreStatus: '최종 병합 작업 진행 중',
+    historyRestoreOfferCount: 0, historyRestoreOffer: [],
+  });
+  assert.equal(h.element('#history-restore-panel').hidden, false);
+  assert.equal(h.element('#chat-view').dataset.workflowVisible, 'true');
+  assert.match(h.element('#history-restore-status').textContent, /최종 병합 작업 진행 중/);
+
+  h.evaluate("conversation.replaceChildren(); chatText.value = ''");
+  showPhase('disconnected', { error: '연결이 끊겼습니다.' });
+  assert.equal(h.element('#conversation').hidden, true);
+  h.evaluate("appendMessages([{ sender: '상대', time: 1700000001, text: '늦게 도착한 메시지' }])");
+  assert.equal(h.element('#conversation').hidden, false);
+  assert.equal(h.element('#chat-view').dataset.chatBody, 'messages');
 });
 
 test('send errors remain visible outside the hidden form after disconnect and emptying the draft', async (t) => {

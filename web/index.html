@@ -147,6 +147,14 @@
     main:has(#chat-view:not([hidden])) { display: flex; flex-direction: column; width: min(100%, 960px); min-height: 0; height: calc(100vh - 72px - var(--space-12)); height: calc(100dvh - 72px - var(--space-12)); margin: 0 auto; }
     #chat-view { display: grid; grid-template-rows: auto auto auto minmax(0, 1fr) auto auto; flex: 1 1 auto; width: 100%; max-width: none; min-width: 0; min-height: 0; margin: 0; padding: 0; overflow: visible; border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); box-shadow: 0 1px 3px var(--shadow); }
     #chat-view[hidden] { display: none !important; }
+    #chat-view[data-phase="connecting"], #chat-view[data-phase="confirming"] { grid-template-rows: auto auto 0 0 0 0; }
+    #chat-view[data-phase="verification"] { grid-template-rows: auto auto auto 0 0 0; }
+    #chat-view[data-phase="disconnected"], #chat-view[data-phase="failed"], #chat-view[data-phase="closed"] { grid-template-rows: auto auto 0 0 auto 0; }
+    #chat-view[data-phase="disconnected"][data-workflow-visible="true"], #chat-view[data-phase="failed"][data-workflow-visible="true"], #chat-view[data-phase="closed"][data-workflow-visible="true"] { grid-template-rows: auto auto auto 0 auto 0; }
+    #chat-view[data-phase="disconnected"][data-chat-body="messages"], #chat-view[data-phase="failed"][data-chat-body="messages"], #chat-view[data-phase="closed"][data-chat-body="messages"] { grid-template-rows: auto auto 0 minmax(0, 1fr) auto auto; }
+    #chat-view[data-phase="disconnected"][data-chat-body="draft"], #chat-view[data-phase="failed"][data-chat-body="draft"], #chat-view[data-phase="closed"][data-chat-body="draft"] { grid-template-rows: auto auto 0 0 auto auto; }
+    #chat-view[data-phase="disconnected"][data-workflow-visible="true"][data-chat-body="messages"], #chat-view[data-phase="failed"][data-workflow-visible="true"][data-chat-body="messages"], #chat-view[data-phase="closed"][data-workflow-visible="true"][data-chat-body="messages"] { grid-template-rows: auto auto auto minmax(0, 1fr) auto auto; }
+    #chat-view[data-phase="disconnected"][data-workflow-visible="true"][data-chat-body="draft"], #chat-view[data-phase="failed"][data-workflow-visible="true"][data-chat-body="draft"], #chat-view[data-phase="closed"][data-workflow-visible="true"][data-chat-body="draft"] { grid-template-rows: auto auto auto 0 auto auto; }
     .chat-header { grid-row: 1; display: flex; min-height: 72px; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) 20px; border-bottom: 1px solid var(--border-soft); }
     .chat-heading { min-width: 0; }
     .chat-heading h2 { margin: 0 0 var(--space-1); font-size: 18px; font-weight: 650; }
@@ -159,13 +167,15 @@
     #storage-status:not([hidden]) { color: var(--text); }
     .chat-workflows { grid-row: 3; display: grid; gap: var(--space-3); min-width: 0; max-height: min(40vh, 360px); overflow: auto; padding: var(--space-3) 20px 0; }
     .chat-workflows:not(:has(> :not([hidden]))) { display: none; }
+    #chat-view[data-phase="verification"] .chat-workflows { max-height: none; overflow: visible; }
     .chat-workflows > .panel { max-width: none; margin: 0; padding: var(--space-4); }
     .chat-workflows h3 { margin: 0 0 var(--space-2); font-size: 16px; }
     .chat-workflows p { line-height: 1.55; overflow-wrap: anywhere; }
     #verification { border-color: var(--focus); background: var(--surface-muted); }
-    #verification > p:first-child { margin-top: 0; color: var(--text); font-weight: 600; }
+    #verification > p:first-of-type { margin-top: 0; color: var(--text); font-weight: 600; }
     #verification .identity-id, #verification .fingerprint { margin: var(--space-1) 0 var(--space-3); padding: var(--space-2) var(--space-3); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--surface); overflow-wrap: anywhere; word-break: break-word; }
-    #verification .actions { margin-top: var(--space-4); }
+    #verification .verification-actions { display: grid; justify-items: start; gap: var(--space-2); margin-top: var(--space-4); }
+    #verification .verification-warning { margin: 0; color: var(--danger); font-weight: 650; }
     #identity-transition-panel { border-color: var(--input-border); }
     #identity-transition-choice { display: block; width: 100%; }
     #history-restore-panel { border-color: var(--input-border); }
@@ -173,6 +183,7 @@
     #history-restore-preview { display: grid; max-height: 12rem; gap: var(--space-2); overflow: auto; margin: var(--space-3) 0; padding: var(--space-2); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--surface); }
     #history-restore-preview .entry { max-width: none; }
     #chat-view #conversation { grid-row: 4; display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; max-height: none; gap: 10px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; margin: 0; padding: 16px 20px; border: 0; border-radius: 0; background: var(--page); }
+    #chat-view #conversation[hidden] { display: none !important; }
     #chat-view #conversation:empty { background: var(--surface); }
     #chat-view .entry { display: grid; width: fit-content; max-width: min(75%, 680px); min-width: 0; gap: var(--space-2); margin: 0; padding: 12px 16px; border: 1px solid var(--border-soft); border-radius: var(--radius-card); background: var(--surface-muted); overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap; }
     #chat-view .entry.mine { align-self: flex-end; margin-left: auto; border-color: transparent; background: var(--primary); color: var(--primary-text); }
@@ -618,10 +629,13 @@
       <div class="chat-workflows">
         <div id="verification" class="panel" hidden>
           <h3>상대 신원 확인</h3>
-          <p>상대 공개 키와 전체 채널 지문을 별도 경로로 비교하세요. 일치하지 않으면 확인하지 마세요.</p>
+          <p>상대 공개 키와 전체 채널 지문을 별도 연락 수단으로 비교하세요.</p>
           <h3>상대 공개 키</h3><p id="peer-id" class="identity-id"></p>
           <h3>채널 지문</h3><p id="fingerprint" class="fingerprint"></p>
-          <div class="actions"><button id="confirm-peer" type="button" class="primary">비교했고 상대를 확인했습니다</button></div>
+          <div class="actions verification-actions">
+            <p class="verification-warning">하나라도 다르면 확인하지 마세요.</p>
+            <button id="confirm-peer" type="button" class="primary">두 값을 비교했고 일치함을 확인했습니다</button>
+          </div>
         </div>
         <div id="identity-transition-panel" class="panel" hidden>
           <h3>이전 신원 대화 연결 요청</h3>

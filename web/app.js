@@ -852,12 +852,19 @@ function appendMessages(items) {
     messageCursor += 1;
   }
   if (items.length && followLatest) conversation.scrollTop = conversation.scrollHeight;
+  if (items.length && ['failed', 'disconnected', 'closed'].includes(latestChatSnapshot?.phase)) {
+    conversation.hidden = false;
+    chatView.dataset.chatBody = 'messages';
+  }
 }
 
 function updateChatView(snapshot) {
   latestChatSnapshot = snapshot;
+  const phase = snapshot.phase || 'connecting';
+  const terminal = ['failed', 'disconnected', 'closed'].includes(phase);
+  chatView.dataset.phase = phase;
   canReturnToChat = Boolean(operationId)
-    && !['failed', 'disconnected', 'closed'].includes(snapshot.phase);
+    && !terminal;
   syncChatReturnButton();
   if (messageEpoch !== snapshot.messageEpoch) {
     conversation.replaceChildren();
@@ -868,12 +875,22 @@ function updateChatView(snapshot) {
     connecting: 'relay에 연결하고 상대를 찾는 중입니다.',
     verification: '상대 공개 키와 지문을 별도 경로로 비교하세요.',
     confirming: '상대 확인 응답을 기다리는 중입니다.',
-    connected: '연결되었습니다. relay는 IP 주소와 연결 시각·통신량을 볼 수 있습니다.',
+    connected: '대화 연결이 활성화되었습니다. relay는 IP 주소와 연결 시각·통신량을 볼 수 있습니다.',
     disconnected: snapshot.error || '연결이 끊겼습니다.',
     failed: snapshot.error || '연결에 실패했습니다.',
     closed: '연결이 종료되었습니다.'
   };
-  chatStatus.textContent = labels[snapshot.phase] || snapshot.error || '연결 상태를 확인하는 중입니다.';
+  const titles = {
+    connecting: '대화 연결',
+    verification: '상대 신원 확인',
+    confirming: '상대 확인 응답 대기',
+    connected: '대화',
+    disconnected: '연결 끊김',
+    failed: '연결 실패',
+    closed: '연결 종료'
+  };
+  document.querySelector('#chat-title').textContent = titles[phase] || '대화 연결';
+  chatStatus.textContent = labels[phase] || snapshot.error || '연결 상태를 확인하는 중입니다.';
   const deliveryStatus = document.querySelector('#delivery-status');
   const deliveryLabels = {
     pending: `relay 접수 확인 대기 중${snapshot.pendingSends > 1 ? ` (${snapshot.pendingSends}건)` : ''}. 상대방의 수신이나 저장은 확인되지 않습니다.`,
@@ -964,20 +981,24 @@ function updateChatView(snapshot) {
     }
     restorePreview.dataset.offerKey = restoreKey;
   }
-  verification.hidden = snapshot.phase !== 'verification';
-  sendForm.hidden = snapshot.phase !== 'connected' && !chatText.value;
-  sendForm.querySelector('button').disabled = snapshot.phase !== 'connected' || sendingMessage;
-  if (snapshot.phase === 'verification' && lastPhase !== 'verification') {
+  verification.hidden = phase !== 'verification';
+  document.querySelector('#history-restore-request').hidden = phase !== 'connected';
+  const hasMessages = conversation.children.length > 0;
+  conversation.hidden = phase !== 'connected' && !(terminal && hasMessages);
+  chatView.dataset.chatBody = hasMessages ? 'messages' : (chatText.value ? 'draft' : 'none');
+  chatView.dataset.workflowVisible = String(!verification.hidden || !transitionPanel.hidden || !restorePanel.hidden);
+  sendForm.hidden = phase !== 'connected' && !(terminal && Boolean(chatText.value));
+  sendForm.querySelector('button').disabled = phase !== 'connected' || sendingMessage;
+  if (phase === 'verification' && lastPhase !== 'verification') {
     document.querySelector('#peer-id').textContent = snapshot.peerId || '';
     document.querySelector('#fingerprint').textContent = snapshot.fingerprint || '';
     document.querySelector('#confirm-peer').disabled = false;
   }
-  if (snapshot.phase === 'confirming') document.querySelector('#confirm-peer').disabled = true;
-  if (snapshot.phase === 'connected') document.querySelector('#chat-title').textContent = '대화';
-  if ((snapshot.phase === 'disconnected' || snapshot.phase === 'failed' || snapshot.phase === 'closed') && !merging) {
+  if (phase === 'confirming') document.querySelector('#confirm-peer').disabled = true;
+  if (terminal && !merging) {
     stopPolling();
   }
-  lastPhase = snapshot.phase;
+  lastPhase = phase;
 }
 
 async function pollChat() {
@@ -1052,6 +1073,16 @@ async function attachChat(id) {
   messageEpoch = null;
   dismissedTransitionKey = '';
   lastPhase = '';
+  chatView.dataset.phase = 'connecting';
+  chatView.dataset.chatBody = 'none';
+  chatView.dataset.workflowVisible = 'false';
+  chatStatus.textContent = 'relay에 연결하고 상대를 찾는 중입니다.';
+  verification.hidden = true;
+  document.querySelector('#identity-transition-panel').hidden = true;
+  document.querySelector('#history-restore-panel').hidden = true;
+  document.querySelector('#history-restore-request').hidden = true;
+  conversation.hidden = true;
+  sendForm.hidden = true;
   conversation.replaceChildren();
   document.querySelector('#chat-title').textContent = '대화 연결';
   document.querySelector('#confirm-peer').disabled = false;
