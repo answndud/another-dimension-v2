@@ -60,8 +60,9 @@ function createHarness(options = {}) {
   const element = (selector) => {
     if (!elements.has(selector)) {
       const target = {
-        value: '', textContent: '', hidden: false, disabled: false, checked: false, open: false,
+        value: '', hidden: false, disabled: false, checked: false, open: false,
         dataset: {}, style: {}, listeners: {}, children: [],
+        _textContent: '', textContentSetCount: 0,
         addEventListener(type, callback) { this.listeners[type] = callback; },
         contains(node) { return (this.containsNodes || []).includes(node); },
         querySelector(selector) { return element(`${selector} inside ${selector}`); },
@@ -77,6 +78,10 @@ function createHarness(options = {}) {
         },
         classList: { add() {}, remove() {}, toggle() {} },
       };
+      Object.defineProperty(target, 'textContent', {
+        get() { return this._textContent; },
+        set(value) { this.textContentSetCount += 1; this._textContent = String(value); },
+      });
       elements.set(selector, target);
     }
     return elements.get(selector);
@@ -90,6 +95,7 @@ function createHarness(options = {}) {
     createElement: (tag) => element(`created:${tag}:${elements.size}`),
     createTextNode: (text) => ({ textContent: text }),
   };
+  document.activeElement = element('body');
   const window = {
     ReprotectWork,
     confirm: () => false,
@@ -1950,6 +1956,65 @@ test('actual UI: chat phases show only the actions available at each step', asyn
   h.evaluate("appendMessages([{ sender: '상대', time: 1700000001, text: '늦게 도착한 메시지' }])");
   assert.equal(h.element('#conversation').hidden, false);
   assert.equal(h.element('#chat-view').dataset.chatBody, 'messages');
+});
+
+test('chat phase focus moves only when the active workflow control disappears', () => {
+  const h = createHarness();
+  h.evaluate("operationId = 'operation-focus'; chatView.hidden = false");
+  const showPhase = (phase) => h.evaluate(`updateChatView({
+    phase: ${JSON.stringify(phase)}, messageCount: 0, messageEpoch: 1, identityTransition: []
+  })`);
+
+  showPhase('verification');
+  h.element('#confirm-peer').focus();
+  showPhase('confirming');
+  assert.equal(h.document.activeElement, h.element('#chat-status'));
+  h.element('#close-chat').focus();
+  showPhase('confirming');
+  assert.equal(h.document.activeElement, h.element('#close-chat'));
+
+  const connected = createHarness();
+  connected.evaluate("operationId = 'operation-connected'; chatView.hidden = false");
+  connected.evaluate("updateChatView({ phase: 'connecting', messageCount: 0, messageEpoch: 1, identityTransition: [] })");
+  connected.element('#chat-status').focus();
+  connected.evaluate("updateChatView({ phase: 'connected', messageCount: 0, messageEpoch: 1, identityTransition: [] })");
+  assert.equal(connected.document.activeElement, connected.element('#chat-text'));
+
+  const otherControl = createHarness();
+  otherControl.evaluate("operationId = 'operation-connected'; chatView.hidden = false");
+  otherControl.evaluate("updateChatView({ phase: 'connecting', messageCount: 0, messageEpoch: 1, identityTransition: [] })");
+  otherControl.element('#close-chat').focus();
+  otherControl.evaluate("updateChatView({ phase: 'connected', messageCount: 0, messageEpoch: 1, identityTransition: [] })");
+  assert.equal(otherControl.document.activeElement, otherControl.element('#close-chat'));
+
+  const home = createHarness();
+  home.evaluate("operationId = 'operation-home'; chatView.hidden = true");
+  home.element('#brand-home').focus();
+  home.evaluate("updateChatView({ phase: 'connected', messageCount: 0, messageEpoch: 1, identityTransition: [] })");
+  assert.equal(home.document.activeElement, home.element('#brand-home'));
+});
+
+test('chat live status text is written only when its displayed value changes', () => {
+  const h = createHarness();
+  h.evaluate("operationId = 'operation-live-status'; chatView.hidden = false");
+  const update = (storageError, restoreStatus, restoreReceived = 1) => h.evaluate(`updateChatView({
+    phase: 'connected', messageCount: 0, messageEpoch: 1, identityTransition: [],
+    pendingSends: 2, relayAck: 'pending', storageError: ${JSON.stringify(storageError)},
+    historyRestoreStatus: ${JSON.stringify(restoreStatus)}, historyRestoreState: 'awaiting-transfer-consent',
+    historyRestoreInProgress: true, historyRestoreReceived: ${restoreReceived}, historyRestoreTotal: 2,
+    historyRestoreOfferCount: 1,
+  })`);
+  update('기록 쓰기 오류', '기록을 확인했습니다.');
+  const statusElements = ['#chat-status', '#delivery-status', '#storage-status', '#history-restore-status']
+    .map((selector) => h.element(selector));
+  for (const item of statusElements) item.textContentSetCount = 0;
+  update('기록 쓰기 오류', '기록을 확인했습니다.');
+  assert.deepEqual(statusElements.map((item) => item.textContentSetCount), [0, 0, 0, 0]);
+
+  update('새 기록 쓰기 오류', '기록을 확인했습니다.', 2);
+  assert.deepEqual(statusElements.map((item) => item.textContentSetCount), [0, 0, 1, 1]);
+  assert.match(h.element('#storage-status').textContent, /새 기록 쓰기 오류/);
+  assert.equal(h.element('#history-restore-status').textContent, '상대 기록을 받는 중입니다: 2 / 2. 동의 전에는 로컬 기록을 변경하지 않습니다.');
 });
 
 test('send errors remain visible outside the hidden form after disconnect and emptying the draft', async (t) => {

@@ -858,7 +858,13 @@ function appendMessages(items) {
   }
 }
 
+function setTextIfChanged(element, text) {
+  if (element.textContent !== text) element.textContent = text;
+}
+
 function updateChatView(snapshot) {
+  const previousPhase = lastPhase;
+  const focusedElement = document.activeElement;
   latestChatSnapshot = snapshot;
   const phase = snapshot.phase || 'connecting';
   const terminal = ['failed', 'disconnected', 'closed'].includes(phase);
@@ -889,8 +895,8 @@ function updateChatView(snapshot) {
     failed: '대화',
     closed: '대화'
   };
-  document.querySelector('#chat-title').textContent = titles[phase] || '대화 연결';
-  chatStatus.textContent = labels[phase] || snapshot.error || '연결 상태를 확인하는 중입니다.';
+  setTextIfChanged(document.querySelector('#chat-title'), titles[phase] || '대화 연결');
+  setTextIfChanged(chatStatus, labels[phase] || snapshot.error || '연결 상태를 확인하는 중입니다.');
   const deliveryStatus = document.querySelector('#delivery-status');
   const deliveryLabels = {
     pending: `relay 접수 확인 대기 중${snapshot.pendingSends > 1 ? ` (${snapshot.pendingSends}건)` : ''}. 상대방의 수신이나 저장은 확인되지 않습니다.`,
@@ -898,12 +904,12 @@ function updateChatView(snapshot) {
     rejected: 'relay가 이벤트를 거부했습니다. 상대방에게 전달되지 않았습니다.',
     unknown: '마지막 메시지의 전달 결과를 확인할 수 없습니다. 로컬 기록을 확인하고 다시 보낼 때는 중복 가능성을 고려하세요.'
   };
-  deliveryStatus.textContent = snapshot.pendingSends > 0
+  setTextIfChanged(deliveryStatus, snapshot.pendingSends > 0
     ? `relay 접수 확인 대기 중 (${snapshot.pendingSends}건). 상대방의 수신이나 저장은 확인되지 않습니다.`
-    : deliveryLabels[snapshot.relayAck] || '';
+    : deliveryLabels[snapshot.relayAck] || '');
   deliveryStatus.hidden = !deliveryStatus.textContent;
   storageStatus.hidden = !snapshot.storageError;
-  storageStatus.textContent = snapshot.storageError ? `이 기기의 기록 처리·저장 상태: ${snapshot.storageError}` : '';
+  setTextIfChanged(storageStatus, snapshot.storageError ? `이 기기의 기록 처리·저장 상태: ${snapshot.storageError}` : '');
   const transitionPanel = document.querySelector('#identity-transition-panel');
   const previousIds = snapshot.identityTransition || [];
   const transitionKey = `${snapshot.peerId || ''}:${previousIds.join(',')}`;
@@ -941,14 +947,15 @@ function updateChatView(snapshot) {
   const restoreTerminal = ['completed', 'failed'].includes(restoreState);
   restorePanel.hidden = (snapshot.phase !== 'connected' && !snapshot.historyRestoreCleanupError && !merging && !restoreTerminal)
     || (!snapshot.historyRestoreInProgress && !restoreOffer.length && !snapshot.historyRestoreStatus);
-  restoreStatus.textContent = merging
+  let restoreStatusText = merging
     ? (snapshot.historyRestoreStatus || '최종 병합 중입니다. 대화 기록 저장은 잠금 때문에 잠시 대기할 수 있습니다. 연결 종료 후에도 계속됩니다.')
     : snapshot.historyRestoreInProgress
       ? `상대 기록을 받는 중입니다: ${snapshot.historyRestoreReceived || 0} / ${snapshot.historyRestoreTotal || 0}. 동의 전에는 로컬 기록을 변경하지 않습니다.`
       : snapshot.historyRestoreStatus || '';
   if (snapshot.historyRestoreCleanupError) {
-    restoreStatus.textContent += ` 임시 기록 정리 실패: ${snapshot.historyRestoreCleanupError}`;
+    restoreStatusText += ` 임시 기록 정리 실패: ${snapshot.historyRestoreCleanupError}`;
   }
+  setTextIfChanged(restoreStatus, restoreStatusText);
   document.querySelector('#history-restore-request').disabled = snapshot.phase !== 'connected'
     || snapshot.historyRestoreInProgress || (snapshot.historyRestoreOfferCount || 0) > 0
     || !['idle', 'failed', 'completed'].includes(restoreState);
@@ -995,6 +1002,17 @@ function updateChatView(snapshot) {
     document.querySelector('#confirm-peer').disabled = false;
   }
   if (phase === 'confirming') document.querySelector('#confirm-peer').disabled = true;
+  const confirmPeer = document.querySelector('#confirm-peer');
+  const phaseChanged = phase !== previousPhase;
+  if (!chatView.hidden && phaseChanged && previousPhase === 'verification'
+    && phase === 'confirming' && focusedElement === confirmPeer) {
+    chatStatus.focus();
+  } else if (!chatView.hidden && phaseChanged && phase === 'connected'
+    && ['connecting', 'verification', 'confirming'].includes(previousPhase)
+    && (focusedElement === document.body || focusedElement === chatStatus
+      || focusedElement === document.querySelector('#chat-title') || focusedElement === confirmPeer)) {
+    chatText.focus();
+  }
   if (terminal && !merging) {
     stopPolling();
   }
