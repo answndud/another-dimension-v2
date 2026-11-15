@@ -589,7 +589,7 @@ test('chat UI keeps the message DOM safe and follows new messages only when alre
     'chat-view', 'chat-title', 'chat-status', 'delivery-status', 'storage-status',
     'verification', 'confirm-peer', 'identity-transition-panel', 'history-restore-panel',
     'history-restore-preview', 'history-restore-request', 'conversation', 'send-form',
-    'chat-text', 'close-chat',
+    'send-status', 'chat-text', 'close-chat',
   ]) assert.match(html, new RegExp(`id="${id}"`));
 });
 
@@ -1738,7 +1738,70 @@ test('actual UI: send rejected during restore merge preserves input and explains
   h.requestFor('/api/chat/send').resolve(response('기록 병합 중이라 메시지를 전송하지 않았습니다. 병합 완료 후 다시 보내세요.', 409));
   await pending;
   assert.equal(h.element('#chat-text').value, 'keep this message');
-  assert.equal(h.element('#chat-status').textContent, '기록 병합 중이라 메시지를 전송하지 않았습니다. 병합 완료 후 다시 보내세요.');
+  assert.equal(h.element('#send-status').textContent, '기록 병합 중이라 메시지를 전송하지 않았습니다. 병합 완료 후 다시 보내세요.');
+  assert.equal(h.element('#send-status').hidden, false);
+  assert.equal(h.element('#chat-status').textContent, '');
+});
+
+test('send request errors stay separate from connection polling and clear on retry or operation switch', async () => {
+  for (const failure of ['409', 'unknown']) {
+    const h = createHarness();
+    h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+    await attachChatInHarness(h, 'operation-A');
+    inputChat(h, 'keep my draft');
+    const submitting = submitChat(h);
+    const request = await waitForRequest(() => h.requestFor('/api/chat/send'));
+    if (failure === '409') {
+      request.resolve(response('병합 중이라 보낼 수 없습니다.', 409));
+    } else {
+      request.reject(new Error('response unavailable'));
+    }
+    await submitting;
+
+    const errorText = h.element('#send-status').textContent;
+    assert.ok(errorText);
+    if (failure === '409') assert.equal(errorText, '병합 중이라 보낼 수 없습니다.');
+    else assert.match(errorText, /결과를 확인하지 못했습니다.*중복될 수 있습니다/);
+    assert.equal(h.element('#send-status').hidden, false);
+    assert.equal(h.element('#chat-text').value, 'keep my draft');
+
+    h.evaluate(`updateChatView({ phase: 'connected', messageCount: 0, messageEpoch: 1 })`);
+    assert.equal(h.element('#chat-status').textContent, '연결되었습니다. relay는 IP 주소와 연결 시각·통신량을 볼 수 있습니다.');
+    assert.equal(h.element('#send-status').textContent, errorText);
+
+    inputChat(h, 'retry text');
+    const retry = submitChat(h);
+    const retryRequest = await waitForRequest(() => h.requests.filter((item) => item.path === '/api/chat/send').at(-1));
+    assert.equal(h.element('#send-status').hidden, true);
+    assert.equal(h.element('#send-status').textContent, '');
+    retryRequest.resolve(response('ok'));
+    await retry;
+    assert.equal(h.element('#chat-text').value, '');
+
+    h.element('#send-status').textContent = 'old task error';
+    h.element('#send-status').hidden = false;
+    await attachChatInHarness(h, 'operation-B');
+    assert.equal(h.element('#send-status').textContent, '');
+    assert.equal(h.element('#send-status').hidden, true);
+  }
+});
+
+test('send error, aggregate relay acknowledgement, and local storage error remain independent', () => {
+  const h = createHarness();
+  h.element('#send-status').textContent = '전송 결과를 확인하지 못했습니다.';
+  h.element('#send-status').hidden = false;
+  h.evaluate(`updateChatView({
+    phase: 'connected', messageCount: 0, messageEpoch: 1,
+    pendingSends: 2, relayAck: 'accepted', storageError: '기록 파일 쓰기 실패',
+  })`);
+
+  assert.equal(h.element('#chat-status').textContent, '연결되었습니다. relay는 IP 주소와 연결 시각·통신량을 볼 수 있습니다.');
+  assert.equal(h.element('#send-status').textContent, '전송 결과를 확인하지 못했습니다.');
+  assert.match(h.element('#delivery-status').textContent, /relay 접수 확인 대기 중 \(2건\)/);
+  assert.match(h.element('#delivery-status').textContent, /상대방의 수신이나 저장은 확인되지 않습니다/);
+  assert.match(h.element('#storage-status').textContent, /^이 기기의 기록 처리·저장 상태: 기록 파일 쓰기 실패$/);
+  assert.equal(h.element('#delivery-status').hidden, false);
+  assert.equal(h.element('#storage-status').hidden, false);
 });
 
 test('actual UI: relay settings display the active relay list and save edited lists', async (t) => {

@@ -23,6 +23,7 @@ const joinForm = document.querySelector('#join-form');
 const joinCode = document.querySelector('#join-code');
 const chatView = document.querySelector('#chat-view');
 const chatStatus = document.querySelector('#chat-status');
+const sendStatus = document.querySelector('#send-status');
 const storageStatus = document.querySelector('#storage-status');
 const historyList = document.querySelector('#history-list');
 const managementHistoryStatus = document.querySelector('#management-history-status');
@@ -437,6 +438,8 @@ async function refreshIdentity() {
   if (previousIdentityId !== currentIdentityId) identitySessionGeneration += 1;
   if (previousIdentityId && previousIdentityId !== currentIdentityId) {
     clearChatDrafts();
+    sendStatus.textContent = '';
+    sendStatus.hidden = true;
     chatViewGeneration += 1;
     if (latestChatSnapshot && ['merge-queued', 'merging'].includes(latestChatSnapshot.historyRestoreState) && operationId) {
       rememberRestoreJob(operationId);
@@ -883,7 +886,7 @@ function updateChatView(snapshot) {
     : deliveryLabels[snapshot.relayAck] || '';
   deliveryStatus.hidden = !deliveryStatus.textContent;
   storageStatus.hidden = !snapshot.storageError;
-  storageStatus.textContent = snapshot.storageError || '';
+  storageStatus.textContent = snapshot.storageError ? `이 기기의 기록 처리·저장 상태: ${snapshot.storageError}` : '';
   const transitionPanel = document.querySelector('#identity-transition-panel');
   const previousIds = snapshot.identityTransition || [];
   const transitionKey = `${snapshot.peerId || ''}:${previousIds.join(',')}`;
@@ -1036,6 +1039,8 @@ async function attachChat(id) {
   stopPolling();
   chatViewGeneration += 1;
   sendingMessage = false;
+  sendStatus.textContent = '';
+  sendStatus.hidden = true;
   operationId = id;
   const draftKey = chatDraftKey();
   chatText.value = draftKey ? (chatDrafts.get(draftKey) || '') : '';
@@ -1261,6 +1266,8 @@ document.querySelector('#logout').addEventListener('click', async () => {
   chatViewGeneration += 1;
   sendingMessage = false;
   clearChatDrafts();
+  sendStatus.textContent = '';
+  sendStatus.hidden = true;
   try {
     if (latestChatSnapshot && ['merge-queued', 'merging'].includes(latestChatSnapshot.historyRestoreState) && operationId) {
       rememberRestoreJob(operationId);
@@ -1300,6 +1307,8 @@ document.querySelectorAll('.disconnect').forEach((button) => button.addEventList
   operationId = null;
   sendingMessage = false;
   clearChatDrafts();
+  sendStatus.textContent = '';
+  sendStatus.hidden = true;
   canReturnToChat = false;
   latestChatSnapshot = null;
   conversation.replaceChildren();
@@ -1454,6 +1463,8 @@ sendForm.addEventListener('submit', async (event) => {
     && identitySessionGeneration === sentSessionGeneration
     && chatViewGeneration === sentViewGeneration;
   sendingMessage = true;
+  sendStatus.textContent = '';
+  sendStatus.hidden = true;
   button.disabled = true;
   try {
     const response = await request('/api/chat/send', body);
@@ -1461,8 +1472,9 @@ sendForm.addEventListener('submit', async (event) => {
     if (!response.ok) {
       const detail = await response.text();
       if (!isCurrentSend()) return;
-      if (response.status === 409 && detail) {
-        chatStatus.textContent = detail;
+      if (response.status === 409) {
+        sendStatus.textContent = detail || '현재 대화 상태에서는 전송할 수 없습니다. 연결 상태를 확인한 뒤 다시 시도하세요.';
+        sendStatus.hidden = false;
         return;
       }
       throw new Error('send failed');
@@ -1480,7 +1492,8 @@ sendForm.addEventListener('submit', async (event) => {
   } catch (_) {
     if (isCurrentSend()) {
       sendForm.hidden = false;
-      chatStatus.textContent = '전송 결과를 확인하지 못했습니다. 입력을 보존했습니다. 다시 보내면 중복될 수 있습니다.';
+      sendStatus.textContent = '전송 결과를 확인하지 못했습니다. 입력을 보존했습니다. 다시 보내면 중복될 수 있습니다.';
+      sendStatus.hidden = false;
     }
   } finally {
     if (isCurrentSend()) {
@@ -1505,6 +1518,8 @@ document.querySelector('#close-chat').addEventListener('click', async () => {
   const closingDraftKey = chatDraftKey();
   if (closingDraftKey) chatDrafts.delete(closingDraftKey);
   chatText.value = '';
+  sendStatus.textContent = '';
+  sendStatus.hidden = true;
   chatViewGeneration += 1;
   sendingMessage = false;
   operationId = null;
