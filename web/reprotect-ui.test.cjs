@@ -1920,7 +1920,7 @@ test('room creation explicit failures preserve the invite and response loss is r
     });
   }
 
-  for (const lostResponse of ['fetch rejection', 'unreadable operation id']) {
+  for (const lostResponse of ['fetch rejection', 'unreadable operation id', 'empty operation id']) {
     await t.test(lostResponse, async () => {
       const h = createHarness();
       const invite = 'ADI3-UNCERTAIN-CODE';
@@ -1929,7 +1929,9 @@ test('room creation explicit failures preserve the invite and response loss is r
       await new Promise((resolve) => setImmediate(resolve));
       const createRequest = h.requestFor('/api/chat/create');
       if (lostResponse === 'fetch rejection') createRequest.reject(new Error('connection lost'));
-      else createRequest.resolve({ ok: true, status: 200, text: async () => { throw new Error('body lost'); } });
+      else if (lostResponse === 'unreadable operation id') {
+        createRequest.resolve({ ok: true, status: 200, text: async () => { throw new Error('body lost'); } });
+      } else createRequest.resolve(response('   '));
       await creating;
       assert.equal(h.element('#invite-view').hidden, false);
       assert.equal(h.evaluate('currentInvite'), invite);
@@ -1944,6 +1946,35 @@ test('room creation explicit failures preserve the invite and response loss is r
 });
 
 test('late room creation results cannot replace a newer invite or another identity screen', async (t) => {
+  await t.test('empty success from a stale request does not change the newer invite UI', async () => {
+    const h = createHarness();
+    h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'; currentInvite = 'ADI3-OLD'; inviteCode.value = currentInvite; show('invite')");
+    const oldRoom = h.click('#start-room');
+    await new Promise((resolve) => setImmediate(resolve));
+    const oldRequest = h.requestFor('/api/chat/create');
+
+    await h.click('#brand-home');
+    const newInvite = h.click('#create-invite');
+    await new Promise((resolve) => setImmediate(resolve));
+    h.requestFor('/api/invite/create').resolve(response('ADI3-NEW'));
+    await newInvite;
+    h.element('#start-room').focus();
+    h.element('#message').textContent = '새 초대 화면의 상태';
+    const focusCalls = h.element('#start-room').focusCalls;
+
+    oldRequest.resolve(response('   '));
+    await oldRoom;
+    assert.equal(h.element('#invite-view').hidden, false);
+    assert.equal(h.evaluate('currentInvite'), 'ADI3-NEW');
+    assert.equal(h.element('#invite-code').value, 'ADI3-NEW');
+    assert.equal(h.element('#message').textContent, '새 초대 화면의 상태');
+    assert.equal(h.element('#start-room').disabled, false);
+    assert.equal(h.document.activeElement, h.element('#start-room'));
+    assert.equal(h.element('#start-room').focusCalls, focusCalls);
+    assert.equal(h.requests.filter((item) => item.path === '/api/chat/cancel').length, 0);
+    assert.equal(h.requests.filter((item) => item.path === '/api/chat/status').length, 0);
+  });
+
   await t.test('leaving the invite view best-effort cancels an operation whose id arrives later', async () => {
     const h = createHarness();
     h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'; currentInvite = 'ADI3-OLD'; inviteCode.value = currentInvite; show('invite')");

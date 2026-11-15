@@ -1493,15 +1493,17 @@ document.querySelector('#start-room').addEventListener('click', async () => {
       return;
     }
     const createdOperationId = (await response.text()).trim();
-    if (!createdOperationId) {
-      unknownResult();
+    if (!isCurrentRequest()) {
+      if (createdOperationId) {
+        const stillOwnsSession = identityId.textContent.trim() === requestIdentityId
+          && token === requestToken
+          && identitySessionGeneration === requestSessionGeneration;
+        if (stillOwnsSession) request('/api/chat/cancel', createdOperationId, requestToken).catch(() => {});
+      }
       return;
     }
-    if (!isCurrentRequest()) {
-      const stillOwnsSession = identityId.textContent.trim() === requestIdentityId
-        && token === requestToken
-        && identitySessionGeneration === requestSessionGeneration;
-      if (stillOwnsSession) request('/api/chat/cancel', createdOperationId, requestToken).catch(() => {});
+    if (!createdOperationId) {
+      unknownResult();
       return;
     }
     currentInvite = '';
