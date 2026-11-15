@@ -1062,6 +1062,11 @@ async function attachChat(id) {
   sendingMessage = false;
   sendStatus.textContent = '';
   sendStatus.hidden = true;
+  const deliveryStatus = document.querySelector('#delivery-status');
+  deliveryStatus.textContent = '';
+  deliveryStatus.hidden = true;
+  storageStatus.textContent = '';
+  storageStatus.hidden = true;
   operationId = id;
   const draftKey = chatDraftKey();
   chatText.value = draftKey ? (chatDrafts.get(draftKey) || '') : '';

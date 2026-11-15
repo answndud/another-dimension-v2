@@ -1807,6 +1807,57 @@ test('send error, aggregate relay acknowledgement, and local storage error remai
   assert.equal(h.element('#storage-status').hidden, false);
 });
 
+test('attaching a new chat clears only the previous relay and storage status before polling', async () => {
+  const h = createHarness();
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  await attachChatInHarness(h, 'operation-A');
+  h.evaluate(`updateChatView({
+    phase: 'connected', messageCount: 0, messageEpoch: 1,
+    pendingSends: 2, relayAck: 'pending', storageError: 'A 기록 파일 쓰기 실패',
+  })`);
+  const priorDelivery = h.element('#delivery-status').textContent;
+  const priorStorage = h.element('#storage-status').textContent;
+  assert.notEqual(priorDelivery, '');
+  assert.notEqual(priorStorage, '');
+
+  await h.click('#brand-home');
+  await h.click('#return-to-chat');
+  assert.equal(h.element('#delivery-status').textContent, priorDelivery);
+  assert.equal(h.element('#storage-status').textContent, priorStorage);
+
+  const closing = h.click('#close-chat');
+  h.requestFor('/api/chat/cancel').resolve(response('ok'));
+  await closing;
+  assert.equal(h.evaluate('operationId'), null);
+
+  const attaching = h.evaluate("attachChat('operation-B')");
+  const pendingStatus = await waitForRequest(() => h.requests.findLast((item) => item.path === '/api/chat/status'));
+  assert.equal(h.element('#delivery-status').textContent, '');
+  assert.equal(h.element('#delivery-status').hidden, true);
+  assert.equal(h.element('#storage-status').textContent, '');
+  assert.equal(h.element('#storage-status').hidden, true);
+  pendingStatus.resolve(response('unavailable', 503));
+  await attaching;
+  assert.equal(h.element('#delivery-status').textContent, '');
+  assert.equal(h.element('#delivery-status').hidden, true);
+  assert.equal(h.element('#storage-status').textContent, '');
+  assert.equal(h.element('#storage-status').hidden, true);
+
+  const next = createHarness();
+  next.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  const attachingNext = next.evaluate("attachChat('operation-B')");
+  const nextStatus = await waitForRequest(() => next.requests.findLast((item) => item.path === '/api/chat/status'));
+  nextStatus.resolve(response(JSON.stringify({
+    phase: 'connected', messageCount: 0, messageEpoch: 1,
+    pendingSends: 1, relayAck: 'pending', storageError: 'B 기록 파일 쓰기 실패',
+  })));
+  await attachingNext;
+  assert.match(next.element('#delivery-status').textContent, /relay 접수 확인 대기 중 \(1건\)/);
+  assert.match(next.element('#storage-status').textContent, /B 기록 파일 쓰기 실패/);
+  assert.equal(next.element('#delivery-status').hidden, false);
+  assert.equal(next.element('#storage-status').hidden, false);
+});
+
 test('actual UI: chat phases show only the actions available at each step', async () => {
   const h = createHarness();
   h.evaluate("operationId = 'operation-phases'; identityId.textContent = 'identity-test'");
