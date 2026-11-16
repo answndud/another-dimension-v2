@@ -1491,6 +1491,89 @@ test('backup import exposes success on the import control after a successful res
   assert.equal(h.element('#history-backup-import-result').hidden, false);
 });
 
+test('single-backup import success reports list refresh failure without changing import outcome', async () => {
+  const peerId = '34'.repeat(32);
+  const h = createHarness({ importResult: JSON.stringify({ peerId, linkedIdentityRestored: false }) });
+  h.element('#history-backup-file').files = [file('single.adbak', 'ADBACK7\0payload')];
+  h.window.confirm = () => true;
+  const task = h.click('#history-backup-import');
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/history/list').resolve(response('temporarily unavailable', 500));
+  await task;
+
+  const result = h.element('#history-backup-import-result');
+  assert.equal(result.dataset.result, 'success');
+  assert.match(result.textContent, /백업 가져오기 성공/);
+  assert.match(result.textContent, /가져온 대상: 대화 343434343434/);
+  assert.match(result.textContent, /기록은 가져왔지만 대화 목록을 갱신하지 못했습니다/);
+  assert.match(result.textContent, /기록 목록을 다시 불러와 확인/);
+  assert.doesNotMatch(result.textContent, /백업 가져오기 실패|가져오기 결과 확인 필요/);
+});
+
+test('bundle import success reports failed or invalid JSON list refresh as a separate problem', async (t) => {
+  for (const mode of ['request failure', 'invalid JSON']) {
+    await t.test(mode, async () => {
+      const h = createHarness({ importResult: JSON.stringify({ conversations: [
+        { peerId: '56'.repeat(32), messageCount: 2, linkedIdentityRestored: false },
+        { peerId: '78'.repeat(32), messageCount: 3, linkedIdentityRestored: false },
+      ] }) });
+      h.element('#history-backup-file').files = [file('bundle.adpak', 'ADPACK3\0payload')];
+      h.window.confirm = () => true;
+      const task = h.click('#history-backup-import');
+      await new Promise((resolve) => setImmediate(resolve));
+      const listing = h.requestFor('/api/history/list');
+      if (mode === 'request failure') listing.reject(new Error('connection lost'));
+      else listing.resolve(response('{ invalid json'));
+      await task;
+
+      const result = h.element('#history-backup-import-result');
+      assert.equal(result.dataset.result, 'success');
+      assert.match(result.textContent, /대화 묶음 전체 백업 2개를 기존 기록과 병합했습니다/);
+      assert.match(result.textContent, /특정 대화가 아닌 묶음 전체에 대한 결과/);
+      assert.match(result.textContent, /기록은 가져왔지만 대화 목록을 갱신하지 못했습니다/);
+      assert.match(result.textContent, /기록 목록을 다시 불러와 확인/);
+      assert.doesNotMatch(result.textContent, /백업 가져오기 실패|가져오기 결과 확인 필요/);
+    });
+  }
+});
+
+test('a newer import prevents an older list refresh failure from replacing its state', async () => {
+  const h = createHarness({ manualImport: true });
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'bridge-session-A'");
+  h.window.confirm = () => true;
+  h.element('#history-backup-file').files = [file('older.adbak', 'ADBACK7\0older')];
+  const olderTask = h.click('#history-backup-import');
+  const olderRequest = await waitForRequest(() => h.requestForAction('import'));
+  olderRequest.resolve(response(JSON.stringify({ peerId: 'ab'.repeat(32), linkedIdentityRestored: false })));
+  await new Promise((resolve) => setImmediate(resolve));
+  const olderListRequest = h.requestFor('/api/history/list');
+  assert.ok(olderListRequest);
+
+  const newerFile = file('newer.adpak', 'ADPACK3\0newer');
+  h.element('#history-backup-file').files = [newerFile];
+  h.element('#history-backup-import-password').value = 'new-import-password';
+  const newerTask = h.click('#history-backup-import');
+  const newerRequest = await waitForRequest(() => {
+    const current = h.requestForAction('import');
+    return current !== olderRequest ? current : null;
+  });
+  olderListRequest.resolve(response('list failed', 500));
+  await olderTask;
+  assert.equal(h.element('#history-backup-import-result').hidden, true);
+  assert.equal(h.element('#history-backup-import-result').textContent, '');
+  assert.equal(h.element('#history-backup-file').files[0].name, 'newer.adpak');
+  assert.equal(h.element('#history-backup-import-password').value, 'new-import-password');
+
+  newerRequest.resolve(response(JSON.stringify({ conversations: [
+    { peerId: 'cd'.repeat(32), messageCount: 1, linkedIdentityRestored: false },
+  ] })));
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/history/list').resolve(response('[]'));
+  await newerTask;
+  assert.equal(h.element('#history-backup-import-result').dataset.result, 'success');
+  assert.match(h.element('#history-backup-import-result').textContent, /대화 묶음 전체 백업 1개/);
+});
+
 test('single-backup import leaves its success result visible in the management dialog', async () => {
   const h = createHarness({ importResult: JSON.stringify({ peerId: 'ab'.repeat(32), linkedIdentityRestored: false }) });
   h.element('#management-dialog').open = true;

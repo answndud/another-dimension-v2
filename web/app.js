@@ -666,24 +666,24 @@ async function refreshHistoryList(isCurrent = () => true) {
     && identityId.textContent.trim() === requestedIdentityId
     && token === requestedToken
     && identitySessionGeneration === requestedSessionGeneration;
-  if (!ownsList()) return;
+  if (!ownsList()) return 'stale';
   historyList.replaceChildren();
   historySummaries = [];
   let items;
   try {
     const response = await request('/api/history/list');
-    if (!ownsList()) return;
+    if (!ownsList()) return 'stale';
     if (!response.ok) throw new Error('history list unavailable');
     items = await response.json();
   } catch (_) {
-    if (!ownsList()) return;
+    if (!ownsList()) return 'stale';
     const error = document.createElement('p');
     error.className = 'meta';
     error.textContent = '대화 기록 목록을 불러오지 못했습니다.';
     historyList.append(error);
-    return;
+    return 'failed';
   }
-  if (!ownsList()) return;
+  if (!ownsList()) return 'stale';
   historySummaries = items;
   verifiedPeers = new Set(items.filter(item => item.verified).map(item => item.peerId));
   for (const item of items) {
@@ -739,6 +739,7 @@ async function refreshHistoryList(isCurrent = () => true) {
     empty.textContent = '검색 결과가 없습니다.';
     historyList.append(empty);
   }
+  return 'success';
 }
 
 function filterHistoryList() {
@@ -1961,20 +1962,25 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     completedImportResult = result;
     if (!isCurrentImport()) return;
     imported = true;
-    await refreshHistoryList(isCurrentImport);
+    const listRefreshResult = await refreshHistoryList(isCurrentImport);
     if (!isCurrentImport()) return;
     document.querySelector('#history-backup-file').value = '';
+    const listRefreshNotice = listRefreshResult === 'failed'
+      ? '기록은 가져왔지만 대화 목록을 갱신하지 못했습니다. 기록 목록을 다시 불러와 확인하세요.'
+      : listRefreshResult === 'stale'
+        ? '기록은 가져왔지만 목록 갱신 작업이 대체되어 결과를 확인할 수 없습니다. 기록 목록을 다시 불러와 확인하세요.'
+        : '';
     if (Array.isArray(result.conversations)) {
       const linked = result.conversations.filter(item => item.linkedIdentityRestored).length;
-      message.textContent = `대화 묶음 전체 백업 ${result.conversations.length}개를 기존 기록과 병합했습니다. 특정 대화가 아닌 묶음 전체에 대한 결과입니다.${linked ? ` ${linked}개 대화의 인증된 이전 신원 관계도 복원했습니다.` : ''}`;
+      message.textContent = `대화 묶음 전체 백업 ${result.conversations.length}개를 기존 기록과 병합했습니다. 특정 대화가 아닌 묶음 전체에 대한 결과입니다.${linked ? ` ${linked}개 대화의 인증된 이전 신원 관계도 복원했습니다.` : ''}${listRefreshNotice ? ` ${listRefreshNotice}` : ''}`;
       setImportResult('success', message.textContent);
     } else {
       const importedPeer = typeof result.peerId === 'string' && result.peerId.length >= 12
         ? `가져온 대상: 대화 ${result.peerId.slice(0, 12)}.`
         : '가져온 대상 ID를 응답에서 확인할 수 없습니다. 기록 목록에서 확인하세요.';
       message.textContent = result.linkedIdentityRestored
-        ? `백업을 확인해 기존 기록과 인증된 이전 신원 관계를 복원했습니다. ${importedPeer}`
-        : `백업을 확인해 기존 기록과 병합했습니다. ${importedPeer}`;
+        ? `백업을 확인해 기존 기록과 인증된 이전 신원 관계를 복원했습니다. ${importedPeer}${listRefreshNotice ? ` ${listRefreshNotice}` : ''}`
+        : `백업을 확인해 기존 기록과 병합했습니다. ${importedPeer}${listRefreshNotice ? ` ${listRefreshNotice}` : ''}`;
       setImportResult('success', message.textContent);
     }
   } catch (_) {
@@ -1985,7 +1991,7 @@ document.querySelector('#history-backup-import').addEventListener('click', async
         : completedImportResult && typeof completedImportResult.peerId === 'string' && completedImportResult.peerId.length >= 12
           ? `가져온 대상: 대화 ${completedImportResult.peerId.slice(0, 12)}.`
           : '가져온 대상 ID를 응답에서 확인할 수 없습니다.';
-      const detail = `백업은 가져왔지만 목록을 갱신하지 못했습니다. ${importedTarget} 기록을 다시 불러오세요.`;
+      const detail = `백업은 가져왔지만 대화 목록을 갱신하지 못했습니다. ${importedTarget} 기록 목록을 다시 불러와 확인하세요.`;
       setImportResult('success', detail);
       message.textContent = detail;
     } else if (importRequestStarted) {
