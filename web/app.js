@@ -52,6 +52,8 @@ let canReturnToChat = false;
 let latestChatSnapshot = null;
 let messageCursor = 0;
 let messageEpoch = null;
+let lastRenderedMessageDate = null;
+let lastRenderedMessageSender = '';
 let pollTimer = null;
 let pollGeneration = 0;
 let lastPhase = '';
@@ -477,8 +479,12 @@ async function refreshIdentity() {
     operationId = null;
     canReturnToChat = false;
     latestChatSnapshot = null;
+    lastPhase = '';
+    chatText.value = '';
+    resizeChatInput();
+    updateSendButton();
     sessionStorage.removeItem(operationKey);
-    conversation.replaceChildren();
+    clearConversationMessages();
     chatStatus.textContent = '';
     document.querySelector('#history-restore-panel').hidden = true;
     setHistoryDeletionBusy(false);
@@ -866,20 +872,73 @@ function formatTime(seconds) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
+function formatChatDate(date) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function resizeChatInput() {
+  chatText.style.height = 'auto';
+  const contentHeight = Number(chatText.scrollHeight) || 48;
+  const height = Math.min(Math.max(contentHeight, 48), 160);
+  chatText.style.height = `${height}px`;
+  chatText.style.overflowY = contentHeight > 160 ? 'auto' : 'hidden';
+}
+
+function updateSendButton() {
+  sendForm.querySelector('button').disabled = lastPhase !== 'connected'
+    || sendingMessage || !chatText.value.trim();
+}
+
+function clearConversationMessages() {
+  conversation.replaceChildren();
+  messageCursor = 0;
+  messageEpoch = null;
+  lastRenderedMessageDate = null;
+  lastRenderedMessageSender = '';
+}
+
+function formatChatClock(date) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 function appendMessages(items) {
   const distanceFromBottom = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight;
   const followLatest = conversation.scrollHeight === 0 || distanceFromBottom <= 80;
   for (const item of items) {
+    const timestamp = Number.isFinite(item.time) ? new Date(item.time * 1000) : null;
+    const validTimestamp = timestamp && Number.isFinite(timestamp.getTime());
+    const localDate = validTimestamp ? formatChatDate(timestamp) : null;
+    const isSystem = item.sender === '신원 변경';
+    if (localDate && lastRenderedMessageDate && localDate !== lastRenderedMessageDate) {
+      const divider = document.createElement('div');
+      divider.className = 'message-date-divider';
+      divider.setAttribute('role', 'separator');
+      divider.textContent = `${timestamp.getFullYear()}년 ${timestamp.getMonth() + 1}월 ${timestamp.getDate()}일`;
+      conversation.append(divider);
+    }
     const card = document.createElement('article');
-    card.className = `entry${item.sender === '나' ? ' mine' : ''}${item.sender === '신원 변경' ? ' system' : ''}`;
-    const time = document.createElement('time');
-    time.dateTime = new Date(item.time * 1000).toISOString();
-    time.textContent = `${formatTime(item.time)} [${item.sender}]`;
+    const continuation = !isSystem && Boolean(localDate)
+      && localDate === lastRenderedMessageDate
+      && item.sender === lastRenderedMessageSender;
+    card.className = `entry${item.sender === '나' ? ' mine' : ''}${isSystem ? ' system' : ''} ${continuation ? 'group-continuation' : 'group-start'}`;
+    card.setAttribute('aria-label', isSystem ? '신원 변경 안내' : item.sender === '나' ? '내가 보낸 메시지' : `${item.sender}가 보낸 메시지`);
+    if (validTimestamp) {
+      const time = document.createElement('time');
+      time.dateTime = timestamp.toISOString();
+      time.title = formatTime(item.time);
+      time.textContent = formatChatClock(timestamp);
+      time.setAttribute('aria-label', `${formatChatClock(timestamp)} · ${item.sender}`);
+      card.append(time);
+    }
     const body = document.createElement('div');
     appendMessageBody(body, item.text);
-    card.append(time, body);
+    card.append(body);
     conversation.append(card);
     messageCursor += 1;
+    if (localDate) lastRenderedMessageDate = localDate;
+    lastRenderedMessageSender = isSystem || !localDate ? '' : item.sender;
   }
   if (items.length && followLatest) conversation.scrollTop = conversation.scrollHeight;
   if (items.length && ['failed', 'disconnected', 'closed'].includes(latestChatSnapshot?.phase)) {
@@ -903,15 +962,14 @@ function updateChatView(snapshot) {
     && !terminal;
   syncChatReturnButton();
   if (messageEpoch !== snapshot.messageEpoch) {
-    conversation.replaceChildren();
-    messageCursor = 0;
+    clearConversationMessages();
     messageEpoch = snapshot.messageEpoch;
   }
   const labels = {
     connecting: 'relay에 연결하고 상대를 찾는 중입니다.',
     verification: '상대 공개 키와 지문을 별도 경로로 비교하세요.',
     confirming: '상대 확인 응답을 기다리는 중입니다.',
-    connected: '대화 연결이 활성화되었습니다. relay는 IP 주소와 연결 시각·통신량을 볼 수 있습니다.',
+    connected: '대화 연결이 활성화되었습니다.',
     disconnected: snapshot.error || '연결이 끊겼습니다.',
     failed: snapshot.error || '연결에 실패했습니다.',
     closed: '연결이 종료되었습니다.'
@@ -1025,12 +1083,11 @@ function updateChatView(snapshot) {
   }
   verification.hidden = phase !== 'verification';
   document.querySelector('#history-restore-request').hidden = phase !== 'connected';
-  const hasMessages = conversation.children.length > 0;
+  const hasMessages = messageCursor > 0;
   conversation.hidden = phase !== 'connected' && !(terminal && hasMessages);
   chatView.dataset.chatBody = hasMessages ? 'messages' : (chatText.value ? 'draft' : 'none');
   chatView.dataset.workflowVisible = String(!verification.hidden || !transitionPanel.hidden || !restorePanel.hidden);
   sendForm.hidden = phase !== 'connected' && !(terminal && Boolean(chatText.value));
-  sendForm.querySelector('button').disabled = phase !== 'connected' || sendingMessage;
   if (phase === 'verification' && lastPhase !== 'verification') {
     document.querySelector('#peer-id').textContent = snapshot.peerId || '';
     document.querySelector('#fingerprint').textContent = snapshot.fingerprint || '';
@@ -1059,6 +1116,7 @@ function updateChatView(snapshot) {
     stopPolling();
   }
   lastPhase = phase;
+  updateSendButton();
 }
 
 async function pollChat() {
@@ -1131,12 +1189,12 @@ async function attachChat(id) {
   operationId = id;
   const draftKey = chatDraftKey();
   chatText.value = draftKey ? (chatDrafts.get(draftKey) || '') : '';
+  resizeChatInput();
   canReturnToChat = true;
   latestChatSnapshot = null;
   syncChatReturnButton();
   sessionStorage.setItem(operationKey, operationId);
-  messageCursor = 0;
-  messageEpoch = null;
+  clearConversationMessages();
   dismissedTransitionKey = '';
   lastPhase = '';
   chatView.dataset.phase = 'connecting';
@@ -1149,8 +1207,8 @@ async function attachChat(id) {
   document.querySelector('#history-restore-request').hidden = true;
   conversation.hidden = true;
   sendForm.hidden = true;
-  conversation.replaceChildren();
   document.querySelector('#chat-title').textContent = '대화 연결';
+  updateSendButton();
   document.querySelector('#confirm-peer').disabled = false;
   show('chat');
   await pollChat();
@@ -1377,6 +1435,10 @@ document.querySelector('#logout').addEventListener('click', async () => {
     if (!(await request('/api/identity/logout')).ok) throw new Error('logout failed');
     operationId = null;
     canReturnToChat = false;
+    lastPhase = '';
+    chatText.value = '';
+    resizeChatInput();
+    updateSendButton();
     sessionStorage.removeItem(operationKey);
     latestChatSnapshot = null;
     identityId.textContent = '';
@@ -1386,6 +1448,7 @@ document.querySelector('#logout').addEventListener('click', async () => {
     historySummaries = [];
     dismissedTransitionKey = '';
     clearReprotectState();
+    clearConversationMessages();
     historyMessages.replaceChildren();
     historyList.replaceChildren();
     show('entry');
@@ -1412,9 +1475,13 @@ document.querySelectorAll('.disconnect').forEach((button) => button.addEventList
   clearChatDrafts();
   sendStatus.textContent = '';
   sendStatus.hidden = true;
+  chatText.value = '';
+  resizeChatInput();
+  lastPhase = '';
+  updateSendButton();
   canReturnToChat = false;
   latestChatSnapshot = null;
-  conversation.replaceChildren();
+  clearConversationMessages();
   sessionStorage.removeItem(operationKey);
   sessionStorage.removeItem(sessionKey);
   identityId.textContent = '';
@@ -1677,7 +1744,6 @@ sendForm.addEventListener('submit', async (event) => {
   const text = chatText.value;
   const sentFocusTarget = document.activeElement;
   const body = `${sentOperationId}\n${text}`;
-  const button = sendForm.querySelector('button');
   const isCurrentSend = () => operationId === sentOperationId
     && identityId.textContent.trim() === sentIdentityId
     && identitySessionGeneration === sentSessionGeneration
@@ -1685,7 +1751,7 @@ sendForm.addEventListener('submit', async (event) => {
   sendingMessage = true;
   sendStatus.textContent = '';
   sendStatus.hidden = true;
-  button.disabled = true;
+  updateSendButton();
   try {
     const response = await request('/api/chat/send', body);
     if (!isCurrentSend()) return;
@@ -1702,6 +1768,7 @@ sendForm.addEventListener('submit', async (event) => {
     if (!isCurrentSend()) return;
     if (chatText.value === text) {
       chatText.value = '';
+      resizeChatInput();
       const draftKey = chatDraftKey(sentIdentityId, sentOperationId, sentSessionGeneration);
       if (draftKey) chatDrafts.set(draftKey, '');
     }
@@ -1717,7 +1784,7 @@ sendForm.addEventListener('submit', async (event) => {
   } finally {
     if (isCurrentSend()) {
       sendingMessage = false;
-      button.disabled = lastPhase !== 'connected';
+      updateSendButton();
     }
   }
 });
@@ -1725,6 +1792,14 @@ sendForm.addEventListener('submit', async (event) => {
 chatText.addEventListener('input', () => {
   const draftKey = chatDraftKey();
   if (draftKey) chatDrafts.set(draftKey, chatText.value);
+  resizeChatInput();
+  updateSendButton();
+});
+
+chatText.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) return;
+  event.preventDefault();
+  if (lastPhase === 'connected' && !sendingMessage && chatText.value.trim()) sendForm.requestSubmit();
 });
 
 document.querySelector('#close-chat').addEventListener('click', async () => {
@@ -1737,6 +1812,7 @@ document.querySelector('#close-chat').addEventListener('click', async () => {
   const closingDraftKey = chatDraftKey();
   if (closingDraftKey) chatDrafts.delete(closingDraftKey);
   chatText.value = '';
+  resizeChatInput();
   sendStatus.textContent = '';
   sendStatus.hidden = true;
   chatViewGeneration += 1;
@@ -1745,11 +1821,11 @@ document.querySelector('#close-chat').addEventListener('click', async () => {
   operationId = null;
   canReturnToChat = false;
   syncChatReturnButton();
-  sendForm.querySelector('button').disabled = true;
+  updateSendButton();
   sessionStorage.removeItem(operationKey);
   stopPolling();
   latestChatSnapshot = null;
-  conversation.replaceChildren();
+  clearConversationMessages();
   show('active');
   const closingViewGeneration = chatViewGeneration;
   if (closingOperationId) await request('/api/chat/cancel', closingOperationId).catch(() => {});

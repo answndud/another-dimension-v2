@@ -144,9 +144,16 @@
     .entry.mine { margin-left: 12%; background: var(--surface-muted); }
     .entry.system { border-style: dashed; color: var(--muted); background: var(--surface-muted); }
     .entry time { display: block; margin-bottom: var(--space-1); color: var(--muted); font-size: 12px; }
-    main:has(#chat-view:not([hidden])) { display: flex; flex-direction: column; width: min(100%, 960px); min-height: 0; height: calc(100vh - 72px - var(--space-12)); height: calc(100dvh - 72px - var(--space-12)); margin: 0 auto; }
-    #chat-view { display: grid; grid-template-rows: auto auto auto minmax(0, 1fr) auto auto; flex: 1 1 auto; width: 100%; max-width: none; min-width: 0; min-height: 0; margin: 0; padding: 0; overflow: visible; border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); box-shadow: 0 1px 3px var(--shadow); }
+    body:has(#chat-view:not([hidden])) .site-header { width: min(100%, 960px); margin-inline: auto; }
+    main:has(#chat-view:not([hidden])) { display: flex; flex-direction: column; width: min(100%, 960px); min-width: 0; min-height: 0; height: calc(100vh - 72px - var(--space-12)); height: calc(100dvh - 72px - var(--space-12)); margin: 0 auto; }
+    #chat-view { display: grid; grid-template-rows: auto auto auto minmax(0, 1fr) auto auto; flex: 1 1 auto; width: 100%; max-width: none; min-width: 0; min-height: 0; margin: 0; padding: 0; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); box-shadow: 0 1px 3px var(--shadow); }
     #chat-view[hidden] { display: none !important; }
+    .chat-header { grid-row: 1; }
+    .chat-status-strip { grid-row: 2; }
+    .chat-workflows { grid-row: 3; }
+    #chat-view #conversation { grid-row: 4; }
+    #chat-view #send-status { grid-row: 5; }
+    #chat-view #send-form { grid-row: 6; }
     #chat-view[data-phase="connecting"], #chat-view[data-phase="confirming"] { grid-template-rows: auto auto 0 0 0 0; }
     #chat-view[data-phase="verification"] { grid-template-rows: auto auto auto 0 0 0; }
     #chat-view[data-phase="disconnected"], #chat-view[data-phase="failed"], #chat-view[data-phase="closed"] { grid-template-rows: auto auto 0 0 auto 0; }
@@ -157,10 +164,13 @@
     #chat-view[data-phase="disconnected"][data-workflow-visible="true"][data-chat-body="draft"], #chat-view[data-phase="failed"][data-workflow-visible="true"][data-chat-body="draft"], #chat-view[data-phase="closed"][data-workflow-visible="true"][data-chat-body="draft"] { grid-template-rows: auto auto auto 0 auto auto; }
     #chat-view[data-phase="connecting"], #chat-view[data-phase="verification"], #chat-view[data-phase="confirming"], #chat-view[data-phase="disconnected"], #chat-view[data-phase="failed"], #chat-view[data-phase="closed"] { align-content: start; flex: 0 0 auto; }
     #chat-view[data-phase="disconnected"][data-chat-body="messages"], #chat-view[data-phase="failed"][data-chat-body="messages"], #chat-view[data-phase="closed"][data-chat-body="messages"] { align-content: stretch; flex: 1 1 auto; min-height: 0; }
-    .chat-header { grid-row: 1; display: flex; min-height: 72px; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) 20px; border-bottom: 1px solid var(--border-soft); }
-    .chat-heading { min-width: 0; }
+    .chat-header { display: flex; min-height: 72px; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) 20px; border-bottom: 1px solid var(--border-soft); }
+    .chat-heading { min-width: 0; flex: 1 1 auto; }
     .chat-heading h2 { margin: 0 0 var(--space-1); font-size: 18px; font-weight: 650; }
     #chat-status { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+    .relay-privacy { margin-top: var(--space-1); color: var(--muted); font-size: 12px; }
+    .relay-privacy summary { width: fit-content; cursor: pointer; }
+    .relay-privacy p { max-width: 64ch; margin: var(--space-1) 0 0; line-height: 1.5; }
     .chat-header-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-2); }
     .chat-header-actions button { min-height: 42px; }
     .chat-status-strip { grid-row: 2; display: grid; gap: var(--space-1); padding: 0 20px; }
@@ -184,24 +194,30 @@
     #history-restore-status { font-weight: 600; }
     #history-restore-preview { display: grid; max-height: 12rem; gap: var(--space-2); overflow: auto; margin: var(--space-3) 0; padding: var(--space-2); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--surface); }
     #history-restore-preview .entry { max-width: none; }
-    #chat-view #conversation { grid-row: 4; display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; max-height: none; gap: 10px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; margin: 0; padding: 16px 20px; border: 0; border-radius: 0; background: var(--page); }
+    #chat-view #conversation { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; max-height: none; gap: var(--space-3); overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; margin: 0; padding: var(--space-4) 20px; border: 0; border-radius: 0; background: var(--page); }
     #chat-view #conversation[hidden] { display: none !important; }
     #chat-view #conversation:empty { background: var(--surface); }
-    #chat-view .entry { display: grid; width: fit-content; max-width: min(75%, 680px); min-width: 0; gap: var(--space-2); margin: 0; padding: 12px 16px; border: 1px solid var(--border-soft); border-radius: var(--radius-card); background: var(--surface-muted); overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap; }
-    #chat-view .entry.mine { align-self: flex-end; margin-left: auto; border-color: transparent; background: var(--primary); color: var(--primary-text); }
+    #chat-view .entry { display: grid; width: fit-content; max-width: min(75%, 680px); min-width: 0; gap: var(--space-2); margin: 0; padding: var(--space-3) var(--space-4); border: 1px solid var(--border-soft); border-radius: var(--radius-card); background: var(--surface-muted); overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap; }
+    #chat-view .entry.group-start { margin-top: var(--space-2); }
+    #chat-view .entry.group-continuation { margin-top: calc(-1 * var(--space-2)); }
+    #chat-view .entry.mine { align-self: flex-end; margin-left: auto; border-color: var(--border); background: var(--surface); color: var(--text); }
     #chat-view .entry.system { align-self: center; width: fit-content; max-width: 90%; padding: var(--space-2) var(--space-3); border: 0; border-radius: 999px; color: var(--muted); background: var(--surface-muted); font-size: 13px; text-align: center; }
     #chat-view .entry time { order: 2; margin: 0; color: var(--muted); font-size: 11px; line-height: 1.35; }
-    #chat-view .entry.mine time { color: inherit; opacity: .76; }
+    #chat-view .entry.mine time { color: var(--muted); opacity: 1; }
+    #chat-view .message-date-divider { display: flex; align-items: center; gap: var(--space-3); margin: var(--space-3) 0; color: var(--muted); font-size: 12px; text-align: center; }
+    #chat-view .message-date-divider::before, #chat-view .message-date-divider::after { height: 1px; flex: 1; background: var(--border-soft); content: ""; }
+    #chat-view .entry.system { margin-top: var(--space-2); }
     #chat-view .entry > div { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
     #chat-view .message-external-link { color: var(--link); }
     #chat-view .entry.mine .message-external-link { color: inherit; }
     #chat-view .message-select { align-self: start; }
-    #send-form { grid-row: 6; display: grid; grid-template-columns: minmax(0, 1fr) 88px; align-items: end; gap: var(--space-2); margin: 0; padding: var(--space-3) 20px; border-top: 1px solid var(--border-soft); background: var(--surface); }
+    #send-form { display: grid; grid-template-columns: minmax(0, 1fr) 88px; align-items: end; gap: var(--space-2); width: 100%; max-width: none; min-width: 0; margin: 0; padding: var(--space-3) 20px; border-top: 1px solid var(--border-soft); background: var(--surface); }
     #send-form[hidden] { display: none !important; }
     #send-status { grid-row: 5; align-self: end; margin: 0 20px var(--space-2); padding: var(--space-2) var(--space-3); border: 1px solid var(--danger-border); border-radius: var(--radius-control); color: var(--danger); background: var(--danger-surface); font-size: 13px; overflow-wrap: anywhere; }
     #send-status[hidden] { display: none !important; }
-    #send-form label { grid-column: 1 / -1; margin: 0; }
-    #chat-text { width: 100%; min-width: 0; min-height: 48px; max-height: 160px; margin: 0; overflow-y: auto; resize: none; }
+    #send-form label, #chat-keyboard-hint { grid-column: 1 / -1; margin: 0; }
+    #chat-keyboard-hint { color: var(--muted); font-size: 12px; }
+    #chat-text { width: 100%; min-width: 0; min-height: 48px; max-height: 160px; height: 48px; margin: 0; overflow-x: hidden; overflow-y: hidden; resize: none; }
     #send-form button { width: 100%; height: 48px; min-height: 48px; }
     #chat-view > .chat-end-row { display: none; }
     #message { min-height: 1.6rem; color: var(--muted); }
@@ -377,7 +393,7 @@
       #chat-view .entry { max-width: 92%; padding: var(--space-3); }
       #send-form { grid-template-columns: minmax(0, 1fr) 76px; gap: var(--space-2); padding: var(--space-2) var(--space-3); }
       #send-status { margin-right: var(--space-3); margin-left: var(--space-3); }
-      #chat-text { min-height: 44px; }
+      #chat-text { min-height: 48px; height: 48px; }
       #send-form button { height: 44px; min-height: 44px; padding: var(--space-2); }
       #identity-transition-panel .actions, #history-restore-panel .actions { align-items: stretch; flex-direction: column; }
       #identity-transition-panel .actions button, #history-restore-panel .actions button { width: 100%; }
@@ -618,6 +634,10 @@
         <div class="chat-heading">
           <h2 id="chat-title">대화 연결</h2>
           <p id="chat-status" role="status" aria-live="polite" tabindex="-1">연결을 시작합니다.</p>
+          <details class="relay-privacy">
+            <summary>Relay 개인정보 안내</summary>
+            <p>Relay는 연결에 사용된 IP 주소, 연결 시각과 통신량을 볼 수 있습니다. 이벤트를 수락해도 상대방이 메시지를 받거나 저장했다는 뜻은 아닙니다.</p>
+          </details>
         </div>
         <div class="chat-header-actions">
           <button id="history-restore-request" type="button">상대 기록 확인</button>
@@ -665,8 +685,9 @@
       <p id="send-status" role="status" aria-live="polite" hidden></p>
       <form id="send-form" hidden>
         <label class="visually-hidden" for="chat-text">메시지</label>
-        <textarea id="chat-text" maxlength="4078" required placeholder="메시지를 입력하세요."></textarea>
+        <textarea id="chat-text" maxlength="4078" required aria-describedby="chat-keyboard-hint" placeholder="메시지를 입력하세요."></textarea>
         <button type="submit" class="primary">전송</button>
+        <p id="chat-keyboard-hint">Enter 전송 · Shift+Enter 줄바꿈</p>
       </form>
     </section>
     <section id="history-detail" hidden>

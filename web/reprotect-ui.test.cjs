@@ -72,6 +72,10 @@ function createHarness(options = {}) {
         append(...children) { this.children.push(...children); },
         appendChild(child) { this.children.push(child); return child; },
         focus() { this.focused = true; this.focusCalls = (this.focusCalls || 0) + 1; document.activeElement = this; }, click() {}, remove() {}, setAttribute() {},
+        requestSubmit() {
+          this.requestSubmitCalls = (this.requestSubmitCalls || 0) + 1;
+          if (this.listeners.submit) return this.listeners.submit({ preventDefault() {} });
+        },
         showModal() { this.open = true; },
         close() {
           this.open = false;
@@ -496,7 +500,7 @@ test('dashboard menu closes on outside click and Escape; management dialog reuse
   assert.match(html, /\.chat-status-strip\s*\{[^}]*grid-row:\s*2/);
   assert.match(html, /\.chat-workflows\s*\{[^}]*grid-row:\s*3/);
   assert.match(html, /#chat-view\s+#conversation\s*\{[^}]*grid-row:\s*4/);
-  assert.match(html, /#send-form\s*\{[^}]*grid-row:\s*6/);
+  assert.match(html, /#chat-view #send-form\s*\{[^}]*grid-row:\s*6/);
   assert.match(html, /#send-status\s*\{[^}]*grid-row:\s*5/);
   assert.match(html, /#chat-view\s*\{[^}]*grid-template-rows:\s*auto auto auto minmax\(0, 1fr\) auto auto/);
   assert.match(html, /<div id="conversation"[^>]*><\/div>\s*<p id="send-status"[^>]*><\/p>\s*<form id="send-form"/);
@@ -588,9 +592,11 @@ test('chat UI keeps the message DOM safe and follows new messages only when alre
   harness.evaluate(`appendMessages([{ sender: '나', time: 1700000000, text: 'hello\\nhttps://example.test' }])`);
   assert.equal(conversation.scrollTop, 1000);
   const firstMessage = conversation.children[0];
-  assert.equal(firstMessage.className, 'entry mine');
+  assert.match(firstMessage.className, /^entry mine group-start$/);
   assert.equal(firstMessage.children.length, 2);
   assert.match(firstMessage.children[0].dateTime, /^\d{4}-/);
+  assert.match(firstMessage.children[0].textContent, /^\d{2}:\d{2}$/);
+  assert.match(firstMessage.children[0].title, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
 
   conversation.scrollHeight = 1200;
   conversation.scrollTop = 200;
@@ -609,6 +615,101 @@ test('chat UI keeps the message DOM safe and follows new messages only when alre
     'history-restore-preview', 'history-restore-request', 'conversation', 'send-form',
     'send-status', 'chat-text', 'close-chat',
   ]) assert.match(html, new RegExp(`id="${id}"`));
+});
+
+test('chat input grows from 48px, caps internally, and resets after clearing', async () => {
+  const h = createHarness();
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  const input = h.element('#chat-text');
+  input.scrollHeight = 112;
+  h.evaluate("chatDrafts.set(chatDraftKey('identity-A', 'operation-A'), 'restored draft')");
+  await attachChatInHarness(h, 'operation-A');
+  assert.equal(input.value, 'restored draft');
+  assert.equal(input.style.height, '112px', 'restored drafts are measured during attachment');
+
+  input.scrollHeight = 220;
+  inputChat(h, 'a long draft');
+  assert.equal(input.style.height, '160px');
+  assert.equal(input.style.overflowY, 'auto');
+
+  input.scrollHeight = 48;
+  inputChat(h, 'short draft');
+  const sending = submitChat(h);
+  const request = await waitForRequest(() => h.requestFor('/api/chat/send'));
+  request.resolve(response('ok'));
+  await sending;
+  assert.equal(input.value, '');
+  assert.equal(input.style.height, '48px');
+  assert.equal(input.style.overflowY, 'hidden');
+});
+
+test('chat keyboard sends on Enter but preserves Shift+Enter and IME composition', async () => {
+  const h = createHarness();
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  await attachChatInHarness(h, 'operation-A');
+  const input = h.element('#chat-text');
+  const form = h.element('#send-form');
+  let submitCalls = 0;
+  form.requestSubmit = () => { submitCalls += 1; };
+  inputChat(h, 'hello');
+
+  const event = (overrides = {}) => ({
+    key: 'Enter', shiftKey: false, isComposing: false, keyCode: 13,
+    prevented: false, preventDefault() { this.prevented = true; }, ...overrides,
+  });
+  const enter = event();
+  input.listeners.keydown(enter);
+  assert.equal(enter.prevented, true);
+  assert.equal(submitCalls, 1);
+
+  for (const composingEnter of [event({ shiftKey: true }), event({ isComposing: true }), event({ keyCode: 229 })]) {
+    input.listeners.keydown(composingEnter);
+    assert.equal(composingEnter.prevented, false);
+  }
+  assert.equal(submitCalls, 1);
+});
+
+test('chat send button requires a connected nonempty unsent draft', () => {
+  const h = createHarness();
+  const button = h.element('#send-form').querySelector('button');
+  const input = h.element('#chat-text');
+  h.evaluate("operationId = 'operation-A'; updateChatView({ phase: 'connected', messageCount: 0, messageEpoch: 1 })");
+  assert.equal(button.disabled, true);
+  inputChat(h, 'hello');
+  assert.equal(button.disabled, false);
+  h.evaluate("updateChatView({ phase: 'disconnected', messageCount: 0, messageEpoch: 1 })");
+  assert.equal(button.disabled, true);
+});
+
+test('chat date separators and sender grouping survive polling batches and reset with message epoch', () => {
+  const h = createHarness();
+  const conversation = h.element('#conversation');
+  const firstDay = new Date(2026, 0, 1, 23, 59, 0).getTime() / 1000;
+  const secondDay = new Date(2026, 0, 2, 0, 1, 0).getTime() / 1000;
+  h.evaluate(`updateChatView({ phase: 'connected', messageCount: 0, messageEpoch: 1 })`);
+  h.evaluate(`appendMessages([{ sender: '상대', time: ${firstDay}, text: 'first batch' }])`);
+  h.evaluate(`appendMessages([
+    { sender: '상대', text: 'timestamp unavailable' },
+    { sender: '상대', time: ${secondDay}, text: 'next day after unknown time' },
+    { sender: '신원 변경', time: ${secondDay + 1}, text: 'system event' },
+    { sender: '상대', time: ${secondDay + 2}, text: 'after system' },
+  ])`);
+
+  assert.equal(conversation.children.length, 6);
+  assert.equal(conversation.children[0].className, 'entry group-start');
+  assert.equal(conversation.children[1].children.length, 1, 'missing timestamps are omitted');
+  assert.equal(conversation.children[2].className, 'message-date-divider');
+  assert.match(conversation.children[2].textContent, /2026년 1월 2일/);
+  assert.equal(conversation.children[3].className, 'entry group-start');
+  assert.equal(conversation.children[4].className, 'entry system group-start');
+  assert.equal(conversation.children[5].className, 'entry group-start');
+  assert.equal(h.evaluate('messageCursor'), 5, 'date separators do not count as messages');
+
+  h.evaluate(`updateChatView({ phase: 'connected', messageCount: 0, messageEpoch: 2 })`);
+  assert.equal(conversation.children.length, 0);
+  assert.equal(h.evaluate('messageCursor'), 0);
+  h.evaluate(`appendMessages([{ sender: '상대', time: ${secondDay}, text: 'new epoch' }])`);
+  assert.equal(conversation.children.length, 1, 'the new epoch starts without stale date or sender state');
 });
 
 test('history detail separates browsing, backup and deletion without replacing feature controls', () => {
@@ -2189,7 +2290,7 @@ test('send request errors stay separate from connection polling and clear on ret
     assert.equal(h.element('#chat-text').value, 'keep my draft');
 
     h.evaluate(`updateChatView({ phase: 'connected', messageCount: 0, messageEpoch: 1 })`);
-    assert.equal(h.element('#chat-status').textContent, '대화 연결이 활성화되었습니다. relay는 IP 주소와 연결 시각·통신량을 볼 수 있습니다.');
+    assert.equal(h.element('#chat-status').textContent, '대화 연결이 활성화되었습니다.');
     assert.equal(h.element('#send-status').textContent, errorText);
 
     inputChat(h, 'retry text');
@@ -2218,7 +2319,7 @@ test('send error, aggregate relay acknowledgement, and local storage error remai
     pendingSends: 2, relayAck: 'accepted', storageError: '기록 파일 쓰기 실패',
   })`);
 
-  assert.equal(h.element('#chat-status').textContent, '대화 연결이 활성화되었습니다. relay는 IP 주소와 연결 시각·통신량을 볼 수 있습니다.');
+  assert.equal(h.element('#chat-status').textContent, '대화 연결이 활성화되었습니다.');
   assert.equal(h.element('#send-status').textContent, '전송 결과를 확인하지 못했습니다.');
   assert.match(h.element('#delivery-status').textContent, /relay 접수 확인 대기 중 \(2건\)/);
   assert.match(h.element('#delivery-status').textContent, /상대방의 수신이나 저장은 확인되지 않습니다/);
@@ -2506,6 +2607,8 @@ test('actual UI: chat phases show only the actions available at each step', asyn
   assert.match(h.element('#chat-status').textContent, /대화 연결이 활성화/);
   assert.equal(h.element('#conversation').hidden, false);
   assert.equal(h.element('#send-form').hidden, false);
+  assert.equal(h.element('#send-form').querySelector('button').disabled, true, 'blank messages cannot be sent');
+  inputChat(h, 'ready to send');
   assert.equal(h.element('#send-form').querySelector('button').disabled, false);
   assert.equal(h.element('#history-restore-request').hidden, false);
   assert.match(h.element('#delivery-status').textContent, /relay 접수 확인 대기/);
@@ -2537,7 +2640,7 @@ test('actual UI: chat phases show only the actions available at each step', asyn
   assert.equal(h.element('#chat-view').dataset.workflowVisible, 'true');
   assert.match(h.element('#history-restore-status').textContent, /최종 병합 작업 진행 중/);
 
-  h.evaluate("conversation.replaceChildren(); chatText.value = ''");
+  h.evaluate("clearConversationMessages(); chatText.value = ''");
   showPhase('disconnected', { error: '연결이 끊겼습니다.' });
   assert.equal(h.element('#conversation').hidden, true);
   h.evaluate("appendMessages([{ sender: '상대', time: 1700000001, text: '늦게 도착한 메시지' }])");
@@ -2666,7 +2769,7 @@ test('peer confirmation request and phase polling stay scoped to the same conver
     lateConfirmRequest.resolve(response('ok'));
     await lateConfirming;
     assert.equal(connected.element('#chat-status').textContent, connectedStatus);
-    assert.equal(connectedStatus, '대화 연결이 활성화되었습니다. relay는 IP 주소와 연결 시각·통신량을 볼 수 있습니다.');
+    assert.equal(connectedStatus, '대화 연결이 활성화되었습니다.');
   });
 });
 
