@@ -989,9 +989,14 @@ function updateChatView(snapshot) {
   document.querySelector('#history-restore-request').disabled = snapshot.phase !== 'connected'
     || snapshot.historyRestoreInProgress || (snapshot.historyRestoreOfferCount || 0) > 0
     || !['idle', 'failed', 'completed'].includes(restoreState);
-  document.querySelector('#history-restore-accept').disabled = snapshot.historyRestoreInProgress
-    || !['awaiting-transfer-consent', 'awaiting-merge-consent'].includes(restoreState)
-    || (snapshot.historyRestoreOfferCount || 0) === 0;
+  const canAcceptTransfer = restoreState === 'awaiting-transfer-consent'
+    && snapshot.phase === 'connected'
+    && !snapshot.historyRestoreInProgress;
+  const canAcceptMerge = restoreState === 'awaiting-merge-consent'
+    && snapshot.phase === 'connected'
+    && !snapshot.historyRestoreInProgress
+    && (snapshot.historyRestoreOfferCount || 0) > 0;
+  document.querySelector('#history-restore-accept').disabled = !canAcceptTransfer && !canAcceptMerge;
   document.querySelector('#history-restore-accept').textContent = restoreState === 'awaiting-merge-consent'
     ? '제안된 기록 병합' : '전송 동의';
   document.querySelector('#history-restore-decline').disabled = ['idle', 'failed', 'completed', 'merging', 'merge-queued'].includes(restoreState);

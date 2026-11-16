@@ -183,6 +183,21 @@ struct ChatSnapshot {
     message_epoch: u64,
 }
 
+const HISTORY_RESTORE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn history_restore_timed_out(started_at: Option<Instant>, now: Instant) -> bool {
+    started_at.is_some_and(|started| now.duration_since(started) > HISTORY_RESTORE_TIMEOUT)
+}
+
+fn history_restore_work_timed_out(
+    started_at: Option<Instant>,
+    request_pending: bool,
+    staging_pending: bool,
+    now: Instant,
+) -> bool {
+    (request_pending || staging_pending) && history_restore_timed_out(started_at, now)
+}
+
 fn reserve_history_restore_resolution(
     snapshot: &mut ChatSnapshot,
     accept: bool,
@@ -217,6 +232,31 @@ fn reserve_history_restore_resolution(
         _ => "복원 취소 요청을 접수했습니다.".to_owned(),
     });
     Ok(state)
+}
+
+fn history_restore_request_allowed(snapshot: &ChatSnapshot) -> bool {
+    snapshot.phase == "connected"
+        && !snapshot.history_restore_in_progress
+        && snapshot.history_restore_offer.is_empty()
+        && matches!(
+            snapshot.history_restore_state,
+            "idle" | "failed" | "completed"
+        )
+}
+
+fn mark_history_restore_timeout(snapshot: &mut ChatSnapshot) {
+    snapshot.history_restore_in_progress = false;
+    snapshot.history_restore_state = "failed";
+    snapshot.history_restore_received = 0;
+    snapshot.history_restore_total = 0;
+    snapshot.history_restore_offer.clear();
+    snapshot.history_restore_offer_count = 0;
+    snapshot.history_restore_legacy_count = 0;
+    snapshot.history_restore_estimate_bytes = 0;
+    snapshot.history_restore_status = Some(
+        "상대 기록 응답 시간이 초과되었습니다. 로컬 기록은 변경하지 않았습니다. 다시 연결되어 있으면 복원을 다시 요청할 수 있습니다."
+            .to_owned(),
+    );
 }
 
 #[derive(Clone)]
@@ -1121,6 +1161,48 @@ mod send_tests {
             sender,
             cancelled: Arc::new(AtomicBool::new(true)),
         })
+    }
+
+    #[test]
+    fn restore_timeout_fails_pending_estimate_and_allows_a_fresh_request() {
+        let operation = closed_test_operation("test-identity", "peer", 0, 0);
+        let now = Instant::now();
+        let started_at = Some(now - HISTORY_RESTORE_TIMEOUT - Duration::from_millis(1));
+        assert!(history_restore_timed_out(started_at, now));
+        assert!(history_restore_work_timed_out(started_at, true, false, now));
+        assert!(history_restore_work_timed_out(started_at, false, true, now));
+        assert!(!history_restore_work_timed_out(
+            started_at, false, false, now
+        ));
+        assert!(!history_restore_timed_out(
+            Some(now - HISTORY_RESTORE_TIMEOUT),
+            now
+        ));
+        assert!(!history_restore_timed_out(None, now));
+
+        chat_update(&operation, |snapshot| {
+            snapshot.phase = "connected";
+            snapshot.history_restore_in_progress = true;
+            snapshot.history_restore_state = "estimating";
+            snapshot.history_restore_estimate_bytes = 8192;
+            snapshot.history_restore_received = 2;
+            snapshot.history_restore_total = 3;
+            snapshot.history_restore_status = Some("estimate pending".to_owned());
+        });
+        chat_update(&operation, mark_history_restore_timeout);
+
+        let snapshot = operation.snapshot.lock().unwrap();
+        assert_eq!(snapshot.history_restore_state, "failed");
+        assert!(!snapshot.history_restore_in_progress);
+        assert_eq!(snapshot.history_restore_received, 0);
+        assert_eq!(snapshot.history_restore_total, 0);
+        assert_eq!(snapshot.history_restore_estimate_bytes, 0);
+        assert!(snapshot
+            .history_restore_status
+            .as_deref()
+            .unwrap()
+            .contains("시간이 초과"));
+        assert!(history_restore_request_allowed(&snapshot));
     }
 
     #[test]
@@ -2713,9 +2795,12 @@ fn spawn_chat_worker(
                     }
                 }
             }
-            if restore_started_at
-                .is_some_and(|started| now.duration_since(started) > Duration::from_secs(30))
-            {
+            if history_restore_work_timed_out(
+                restore_started_at,
+                restore_request_id.is_some(),
+                pending_restore.is_some(),
+                now,
+            ) {
                 restore_started_at = None;
                 if let Some(request_id) = restore_request_id.take() {
                     let _ = session.send(&chat_control(serde_json::json!({
@@ -2726,15 +2811,7 @@ fn spawn_chat_worker(
                 }
                 restore_receiver = HistorySyncReceiver::default();
                 discard_restore_staging(&mut pending_restore, &operation);
-                chat_update(&operation, |snapshot| {
-                    snapshot.history_restore_in_progress = false;
-                    snapshot.history_restore_received = 0;
-                    snapshot.history_restore_total = 0;
-                    snapshot.history_restore_status = Some(
-                        "상대 기록 응답 시간이 초과되었습니다. 로컬 기록은 변경하지 않았습니다."
-                            .to_owned(),
-                    );
-                });
+                chat_update(&operation, mark_history_restore_timeout);
             }
             if outgoing_sync_started_at
                 .is_some_and(|started| now.duration_since(started) > Duration::from_secs(30))
@@ -4987,15 +5064,11 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some(operation) = owned_chat_operation(&state, body) else {
             return reject(&mut stream, "404 Not Found");
         };
-        if !operation.snapshot.lock().is_ok_and(|snapshot| {
-            snapshot.phase == "connected"
-                && !snapshot.history_restore_in_progress
-                && snapshot.history_restore_offer.is_empty()
-                && matches!(
-                    snapshot.history_restore_state,
-                    "idle" | "failed" | "completed"
-                )
-        }) {
+        if !operation
+            .snapshot
+            .lock()
+            .is_ok_and(|snapshot| history_restore_request_allowed(&snapshot))
+        {
             return reject(&mut stream, "409 Conflict");
         }
         let (sender, receiver) = mpsc::channel();

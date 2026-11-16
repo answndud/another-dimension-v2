@@ -1866,7 +1866,7 @@ test('actual UI: restore progress, cancel, and unsigned legacy preview reach the
   assert.match(h.element('#message').textContent, /전송을 취소했습니다/);
 });
 
-test('actual UI: transfer consent and final merge consent are separate states', async () => {
+test('actual UI: transfer consent uses the estimate while final merge consent requires verified records', async () => {
   const h = createHarness();
   h.evaluate(`updateChatView({
     phase: 'connected', messageEpoch: 0, messages: [], peerId: 'peer', identityTransition: [],
@@ -1876,7 +1876,16 @@ test('actual UI: transfer consent and final merge consent are separate states', 
     historyRestoreStatus: 'estimate only'
   })`);
   assert.equal(h.element('#history-restore-accept').textContent, '전송 동의');
-  assert.equal(h.element('#history-restore-accept').disabled, true);
+  assert.equal(h.element('#history-restore-accept').disabled, false);
+
+  h.evaluate(`updateChatView({
+    phase: 'connected', messageEpoch: 0, messages: [], peerId: 'peer', identityTransition: [],
+    historyRestoreState: 'awaiting-transfer-consent', historyRestoreInProgress: false,
+    historyRestoreTotal: 0, historyRestoreEstimateBytes: 0,
+    historyRestoreOfferCount: 0, historyRestoreOffer: [],
+    historyRestoreStatus: '0개 예상'
+  })`);
+  assert.equal(h.element('#history-restore-accept').disabled, false);
   h.evaluate(`updateChatView({
     phase: 'connected', messageEpoch: 0, messages: [], peerId: 'peer', identityTransition: [],
     historyRestoreState: 'awaiting-merge-consent', historyRestoreInProgress: false,
@@ -1885,6 +1894,31 @@ test('actual UI: transfer consent and final merge consent are separate states', 
   })`);
   assert.equal(h.element('#history-restore-accept').textContent, '제안된 기록 병합');
   assert.equal(h.element('#history-restore-accept').disabled, false);
+
+  h.evaluate(`updateChatView({
+    phase: 'connected', messageEpoch: 0, messages: [], peerId: 'peer', identityTransition: [],
+    historyRestoreState: 'awaiting-merge-consent', historyRestoreInProgress: false,
+    historyRestoreTotal: 0, historyRestoreOfferCount: 0, historyRestoreOffer: [],
+    historyRestoreStatus: '상대가 보낸 기록이 없습니다.'
+  })`);
+  assert.equal(h.element('#history-restore-accept').disabled, true);
+  assert.equal(h.element('#history-restore-decline').disabled, false);
+
+  h.evaluate(`updateChatView({
+    phase: 'connected', messageEpoch: 0, messages: [], peerId: 'peer', identityTransition: [],
+    historyRestoreState: 'awaiting-transfer-consent', historyRestoreInProgress: true,
+    historyRestoreTotal: 1, historyRestoreOfferCount: 0, historyRestoreOffer: [],
+    historyRestoreStatus: 'receiving'
+  })`);
+  assert.equal(h.element('#history-restore-accept').disabled, true);
+
+  h.evaluate(`updateChatView({
+    phase: 'disconnected', messageEpoch: 0, messages: [], peerId: 'peer', identityTransition: [],
+    historyRestoreState: 'awaiting-transfer-consent', historyRestoreInProgress: false,
+    historyRestoreTotal: 1, historyRestoreOfferCount: 0, historyRestoreOffer: [],
+    historyRestoreStatus: 'estimate only'
+  })`);
+  assert.equal(h.element('#history-restore-accept').disabled, true);
 });
 
 test('actual UI: history detail loads bounded pages and searches only the current page', async () => {
