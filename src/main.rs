@@ -259,6 +259,24 @@ fn mark_history_restore_timeout(snapshot: &mut ChatSnapshot) {
     );
 }
 
+fn reserve_history_restore_timeout(snapshot: &mut ChatSnapshot) -> bool {
+    if !matches!(
+        snapshot.history_restore_state,
+        "estimating" | "awaiting-transfer-consent" | "receiving" | "awaiting-merge-consent"
+    ) {
+        return false;
+    }
+    mark_history_restore_timeout(snapshot);
+    true
+}
+
+fn try_reserve_history_restore_timeout(operation: &ChatOperation) -> bool {
+    operation
+        .snapshot
+        .lock()
+        .is_ok_and(|mut snapshot| reserve_history_restore_timeout(&mut snapshot))
+}
+
 #[derive(Clone)]
 struct ChatEntry {
     unix_time: u64,
@@ -1163,6 +1181,45 @@ mod send_tests {
         })
     }
 
+    fn connected_restore_test_operation(
+        state: &'static str,
+        peer: &str,
+        offer_count: usize,
+    ) -> (Arc<ChatOperation>, mpsc::Receiver<ChatCommand>) {
+        let (sender, receiver) = mpsc::channel();
+        let operation = Arc::new(ChatOperation {
+            owner_identity_id: "test-identity".to_owned(),
+            history_state_lock: Mutex::new(()),
+            snapshot: Mutex::new(ChatSnapshot {
+                phase: "connected",
+                fingerprint: None,
+                peer_id: Some(peer.to_owned()),
+                error: None,
+                storage_error: None,
+                messages: Vec::new(),
+                message_count: 0,
+                relay_ack: None,
+                pending_sends: 0,
+                identity_transition: None,
+                history_restore_in_progress: false,
+                history_restore_state: state,
+                history_restore_estimate_bytes: 8,
+                history_restore_cleanup_error: None,
+                history_restore_offer: Vec::new(),
+                history_restore_offer_count: offer_count,
+                history_restore_legacy_count: 0,
+                history_restore_received: offer_count,
+                history_restore_total: offer_count,
+                history_restore_status: None,
+                message_epoch: 0,
+            }),
+            message_reader: Mutex::new(None),
+            sender,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        (operation, receiver)
+    }
+
     #[test]
     fn restore_timeout_fails_pending_estimate_and_allows_a_fresh_request() {
         let operation = closed_test_operation("test-identity", "peer", 0, 0);
@@ -1189,7 +1246,7 @@ mod send_tests {
             snapshot.history_restore_total = 3;
             snapshot.history_restore_status = Some("estimate pending".to_owned());
         });
-        chat_update(&operation, mark_history_restore_timeout);
+        assert!(try_reserve_history_restore_timeout(&operation));
 
         let snapshot = operation.snapshot.lock().unwrap();
         assert_eq!(snapshot.history_restore_state, "failed");
@@ -1203,6 +1260,229 @@ mod send_tests {
             .unwrap()
             .contains("시간이 초과"));
         assert!(history_restore_request_allowed(&snapshot));
+    }
+
+    #[test]
+    fn restore_consent_and_timeout_are_arbitrated_before_staging_is_discarded() {
+        let _data = TestDataDirectory::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer_id = "ab".repeat(32);
+        let request_id = "cd".repeat(32);
+        let (mut existing, _, _) = history::History::open(&identity, &peer_id).unwrap();
+        let baseline = history::StoredMessage {
+            unix_time: 1,
+            sender: history::MessageSender::Me,
+            text: "existing record".to_owned(),
+            proof: None,
+        };
+        existing.append(&baseline).unwrap();
+
+        let mut stage = history::RestoreStaging::create(&identity, &peer_id, &request_id).unwrap();
+        stage
+            .append_verified(&history::StoredMessage {
+                unix_time: 2,
+                sender: history::MessageSender::Other,
+                text: "staged record".to_owned(),
+                proof: None,
+            })
+            .unwrap();
+        stage.finish().unwrap();
+
+        let (operation, command_receiver) =
+            connected_restore_test_operation("awaiting-merge-consent", &peer_id, 1);
+
+        // Model the API winning the shared snapshot mutex immediately before
+        // the worker's expired-timer check. The queued command owns the stage.
+        {
+            let mut snapshot = operation.snapshot.lock().unwrap();
+            assert_eq!(
+                reserve_history_restore_resolution(&mut snapshot, true),
+                Ok("merge-queued")
+            );
+        }
+        operation
+            .sender
+            .send(ChatCommand::ResolveHistoryRestore(true))
+            .unwrap();
+        assert!(history_restore_work_timed_out(
+            Some(Instant::now() - HISTORY_RESTORE_TIMEOUT - Duration::from_millis(1)),
+            false,
+            true,
+            Instant::now(),
+        ));
+        assert!(!try_reserve_history_restore_timeout(&operation));
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Ok(ChatCommand::ResolveHistoryRestore(true))
+        ));
+        assert_eq!(
+            operation.snapshot.lock().unwrap().history_restore_state,
+            "merge-queued"
+        );
+        assert_eq!(stage.count(), 1);
+
+        // Exercise the worker's queued merge path with the retained staging.
+        let mut current = history::History::open(&identity, &peer_id).unwrap().0;
+        let summary = current
+            .merge_restore_staging(&identity, &mut stage)
+            .unwrap();
+        stage.cleanup().unwrap();
+        assert_eq!(summary.imported_count, 1);
+        let (_, restored_messages, _) = history::History::open(&identity, &peer_id).unwrap();
+        assert_eq!(restored_messages.len(), 2);
+
+        // If the timeout reserves the state first, later consent is rejected
+        // and cleanup removes only staging, leaving the existing history intact.
+        let (timeout_first, _) =
+            connected_restore_test_operation("awaiting-merge-consent", &peer_id, 1);
+        let mut second_stage =
+            history::RestoreStaging::create(&identity, &peer_id, &"ef".repeat(32)).unwrap();
+        second_stage
+            .append_verified(&history::StoredMessage {
+                unix_time: 3,
+                sender: history::MessageSender::Other,
+                text: "must not be applied".to_owned(),
+                proof: None,
+            })
+            .unwrap();
+        second_stage.finish().unwrap();
+        let mut pending = Some(second_stage);
+        assert!(try_reserve_history_restore_timeout(&timeout_first));
+        assert!(timeout_first
+            .snapshot
+            .lock()
+            .unwrap()
+            .history_restore_status
+            .as_deref()
+            .unwrap()
+            .contains("시간이 초과"));
+        let mut snapshot = timeout_first.snapshot.lock().unwrap();
+        assert!(reserve_history_restore_resolution(&mut snapshot, true).is_err());
+        drop(snapshot);
+        discard_restore_staging(&mut pending, &timeout_first);
+        assert!(pending.is_none());
+        let (_, unchanged_messages, _) = history::History::open(&identity, &peer_id).unwrap();
+        assert_eq!(unchanged_messages.len(), 2);
+    }
+
+    #[test]
+    fn transfer_consent_and_timeout_preserve_the_winning_request_state() {
+        // Consent queued first: the worker must retain the request ID and
+        // process the command rather than timing out the accepted action.
+        let (accepted_operation, accepted_commands) =
+            connected_restore_test_operation("awaiting-transfer-consent", &"93".repeat(32), 0);
+        let request_id = Some("94".repeat(32));
+        {
+            let mut snapshot = accepted_operation.snapshot.lock().unwrap();
+            assert_eq!(
+                reserve_history_restore_resolution(&mut snapshot, true),
+                Ok("transfer-queued")
+            );
+        }
+        accepted_operation
+            .sender
+            .send(ChatCommand::ResolveHistoryRestore(true))
+            .unwrap();
+        assert!(!try_reserve_history_restore_timeout(&accepted_operation));
+        assert!(request_id.is_some());
+        assert!(matches!(
+            accepted_commands.try_recv(),
+            Ok(ChatCommand::ResolveHistoryRestore(true))
+        ));
+        assert!(request_id.is_some());
+
+        // Timeout claimed first: the request is invalidated and a later
+        // consent cannot be reported as accepted or enqueue worker work.
+        let (timed_out_operation, timed_out_commands) =
+            connected_restore_test_operation("awaiting-transfer-consent", &"93".repeat(32), 0);
+        let mut timed_out_request_id = Some("95".repeat(32));
+        assert!(history_restore_work_timed_out(
+            Some(Instant::now() - HISTORY_RESTORE_TIMEOUT - Duration::from_millis(1)),
+            true,
+            false,
+            Instant::now(),
+        ));
+        assert!(try_reserve_history_restore_timeout(&timed_out_operation));
+        timed_out_request_id.take();
+        assert!(timed_out_request_id.is_none());
+        let mut snapshot = timed_out_operation.snapshot.lock().unwrap();
+        assert!(reserve_history_restore_resolution(&mut snapshot, true).is_err());
+        drop(snapshot);
+        assert!(timed_out_commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn concurrent_merge_consent_and_timeout_keep_the_winning_transition_and_stage() {
+        use std::sync::Barrier;
+
+        let _data = TestDataDirectory::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer_id = "91".repeat(32);
+        let request_id = "92".repeat(32);
+        let mut staging =
+            history::RestoreStaging::create(&identity, &peer_id, &request_id).unwrap();
+        staging
+            .append_verified(&history::StoredMessage {
+                unix_time: 1,
+                sender: history::MessageSender::Other,
+                text: "race-owned staging".to_owned(),
+                proof: None,
+            })
+            .unwrap();
+        staging.finish().unwrap();
+
+        let (operation, command_receiver) =
+            connected_restore_test_operation("awaiting-merge-consent", &peer_id, 1);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let api_operation = Arc::clone(&operation);
+        let api_barrier = Arc::clone(&barrier);
+        let api = thread::spawn(move || {
+            api_barrier.wait();
+            let accepted = {
+                let mut snapshot = api_operation.snapshot.lock().unwrap();
+                reserve_history_restore_resolution(&mut snapshot, true).is_ok()
+            };
+            if accepted {
+                api_operation
+                    .sender
+                    .send(ChatCommand::ResolveHistoryRestore(true))
+                    .unwrap();
+            }
+            accepted
+        });
+        let timer_operation = Arc::clone(&operation);
+        let timer_barrier = Arc::clone(&barrier);
+        let timer = thread::spawn(move || {
+            timer_barrier.wait();
+            try_reserve_history_restore_timeout(&timer_operation)
+        });
+
+        barrier.wait();
+        let accepted = api.join().unwrap();
+        let timed_out = timer.join().unwrap();
+        assert_ne!(accepted, timed_out);
+        let state = operation.snapshot.lock().unwrap().history_restore_state;
+        if accepted {
+            assert_eq!(state, "merge-queued");
+            assert!(matches!(
+                command_receiver.try_recv(),
+                Ok(ChatCommand::ResolveHistoryRestore(true))
+            ));
+            assert_eq!(staging.count(), 1);
+            // The worker can still take and apply the staging after its queued
+            // command wins the same state transition race.
+            let mut current = history::History::open(&identity, &peer_id).unwrap().0;
+            let summary = current
+                .merge_restore_staging(&identity, &mut staging)
+                .unwrap();
+            staging.cleanup().unwrap();
+            assert_eq!(summary.imported_count, 1);
+        } else {
+            assert_eq!(state, "failed");
+            assert!(command_receiver.try_recv().is_err());
+            staging.cleanup().unwrap();
+        }
     }
 
     #[test]
@@ -1526,9 +1806,19 @@ mod send_tests {
         assert!(complete.contains("\"historyRestoreState\":\"completed\""));
         assert!(complete.contains("merge complete"));
         chat_update(&operation, |snapshot| {
-            snapshot.history_restore_state = "failed";
-            snapshot.history_restore_status = Some("injected merge failure".to_owned());
+            snapshot.phase = "connected";
+            snapshot.history_restore_state = "awaiting-merge-consent";
+            snapshot.history_restore_in_progress = false;
+            snapshot.history_restore_offer_count = 1;
         });
+        assert!(try_reserve_history_restore_timeout(&operation));
+        let after_timeout = call_test_api(
+            &state,
+            "/api/chat/resolve-history-restore",
+            body,
+            "test-session",
+        );
+        assert!(after_timeout.starts_with("HTTP/1.1 409 Conflict"));
         let failure = call_test_api(
             &state,
             "/api/chat/status",
@@ -1536,7 +1826,7 @@ mod send_tests {
             "test-session",
         );
         assert!(failure.contains("\"historyRestoreState\":\"failed\""));
-        assert!(failure.contains("injected merge failure"));
+        assert!(failure.contains("시간이 초과"));
     }
 
     #[test]
@@ -2800,7 +3090,8 @@ fn spawn_chat_worker(
                 restore_request_id.is_some(),
                 pending_restore.is_some(),
                 now,
-            ) {
+            ) && try_reserve_history_restore_timeout(&operation)
+            {
                 restore_started_at = None;
                 if let Some(request_id) = restore_request_id.take() {
                     let _ = session.send(&chat_control(serde_json::json!({
@@ -2811,7 +3102,6 @@ fn spawn_chat_worker(
                 }
                 restore_receiver = HistorySyncReceiver::default();
                 discard_restore_staging(&mut pending_restore, &operation);
-                chat_update(&operation, mark_history_restore_timeout);
             }
             if outgoing_sync_started_at
                 .is_some_and(|started| now.duration_since(started) > Duration::from_secs(30))
