@@ -4650,23 +4650,8 @@ fn issue_code(state: &mut State) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 fn preferences_path() -> io::Result<PathBuf> {
     Ok(history::data_directory()?.join("preferences.json"))
-}
-
-#[cfg(not(test))]
-fn preferences_path() -> io::Result<PathBuf> {
-    #[cfg(debug_assertions)]
-    if std::env::var_os("ANOTHER_DIMENSION_DATA_DIR").is_some() {
-        return Ok(history::data_directory()?.join("preferences.json"));
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory is unavailable"))?;
-    Ok(home
-        .join("Library/Application Support/Another Dimension v2")
-        .join("preferences.json"))
 }
 
 fn load_settings() -> io::Result<AppSettings> {

@@ -5539,8 +5539,7 @@ pub(crate) fn data_directory() -> io::Result<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        return home_dir()
-            .map(|home| home.join("Library/Application Support/Another Dimension v2"));
+        return Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("chat-data"));
     }
     #[cfg(target_os = "windows")]
     {
@@ -8460,6 +8459,7 @@ mod tests {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn home_dir() -> io::Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)

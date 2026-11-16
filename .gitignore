@@ -19,6 +19,7 @@ HANDOFF.md
 /docs/private/
 /private/
 /scratch/
+/chat-data/
 
 # Local credentials and environment
 .env
