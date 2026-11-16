@@ -10,7 +10,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::fs::{create_dir_all, rename, File, OpenOptions};
+use std::fs::{create_dir_all, read_dir, remove_dir, remove_file, rename, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -44,6 +44,8 @@ const BACKUP_SALT_BYTES: usize = 16;
 pub(crate) const IDENTITY_EVENT_PREFIX: &str = "[AD2-IDENTITY-EVENT/1] ";
 static INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CONVERSATION_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+static BACKUP_TRANSFER_WORKSPACES: OnceLock<Mutex<HashMap<PathBuf, Arc<BackupTransferWorkspace>>>> =
+    OnceLock::new();
 #[cfg(test)]
 pub(crate) type HistoryDeleteTestGate = Arc<(Mutex<(bool, bool)>, std::sync::Condvar)>;
 #[cfg(test)]
@@ -51,6 +53,13 @@ static HISTORY_DELETE_TEST_GATE: Mutex<Option<HistoryDeleteTestGate>> = Mutex::n
 const RESTORE_SORT_RUN_RECORDS: usize = 512;
 const RESTORE_SORT_RUN_BYTES: usize = 2 * 1024 * 1024;
 const RESTORE_MERGE_FAN_IN: usize = 16;
+
+struct BackupTransferWorkspace {
+    path: PathBuf,
+    owner_id: String,
+    _lock: File,
+    manifest_lock: Mutex<()>,
+}
 #[cfg(test)]
 thread_local! {
     static TEST_DATA_DIRECTORY: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
@@ -1846,8 +1855,7 @@ impl History {
             }
         }
         let directory = Self::backup_transfer_directory(identity)?;
-        let suffix = hex_encode(&random_nonce()?);
-        let child_path = directory.join(format!("bundle-child-{suffix}.tmp"));
+        let mut active_child_path = None;
         let result = (|| {
             let mut bundle_id = [0; 16];
             File::open("/dev/urandom")?.read_exact(&mut bundle_id)?;
@@ -1861,12 +1869,11 @@ impl History {
                 .map_err(|_| invalid_data("backup bundle authentication key unavailable"))?;
             mac.update(&header);
             for peer_id in peer_ids {
-                let mut child = OpenOptions::new()
-                    .create_new(true)
-                    .read(true)
-                    .write(true)
-                    .open(&child_path)?;
-                set_private_file(&child)?;
+                let suffix = hex_encode(&random_nonce()?);
+                let child_name = format!("bundle-child-{suffix}.tmp");
+                let child_path = directory.join(&child_name);
+                let (_, mut child) = Self::create_backup_transfer_file(identity, &child_name)?;
+                active_child_path = Some(child_path.clone());
                 Self::export_backup_stream(identity, peer_id, None, &mut child)?;
                 child.flush()?;
                 child.sync_all()?;
@@ -1886,23 +1893,93 @@ impl History {
                 }
                 drop(child);
                 std::fs::remove_file(&child_path)?;
+                active_child_path = None;
             }
             output.write_all(&mac.finalize().into_bytes())?;
             output.flush()
         })();
         if result.is_err() {
-            let _ = std::fs::remove_file(child_path);
+            if let Some(child_path) = active_child_path {
+                let _ = std::fs::remove_file(child_path);
+            }
         }
         result
     }
 
     pub(crate) fn backup_transfer_directory(identity: &Identity) -> io::Result<PathBuf> {
+        backup_transfer_workspace(identity).map(|workspace| workspace.path.clone())
+    }
+
+    pub(crate) fn create_backup_transfer_file(
+        identity: &Identity,
+        name: &str,
+    ) -> io::Result<(PathBuf, File)> {
+        if !is_backup_transfer_temp_name(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid backup transfer temporary filename",
+            ));
+        }
+        let workspace = backup_transfer_workspace(identity)?;
+        let path = workspace.path.join(name);
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        if let Err(error) = set_private_file(&file)
+            .and_then(|()| register_backup_transfer_file(&workspace, name, &file))
+        {
+            drop(file);
+            let cleanup = remove_file(&path);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(io::Error::other(format!(
+                    "backup transfer file setup failed ({error}); temporary cleanup failed ({cleanup_error})"
+                ))),
+            };
+        }
+        Ok((path, file))
+    }
+
+    /// Remove only transfer files whose owner lock proves that their process
+    /// has exited and whose exact names were recorded in its private manifest.
+    pub(crate) fn cleanup_abandoned_backup_transfers() -> io::Result<usize> {
+        let root = data_directory()?;
+        if !root.exists() {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        for identity_entry in read_dir(&root)? {
+            let identity_entry = identity_entry?;
+            if !identity_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let transfer_root = identity_entry.path().join(".backup-transfer");
+            match cleanup_stale_transfer_workspaces(&transfer_root) {
+                Ok(count) => removed += count,
+                Err(error) => eprintln!("백업 전송 임시 파일 정리 실패: {error}"),
+            }
+        }
+        Ok(removed)
+    }
+
+    pub(crate) fn backup_transfer_base_directory(identity: &Identity) -> io::Result<PathBuf> {
         let directory = data_directory()?
             .join(identity.public_id())
             .join(".backup-transfer");
         create_dir_all(&directory)?;
+        if !std::fs::symlink_metadata(&directory)?.file_type().is_dir() {
+            return Err(invalid_data(
+                "backup transfer directory is not a real directory",
+            ));
+        }
         set_private_directory(&directory)?;
         Ok(directory)
+    }
+
+    pub(crate) fn backup_transfer_workspace_id(identity: &Identity) -> io::Result<String> {
+        backup_transfer_workspace(identity).map(|workspace| workspace.owner_id.clone())
     }
 
     pub(crate) fn import_backup_file(
@@ -3030,6 +3107,350 @@ fn import_backup_bundle_stream_v2<R: Read>(
     Ok(imported)
 }
 
+fn backup_transfer_workspace(identity: &Identity) -> io::Result<Arc<BackupTransferWorkspace>> {
+    let root = History::backup_transfer_base_directory(identity)?;
+    let owners = BACKUP_TRANSFER_WORKSPACES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut owners = owners
+        .lock()
+        .map_err(|_| io::Error::other("backup transfer owner state unavailable"))?;
+    if let Some(workspace) = owners.get(&root) {
+        return Ok(Arc::clone(workspace));
+    }
+    if let Err(error) = cleanup_stale_transfer_workspaces(&root) {
+        eprintln!("백업 전송 임시 파일 정리 실패: {error}");
+    }
+    let workspace = Arc::new(create_backup_transfer_workspace(&root)?);
+    owners.insert(root, Arc::clone(&workspace));
+    Ok(workspace)
+}
+
+fn create_backup_transfer_workspace(root: &std::path::Path) -> io::Result<BackupTransferWorkspace> {
+    for _ in 0..8 {
+        let owner_id = hex_encode(&random_nonce()?);
+        let path = root.join(format!(".process-{owner_id}"));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+        if let Err(error) = set_private_directory(&path) {
+            let _ = remove_dir(&path);
+            return Err(error);
+        }
+        let lock_path = path.join("owner.lock");
+        let lock = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = remove_dir(&path);
+                return Err(error);
+            }
+        };
+        if let Err(error) = set_private_file(&lock).and_then(|()| lock_transfer_owner(&lock)) {
+            drop(lock);
+            let _ = remove_file(&lock_path);
+            let _ = remove_dir(&path);
+            return Err(error);
+        }
+        let manifest_path = path.join("manifest");
+        let mut manifest = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&manifest_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                drop(lock);
+                let _ = remove_file(&lock_path);
+                let _ = remove_dir(&path);
+                return Err(error);
+            }
+        };
+        if let Err(error) = set_private_file(&manifest) {
+            drop(manifest);
+            drop(lock);
+            let _ = remove_file(&manifest_path);
+            let _ = remove_file(&lock_path);
+            let _ = remove_dir(&path);
+            return Err(error);
+        }
+        if let Err(error) = manifest
+            .write_all(b"ADBT1\n")
+            .and_then(|()| manifest.sync_all())
+        {
+            drop(manifest);
+            drop(lock);
+            let _ = remove_file(&manifest_path);
+            let _ = remove_file(&lock_path);
+            let _ = remove_dir(&path);
+            return Err(error);
+        }
+        return Ok(BackupTransferWorkspace {
+            path,
+            owner_id,
+            _lock: lock,
+            manifest_lock: Mutex::new(()),
+        });
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate backup transfer owner directory",
+    ))
+}
+
+fn register_backup_transfer_file(
+    workspace: &BackupTransferWorkspace,
+    name: &str,
+    file: &File,
+) -> io::Result<()> {
+    if !is_backup_transfer_temp_name(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid backup transfer temporary filename",
+        ));
+    }
+    let _guard = workspace
+        .manifest_lock
+        .lock()
+        .map_err(|_| io::Error::other("backup transfer manifest unavailable"))?;
+    let manifest_path = workspace.path.join("manifest");
+    let mut manifest = open_manifest_append_nofollow(&manifest_path)?;
+    ensure_single_link_owned_file(&manifest)?;
+    let (device, inode) = backup_transfer_file_identity(&file.metadata()?)?;
+    let line = format!("{name}\t{device}\t{inode}\n");
+    manifest.write_all(line.as_bytes())?;
+    manifest.sync_all()
+}
+
+fn cleanup_stale_transfer_workspaces(root: &std::path::Path) -> io::Result<usize> {
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(invalid_data(
+            "backup transfer directory is not a real directory",
+        ));
+    }
+    let mut removed = 0;
+    for entry in read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(owner_id) = name.strip_prefix(".process-") else {
+            continue;
+        };
+        if !is_hex_string(owner_id, NONCE_BYTES * 2) || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        match cleanup_stale_transfer_workspace(&entry.path()) {
+            Ok(true) => removed += 1,
+            Ok(false) => {}
+            Err(error) => eprintln!("백업 전송 임시 파일 정리 실패: {error}"),
+        }
+    }
+    Ok(removed)
+}
+
+fn cleanup_stale_transfer_workspace(path: &std::path::Path) -> io::Result<bool> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Ok(false);
+    }
+    let lock_path = path.join("owner.lock");
+    let lock_metadata = match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !lock_metadata.file_type().is_file() {
+        return Ok(false);
+    }
+    let lock = match open_nofollow(&lock_path, true) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    ensure_single_link_owned_file(&lock)?;
+    if !try_lock_transfer_owner(&lock)? {
+        return Ok(false);
+    }
+
+    let manifest_path = path.join("manifest");
+    let mut manifest = match open_nofollow(&manifest_path, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    ensure_single_link_owned_file(&manifest)?;
+    let mut contents = String::new();
+    manifest.read_to_string(&mut contents)?;
+    let mut lines = contents.lines();
+    if lines.next() != Some("ADBT1") {
+        return Err(invalid_data("invalid backup transfer ownership manifest"));
+    }
+    let mut entries = HashMap::new();
+    for line in lines {
+        let mut fields = line.split('\t');
+        let (Some(name), Some(device), Some(inode), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(invalid_data("invalid backup transfer ownership manifest"));
+        };
+        if !is_backup_transfer_temp_name(name) {
+            return Err(invalid_data("invalid backup transfer ownership manifest"));
+        }
+        let (Ok(device), Ok(inode)) = (device.parse::<u64>(), inode.parse::<u64>()) else {
+            return Err(invalid_data("invalid backup transfer ownership manifest"));
+        };
+        if entries.insert(name.to_owned(), (device, inode)).is_some() {
+            return Err(invalid_data("duplicate backup transfer manifest entry"));
+        }
+    }
+    let mut owned_files = Vec::new();
+    for (name, expected_identity) in entries {
+        let file_path = path.join(name);
+        let file_metadata = match std::fs::symlink_metadata(&file_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !file_metadata.file_type().is_file() || !is_single_link_owned_metadata(&file_metadata) {
+            return Err(invalid_data(
+                "backup transfer file ownership could not be verified",
+            ));
+        }
+        if backup_transfer_file_identity(&file_metadata)? != expected_identity {
+            return Err(invalid_data(
+                "backup transfer file identity does not match its manifest",
+            ));
+        }
+        owned_files.push(file_path);
+    }
+    for file_path in owned_files {
+        remove_file(file_path)?;
+    }
+    remove_file(&lock_path)?;
+    drop(manifest);
+    remove_file(&manifest_path)?;
+    if read_dir(path)?.next().is_none() {
+        remove_dir(path)?;
+    }
+    Ok(true)
+}
+
+fn is_backup_transfer_temp_name(name: &str) -> bool {
+    if let Some(id) = name.strip_suffix(".backup") {
+        return is_hex_string(id, 64);
+    }
+    ["bundle-child-", "bundle-import-child-"]
+        .iter()
+        .any(|prefix| {
+            name.strip_prefix(prefix)
+                .and_then(|suffix| suffix.strip_suffix(".tmp"))
+                .is_some_and(|id| is_hex_string(id, NONCE_BYTES * 2))
+        })
+}
+
+fn is_hex_string(value: &str, length: usize) -> bool {
+    value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn open_nofollow(path: &std::path::Path, read_write: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(read_write);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn open_manifest_append_nofollow(path: &std::path::Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn ensure_single_link_owned_file(file: &File) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !is_single_link_owned_metadata(&metadata) {
+        return Err(invalid_data(
+            "backup transfer file ownership could not be verified",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn backup_transfer_file_identity(metadata: &std::fs::Metadata) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn backup_transfer_file_identity(_metadata: &std::fs::Metadata) -> io::Result<(u64, u64)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "backup transfer cleanup ownership checks require Unix file identities",
+    ))
+}
+
+#[cfg(unix)]
+fn is_single_link_owned_metadata(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.file_type().is_file()
+        && metadata.nlink() == 1
+        && metadata.uid() == unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn is_single_link_owned_metadata(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_file()
+}
+
+fn lock_transfer_owner(file: &File) -> io::Result<()> {
+    if try_lock_transfer_owner(file)? {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "backup transfer owner lock is already held",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_transfer_owner(file: &File) -> io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_transfer_owner(_file: &File) -> io::Result<bool> {
+    Ok(false)
+}
+
 fn partial_bundle_error(applied: usize, error: io::Error) -> io::Error {
     if applied == 0 {
         error
@@ -3080,18 +3501,12 @@ fn import_backup_bundle_stream<R: Read>(
             if length < 8 + 1 + 16 + 1 + NONCE_BYTES as u64 + 4 + 8 + 32 + 16 {
                 return Err(invalid_data("truncated backup bundle child"));
             }
-            let child_path = directory.join(format!(
-                "bundle-import-child-{}.tmp",
-                hex_encode(&random_nonce()?)
-            ));
+            let child_name = format!("bundle-import-child-{}.tmp", hex_encode(&random_nonce()?));
+            let child_path = directory.join(&child_name);
             let child_result = (|| {
-                let mut child_file = OpenOptions::new()
-                    .create_new(true)
-                    .read(true)
-                    .write(true)
-                    .open(&child_path)?;
+                let (_, mut child_file) =
+                    History::create_backup_transfer_file(identity, &child_name)?;
                 staged_children.push(child_path.clone());
-                set_private_file(&child_file)?;
                 let mut remaining = length;
                 let mut buffer = [0; 64 * 1024];
                 while remaining > 0 {
@@ -5173,15 +5588,17 @@ fn wait_history_delete_test_gate() {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_peer_id, History, MessageSender, RestoreStaging, StoredMessage,
-        MAX_LEGACY_BACKUP_BYTES, MAX_MESSAGE_BYTES,
+        backup_transfer_file_identity, cleanup_stale_transfer_workspace,
+        cleanup_stale_transfer_workspaces, decode_peer_id, lock_transfer_owner,
+        set_private_directory, set_private_file, History, MessageSender, RestoreStaging,
+        StoredMessage, MAX_LEGACY_BACKUP_BYTES, MAX_MESSAGE_BYTES, NONCE_BYTES,
     };
     use crate::identity::Identity;
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
     use std::collections::HashSet;
     use std::fs::OpenOptions;
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::{self, Read, Seek, SeekFrom, Write};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -5217,6 +5634,137 @@ mod tests {
             text: text.to_owned(),
             proof: None,
         }
+    }
+
+    #[test]
+    fn backup_transfer_cleanup_only_removes_manifested_files_from_unlocked_workspaces() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let active_workspace = History::backup_transfer_directory(&identity).unwrap();
+        let active_name = format!("{}.backup", "b".repeat(64));
+        let (active_path, mut active_file) =
+            History::create_backup_transfer_file(&identity, &active_name).unwrap();
+        active_file.write_all(b"active app transfer").unwrap();
+        drop(active_file);
+        let active_child_names = [
+            format!("bundle-child-{}.tmp", "3".repeat(NONCE_BYTES * 2)),
+            format!("bundle-import-child-{}.tmp", "4".repeat(NONCE_BYTES * 2)),
+        ];
+        for name in &active_child_names {
+            let (_, file) = History::create_backup_transfer_file(&identity, name).unwrap();
+            drop(file);
+        }
+        let active_manifest = std::fs::read_to_string(active_workspace.join("manifest")).unwrap();
+        assert!(active_child_names.iter().all(|name| active_manifest
+            .lines()
+            .any(|line| line.starts_with(&format!("{name}\t")))));
+
+        let transfer_root = active_workspace.parent().unwrap().to_path_buf();
+        let legacy_name = format!("{}.backup", "c".repeat(64));
+        let legacy_path = transfer_root.join(&legacy_name);
+        std::fs::write(&legacy_path, b"unowned legacy transfer").unwrap();
+        let user_backup = transfer_root.join("user-original.backup");
+        std::fs::write(&user_backup, b"user original backup").unwrap();
+
+        let stale_id = "a".repeat(NONCE_BYTES * 2);
+        let stale_workspace = transfer_root.join(format!(".process-{stale_id}"));
+        std::fs::create_dir(&stale_workspace).unwrap();
+        set_private_directory(&stale_workspace).unwrap();
+        let lock_path = stale_workspace.join("owner.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap();
+        set_private_file(&lock).unwrap();
+        lock_transfer_owner(&lock).unwrap();
+
+        let names = [
+            format!("{}.backup", "d".repeat(64)),
+            format!("bundle-child-{}.tmp", "e".repeat(NONCE_BYTES * 2)),
+            format!("bundle-import-child-{}.tmp", "f".repeat(NONCE_BYTES * 2)),
+        ];
+        let manifest_path = stale_workspace.join("manifest");
+        let mut manifest = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&manifest_path)
+            .unwrap();
+        set_private_file(&manifest).unwrap();
+        manifest.write_all(b"ADBT1\n").unwrap();
+        let mut stale_paths = Vec::new();
+        for name in &names {
+            let file_path = stale_workspace.join(name);
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&file_path)
+                .unwrap();
+            set_private_file(&file).unwrap();
+            let (device, inode) = backup_transfer_file_identity(&file.metadata().unwrap()).unwrap();
+            writeln!(manifest, "{name}\t{device}\t{inode}").unwrap();
+            stale_paths.push(file_path);
+        }
+        let unregistered_user_file = stale_workspace.join("keep-this.txt");
+        std::fs::write(&unregistered_user_file, b"not in manifest").unwrap();
+        drop(manifest);
+        drop(lock);
+
+        assert_eq!(
+            cleanup_stale_transfer_workspaces(&transfer_root).unwrap(),
+            1
+        );
+        assert!(stale_paths.iter().all(|path| !path.exists()));
+        assert!(!stale_workspace.join("owner.lock").exists());
+        assert!(unregistered_user_file.exists());
+        assert!(stale_workspace.exists());
+        assert!(active_path.exists());
+        assert!(active_workspace.join("owner.lock").exists());
+        assert!(legacy_path.exists());
+        assert!(user_backup.exists());
+    }
+
+    #[test]
+    fn backup_transfer_cleanup_retains_files_when_manifest_cannot_prove_ownership() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let active_workspace = History::backup_transfer_directory(&identity).unwrap();
+        let transfer_root = active_workspace.parent().unwrap();
+        let stale_workspace =
+            transfer_root.join(format!(".process-{}", "1".repeat(NONCE_BYTES * 2)));
+        std::fs::create_dir(&stale_workspace).unwrap();
+        set_private_directory(&stale_workspace).unwrap();
+        let lock_path = stale_workspace.join("owner.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .unwrap();
+        set_private_file(&lock).unwrap();
+        lock_transfer_owner(&lock).unwrap();
+        let temp_name = format!("{}.backup", "2".repeat(64));
+        let temp_path = stale_workspace.join(&temp_name);
+        std::fs::write(&temp_path, b"retain if ownership is unclear").unwrap();
+        let manifest_path = stale_workspace.join("manifest");
+        let mut manifest = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&manifest_path)
+            .unwrap();
+        set_private_file(&manifest).unwrap();
+        writeln!(manifest, "ADBT1").unwrap();
+        writeln!(manifest, "{temp_name}\t0\t0").unwrap();
+        writeln!(manifest, "../user-original.backup\t0\t0").unwrap();
+        drop(manifest);
+        drop(lock);
+
+        let error = cleanup_stale_transfer_workspace(&stale_workspace).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(temp_path.exists());
+        assert!(lock_path.exists());
+        assert!(manifest_path.exists());
     }
 
     fn encode_v6_fixture(

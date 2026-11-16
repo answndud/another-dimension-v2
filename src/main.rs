@@ -901,6 +901,18 @@ mod send_tests {
         let upload: serde_json::Value =
             serde_json::from_str(upload.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         let upload_id = upload["transferId"].as_str().unwrap();
+        let transfer_workspace = history::History::backup_transfer_directory(
+            state.lock().unwrap().identity.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert!(transfer_workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".process-")));
+        let manifest = std::fs::read_to_string(transfer_workspace.join("manifest")).unwrap();
+        assert!(manifest
+            .lines()
+            .any(|line| line.starts_with(&format!("{upload_id}.backup\t"))));
         let written = call_test_api(
             &state,
             "/api/history/backup-transfer",
@@ -5995,8 +6007,23 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             Ok(path) => path,
             Err(_) => return reject(&mut stream, "500 Internal Server Error"),
         };
+        let transfer_owner = match history::History::backup_transfer_workspace_id(identity) {
+            Ok(owner) => owner,
+            Err(_) => return reject(&mut stream, "500 Internal Server Error"),
+        };
+        let new_transfer_id = || -> io::Result<String> {
+            let entropy = random_token()?;
+            Ok(format!(
+                "{}{}",
+                transfer_owner,
+                &entropy[..64 - transfer_owner.len()]
+            ))
+        };
         let get_transfer_path = |id: &str| -> Option<PathBuf> {
-            if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            if id.len() != 64
+                || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || !id.to_ascii_lowercase().starts_with(&transfer_owner)
+            {
                 return None;
             }
             Some(transfer_dir.join(format!("{}.backup", id.to_ascii_lowercase())))
@@ -6051,19 +6078,20 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 {
                     return reject(&mut stream, "409 Conflict");
                 }
-                let id = match random_token() {
+                let id = match new_transfer_id() {
                     Ok(id) => id,
                     Err(_) => return reject(&mut stream, "500 Internal Server Error"),
                 };
                 let Some(path) = get_transfer_path(&id) else {
                     return reject(&mut stream, "400 Bad Request");
                 };
+                let mut created = false;
                 let result = (|| -> io::Result<()> {
-                    let mut file = OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&path)?;
-                    set_private_file(&file)?;
+                    let (_, mut file) = history::History::create_backup_transfer_file(
+                        identity,
+                        &format!("{id}.backup"),
+                    )?;
+                    created = true;
                     if action == "export" {
                         history::History::export_backup_stream(
                             identity,
@@ -6081,7 +6109,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                     Ok(())
                 })();
                 if let Err(error) = result {
-                    let _ = std::fs::remove_file(&path);
+                    if created {
+                        let _ = std::fs::remove_file(&path);
+                    }
                     let status = if error.kind() == io::ErrorKind::InvalidInput {
                         "400 Bad Request"
                     } else {
@@ -6107,21 +6137,17 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 if !fields.is_empty() {
                     return reject(&mut stream, "400 Bad Request");
                 }
-                let id = match random_token() {
+                let id = match new_transfer_id() {
                     Ok(id) => id,
                     Err(_) => return reject(&mut stream, "500 Internal Server Error"),
                 };
-                let Some(path) = get_transfer_path(&id) else {
-                    return reject(&mut stream, "400 Bad Request");
-                };
-                let file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+                let (_, _file) = match history::History::create_backup_transfer_file(
+                    identity,
+                    &format!("{id}.backup"),
+                ) {
                     Ok(file) => file,
                     Err(_) => return reject(&mut stream, "500 Internal Server Error"),
                 };
-                if set_private_file(&file).is_err() {
-                    let _ = std::fs::remove_file(path);
-                    return reject(&mut stream, "500 Internal Server Error");
-                }
                 return response_json(&mut stream, serde_json::json!({"transferId": id}));
             }
             "upload-chunk" => {
@@ -6321,31 +6347,20 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 let Some(source_path) = get_transfer_path(&id) else {
                     return reject(&mut stream, "400 Bad Request");
                 };
-                let output_id = match random_token() {
+                let output_id = match new_transfer_id() {
                     Ok(id) => id,
                     Err(_) => return reject(&mut stream, "500 Internal Server Error"),
                 };
                 let Some(output_path) = get_transfer_path(&output_id) else {
                     return reject(&mut stream, "400 Bad Request");
                 };
-                let mut output = match OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&output_path)
-                {
+                let (_, mut output) = match history::History::create_backup_transfer_file(
+                    identity,
+                    &format!("{output_id}.backup"),
+                ) {
                     Ok(file) => file,
                     Err(_) => return reject(&mut stream, "500 Internal Server Error"),
                 };
-                if let Err(error) = set_private_file(&output) {
-                    drop(output);
-                    let _ = std::fs::remove_file(&output_path);
-                    return respond(
-                        &mut stream,
-                        "500 Internal Server Error",
-                        "text/plain; charset=utf-8",
-                        error.to_string().as_bytes(),
-                    );
-                }
                 let result = history::History::reprotect_backup_file(
                     &previous_identity,
                     identity,
@@ -6478,6 +6493,13 @@ fn main() -> io::Result<()> {
             io::ErrorKind::InvalidInput,
             "실행 옵션은 지원하지 않습니다. 연결 모드는 앱 설정에서 선택하세요.",
         ));
+    }
+    match history::History::cleanup_abandoned_backup_transfers() {
+        Ok(removed) if removed > 0 => {
+            eprintln!("이전 실행의 백업 전송 임시 파일 {removed}개 작업 공간을 정리했습니다.")
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("백업 전송 임시 파일 정리 실패: {error}"),
     }
     let settings = load_settings()?;
     let tor_socks = settings.tor_socks;
