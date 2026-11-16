@@ -705,6 +705,46 @@ test('bundle export success and failure are announced inside the open history di
   }
 });
 
+test('opening history refreshes records created after the last list load and preserves pending notices', async () => {
+  const h = createHarness();
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  const initial = h.evaluate('refreshHistoryList()');
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/history/list').resolve(response('[]'));
+  await initial;
+  assert.match(h.element('#history-list').children[0].textContent, /저장된 대화가 없습니다/);
+
+  // Model a conversation being written after the login-time empty list.
+  h.evaluate("pendingManagementHistoryNotices.push({ identityId: 'identity-A', text: '복원이 완료됐습니다.', refreshList: false })");
+  await h.click('#menu-open-history');
+  const reopened = await waitForRequest(() => h.requests.filter(item => item.path === '/api/history/list').at(-1));
+  assert.match(h.element('#management-history-status').textContent, /복원이 완료됐습니다/);
+  reopened.resolve(response(JSON.stringify([historySummary('peer-created-during-chat')])));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(h.element('#history-list').children.length, 1);
+  assert.equal(h.element('#history-list').children[0].children[1].dataset.peerId, 'peer-created-during-chat');
+  assert.match(h.element('#management-history-status').textContent, /복원이 완료됐습니다/);
+});
+
+test('a history list response from the prior identity cannot replace the newly opened identity list', async () => {
+  const h = createHarness();
+  h.evaluate("identityId.textContent = 'identity-A'; token = 'session-A'");
+  await h.click('#menu-open-history');
+  const requestA = await waitForRequest(() => h.requests.filter(item => item.path === '/api/history/list').at(-1));
+
+  h.evaluate("identitySessionGeneration += 1; identityId.textContent = 'identity-B'; token = 'session-B'");
+  await h.click('#menu-open-history');
+  const requestB = await waitForRequest(() => h.requests.filter(item => item.path === '/api/history/list').at(-1));
+  requestB.resolve(response(JSON.stringify([historySummary('peer-identity-B')])));
+  await new Promise((resolve) => setImmediate(resolve));
+  requestA.resolve(response(JSON.stringify([historySummary('peer-identity-A')])));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(h.element('#history-list').children.length, 1);
+  assert.equal(h.element('#history-list').children[0].children[1].dataset.peerId, 'peer-identity-B');
+});
+
 test('opening a conversation reports HTTP and network errors inside the history dialog', async () => {
   for (const [status, reject, expected] of [
     [500, false, /대화 기록을 열지 못했습니다/],

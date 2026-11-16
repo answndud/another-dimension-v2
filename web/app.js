@@ -214,9 +214,9 @@ function openManagementView(view, title) {
     pendingManagementHistoryNotices = pendingManagementHistoryNotices.filter(notice => notice.identityId !== identity);
     if (notices.length) {
       setManagementHistoryStatus(notices.map(notice => notice.text).join(' · '));
-      if (notices.some(notice => notice.refreshList)) refreshHistoryList();
     }
   }
+  if (view === 'history') refreshHistoryList();
 }
 
 document.querySelector('#menu-open-settings').addEventListener('click', () => openManagementView('settings', '연결 설정'));
