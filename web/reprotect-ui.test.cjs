@@ -1068,6 +1068,7 @@ test('backup import result stays visible without hover or focus', () => {
 test('backup import keeps a general server failure detail in the result region', async () => {
   const detail = 'backup authentication failed: invalid password';
   const h = createHarness({ importFailure: detail });
+  h.evaluate("selectedHistoryPeer = '89'.repeat(32)");
   h.element('#history-backup-file').files = [file('backup.adbak', 'ADBACK7\0payload')];
   h.window.confirm = () => true;
   const task = h.click('#history-backup-import');
@@ -1076,6 +1077,7 @@ test('backup import keeps a general server failure detail in the result region',
   assert.equal(h.element('#history-backup-import-result').dataset.result, 'failure');
   assert.match(h.element('#history-backup-import-result').textContent, /백업 가져오기 실패/);
   assert.ok(h.element('#history-backup-import-result').textContent.includes(detail));
+  assert.doesNotMatch(h.element('#history-backup-import-result').textContent, /대화 898989898989/);
 });
 
 test('legacy streaming backup formats warn about their integrity and privacy limits', async () => {
@@ -1107,13 +1109,14 @@ test('backup import presents the server-reported partial bundle count', async ()
     peerId: 'cd'.repeat(32), messageCount: 3, lastMessage: 1234, verified: true,
   }])));
   await task;
-  assert.equal(h.element('#message').textContent, `${detail} 기록 목록을 새로고침해 적용된 대화를 확인하고, 원본 백업 파일은 보관하세요. 미적용 대화만 선택해 재시도하는 기능은 없습니다.`);
+  assert.equal(h.element('#message').textContent, `${detail} 적용된 대화 ID는 오류 응답에 없어 특정할 수 없습니다. 기록 목록을 새로고침해 적용된 대화를 확인하고, 원본 백업 파일은 보관하세요. 미적용 대화만 선택해 재시도하는 기능은 없습니다.`);
   assert.match(h.element('#history-backup-import-result').textContent, /^백업 가져오기 실패/);
   assert.equal(h.element('#history-backup-import-result').dataset.result, 'failure');
   assert.equal(h.element('#history-backup-import-result').hidden, false);
   assert.ok(h.element('#history-backup-import-result').textContent.includes(detail));
   assert.match(h.element('#history-backup-import-result').textContent, /기록 목록을 새로고침해 적용된 대화를 확인/);
   assert.match(h.element('#history-backup-import-result').textContent, /원본 백업 파일은 보관/);
+  assert.match(h.element('#history-backup-import-result').textContent, /적용된 대화 ID는 오류 응답에 없어 특정할 수 없습니다/);
   assert.equal(h.element('#history-list').children.length, 1);
   assert.equal(h.element('#history-list').children[0].children[1].children[0].textContent, '대화 cdcdcdcdcdcd');
   assert.equal(h.element('#history-backup-file').files[0], original);
@@ -1160,10 +1163,11 @@ test('completed import with upload cleanup failure refreshes the list and explai
   assert.equal(h.element('#history-backup-import-result').dataset.result, 'cleanup-warning');
   assert.match(h.element('#history-backup-import-result').textContent, /^가져오기 완료 · 임시 파일 정리 실패/);
   assert.ok(h.element('#history-backup-import-result').textContent.includes(detail));
-  assert.match(h.element('#history-backup-import-result').textContent, /기록 목록에서 확인/);
+  assert.match(h.element('#history-backup-import-result').textContent, /기록 목록에서 가져온 대화를 확인하세요/);
+  assert.match(h.element('#history-backup-import-result').textContent, /적용된 대화 ID는 응답에 없어 특정할 수 없습니다/);
   assert.match(h.element('#history-backup-import-result').textContent, /README의 수동 정리 안내/);
   assert.match(h.element('#message').textContent, /backup import completed but temporary upload cleanup failed/);
-  assert.match(h.element('#message').textContent, /기록 목록에서 확인/);
+  assert.match(h.element('#message').textContent, /기록 목록에서 가져온 대화를 확인하세요/);
   assert.match(h.element('#message').textContent, /앱을 모두 종료한 뒤 README의 수동 정리 안내/);
   assert.equal(h.element('#history-list').children[0].children[1].children[0].textContent, '대화 121212121212');
   assert.equal(h.element('#history-backup-file').files[0], original);
@@ -1184,10 +1188,10 @@ test('backup import distinguishes an unconfirmed server result from pre-request 
       await task;
       assert.equal(h.element('#history-backup-import-result').dataset.result, 'unknown');
       assert.match(h.element('#history-backup-import-result').textContent, /가져오기 결과 확인 필요/);
-      assert.match(h.element('#history-backup-import-result').textContent, /가져오기 요청을 보낸 뒤 결과를 확인하지 못했습니다/);
+      assert.match(h.element('#history-backup-import-result').textContent, /가져오기 요청을 보낸 뒤 결과와 적용 대상 대화를 확인하지 못했습니다/);
       assert.match(h.element('#history-backup-import-result').textContent, /기록 목록을 새로고침해 적용 여부를 확인/);
       assert.match(h.element('#history-backup-import-result').textContent, /원본 백업 파일은 보관/);
-      assert.match(h.element('#message').textContent, /가져오기 요청을 보낸 뒤 결과를 확인하지 못했습니다/);
+      assert.match(h.element('#message').textContent, /가져오기 요청을 보낸 뒤 결과와 적용 대상 대화를 확인하지 못했습니다/);
       assert.match(h.element('#message').textContent, /기록 목록을 새로고침해 적용 여부를 확인/);
       assert.match(h.element('#message').textContent, /원본 백업 파일은 보관/);
       assert.doesNotMatch(h.element('#message').textContent, /기존 기록과 선택한 원본 파일은 보존됩니다/);
@@ -1471,14 +1475,18 @@ test('superseded upload cleanup uses the session that created its transfer', asy
 });
 
 test('backup import exposes success on the import control after a successful response', async () => {
-  const h = createHarness({ importResult: JSON.stringify({ conversations: [] }) });
+  const h = createHarness({ importResult: JSON.stringify({ conversations: [
+    { peerId: 'ab'.repeat(32), messageCount: 2, linkedIdentityRestored: false },
+    { peerId: 'cd'.repeat(32), messageCount: 3, linkedIdentityRestored: false },
+  ] }) });
   h.element('#history-backup-file').files = [file('backup.adbak', 'ADBACK4\0payload')];
   const task = h.click('#history-backup-import');
   await new Promise((resolve) => setImmediate(resolve));
   h.requestFor('/api/history/list').resolve(response('[]'));
   await task;
   assert.match(h.element('#history-backup-import-result').textContent, /백업 가져오기 성공/);
-  assert.match(h.element('#history-backup-import-result').textContent, /0개 대화 백업을 기존 기록과 병합했습니다/);
+  assert.match(h.element('#history-backup-import-result').textContent, /대화 묶음 전체 백업 2개를 기존 기록과 병합했습니다/);
+  assert.match(h.element('#history-backup-import-result').textContent, /특정 대화가 아닌 묶음 전체에 대한 결과/);
   assert.equal(h.element('#history-backup-import-result').dataset.result, 'success');
   assert.equal(h.element('#history-backup-import-result').hidden, false);
 });
@@ -1496,6 +1504,54 @@ test('single-backup import leaves its success result visible in the management d
   assert.equal(h.element('#management-dialog').open, true);
   assert.equal(h.element('#history-detail').hidden, true);
   assert.match(h.element('#history-backup-import-result').textContent, /기존 기록과 병합했습니다/);
+  assert.match(h.element('#history-backup-import-result').textContent, /가져온 대상: 대화 abababababab/);
+});
+
+test('single-backup result keeps its server target after opening another conversation', async () => {
+  const peerA = 'ab'.repeat(32);
+  const peerB = 'cd'.repeat(32);
+  const h = createHarness({ importResult: JSON.stringify({ peerId: peerA, linkedIdentityRestored: false }) });
+  const openA = h.evaluate(`openHistory('${peerA}')`);
+  h.requestFor('/api/history/messages').resolve(response(JSON.stringify({ messages: [], version: 1, nextCursor: null })));
+  await openA;
+  h.element('#history-backup-file').files = [file('backup.adbak', 'ADBACK7\0payload')];
+  h.window.confirm = () => true;
+  const importing = h.click('#history-backup-import');
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/history/list').resolve(response('[]'));
+  await importing;
+
+  const openB = h.evaluate(`openHistory('${peerB}')`);
+  h.requestFor('/api/history/messages').resolve(response(JSON.stringify({ messages: [], version: 1, nextCursor: null })));
+  await openB;
+  const text = h.element('#history-backup-import-result').textContent;
+  assert.match(text, /가져온 대상: 대화 abababababab/);
+  assert.doesNotMatch(text, /가져온 대상: 대화 cdcdcdcdcdcd/);
+});
+
+test('late single-backup success after navigating A to B reports the server target, not B', async () => {
+  const peerA = 'ef'.repeat(32);
+  const peerB = '12'.repeat(32);
+  const h = createHarness({ manualImport: true });
+  const openA = h.evaluate(`openHistory('${peerA}')`);
+  h.requestFor('/api/history/messages').resolve(response(JSON.stringify({ messages: [], version: 1, nextCursor: null })));
+  await openA;
+  h.element('#history-backup-file').files = [file('backup.adbak', 'ADBACK7\0payload')];
+  h.window.confirm = () => true;
+  const importing = h.click('#history-backup-import');
+  const importRequest = await waitForRequest(() => h.requestForAction('import'));
+
+  const openB = h.evaluate(`openHistory('${peerB}')`);
+  h.requestFor('/api/history/messages').resolve(response(JSON.stringify({ messages: [], version: 1, nextCursor: null })));
+  await openB;
+
+  importRequest.resolve(response(JSON.stringify({ peerId: peerA, linkedIdentityRestored: false })));
+  await new Promise((resolve) => setImmediate(resolve));
+  h.requestFor('/api/history/list').resolve(response('[]'));
+  await importing;
+  const text = h.element('#history-backup-import-result').textContent;
+  assert.match(text, /가져온 대상: 대화 efefefefefef/);
+  assert.doesNotMatch(text, /가져온 대상: 대화 121212121212/);
 });
 
 function createOutputHandle() {
