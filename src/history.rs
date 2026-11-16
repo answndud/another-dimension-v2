@@ -2536,6 +2536,7 @@ pub(crate) fn copy_linked_keys_to(
     write_linked_keys(replacement, peer_id, &links)
 }
 
+#[cfg(test)]
 fn encode_backup(
     identity: &Identity,
     peer_id: &str,

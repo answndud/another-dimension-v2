@@ -1,0 +1,29 @@
+[package]
+name = "another-dimension-v2"
+version = "0.1.0"
+edition = "2021"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
+
+[dependencies]
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc"] }
+base64 = "=0.22.1"
+chacha20poly1305 = { version = "=0.10.1", features = ["std"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "zeroize"] }
+hkdf = "=0.12.4"
+hmac = "=0.12.1"
+libc = "=0.2.191"
+nostr = { version = "=0.45.7", default-features = false, features = ["std", "os-rng"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
+serde_json = "=1.0.154"
+sha2 = "=0.10.9"
+socks = "=0.3.4"
+snow = { version = "=0.10.0", default-features = false, features = ["default-resolver", "use-blake2", "use-chacha20poly1305", "use-curve25519", "use-getrandom"] }
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake", "url", "rustls-tls-native-roots"] }
+zeroize = { version = "=1.9.0", features = ["alloc"] }

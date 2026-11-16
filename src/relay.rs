@@ -888,7 +888,6 @@ impl RelayRendezvous {
     }
 
     fn wait_for_peer_subscription(&mut self) -> Result<(), RelayError> {
-        let deadline = Instant::now() + self.timeout;
         let mut last_request = None;
         let mut pending_nonces = BTreeSet::new();
         loop {
@@ -898,9 +897,6 @@ impl RelayRendezvous {
                 .is_some_and(|token| token.load(Ordering::SeqCst))
             {
                 return Err(RelayError::Cancelled);
-            }
-            if Instant::now() >= deadline {
-                return Err(RelayError::TimedOut("peer subscription"));
             }
 
             if self.role == Role::Initiator
@@ -1412,7 +1408,7 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
@@ -2259,12 +2255,17 @@ mod tests {
     }
 
     #[test]
-    fn multi_relay_rendezvous_times_out_when_the_participants_share_no_relay() {
+    fn rendezvous_waits_for_peer_subscription_until_cancelled() {
         let network = FakeRelayNetwork::default();
         let invite = InviteCode::generate().unwrap();
         let invite_code = invite.code().to_owned();
+        let left_cancelled = Arc::new(AtomicBool::new(false));
+        let right_cancelled = Arc::new(AtomicBool::new(false));
+        let (result_sender, result_receiver) = mpsc::channel();
         let left_network = network.clone();
         let left_code = invite_code.clone();
+        let left_token = Arc::clone(&left_cancelled);
+        let left_result = result_sender.clone();
         let left = thread::spawn(move || {
             let invite = InviteCode::parse(&left_code).unwrap();
             let mut rendezvous = RelayRendezvous::connect_with(
@@ -2274,10 +2275,13 @@ mod tests {
                 |endpoint| left_network.open(endpoint),
             )
             .unwrap();
-            rendezvous.timeout = Duration::from_millis(120);
-            rendezvous.complete_handshake()
+            rendezvous.set_cancellation_token(left_token);
+            let result = rendezvous.complete_handshake().map(|_| ());
+            left_result.send(result).unwrap();
         });
         let right_network = network.clone();
+        let right_token = Arc::clone(&right_cancelled);
+        let right_result = result_sender;
         let right = thread::spawn(move || {
             let invite = InviteCode::parse(&invite_code).unwrap();
             let mut rendezvous = RelayRendezvous::connect_with(
@@ -2287,17 +2291,26 @@ mod tests {
                 |endpoint| right_network.open(endpoint),
             )
             .unwrap();
-            rendezvous.timeout = Duration::from_millis(120);
-            rendezvous.complete_handshake()
+            rendezvous.set_cancellation_token(right_token);
+            let result = rendezvous.complete_handshake().map(|_| ());
+            right_result.send(result).unwrap();
         });
         assert!(matches!(
-            left.join().unwrap(),
-            Err(RelayError::TimedOut("peer subscription"))
+            result_receiver.recv_timeout(Duration::from_millis(250)),
+            Err(mpsc::RecvTimeoutError::Timeout)
         ));
-        assert!(matches!(
-            right.join().unwrap(),
-            Err(RelayError::TimedOut("peer subscription"))
-        ));
+        left_cancelled.store(true, Ordering::SeqCst);
+        right_cancelled.store(true, Ordering::SeqCst);
+        let first = result_receiver
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        let second = result_receiver
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        assert!(matches!(first, Err(RelayError::Cancelled)));
+        assert!(matches!(second, Err(RelayError::Cancelled)));
+        left.join().unwrap();
+        right.join().unwrap();
     }
 
     #[test]

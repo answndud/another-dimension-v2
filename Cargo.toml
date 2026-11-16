@@ -3,6 +3,14 @@ name = "another-dimension-v2"
 version = "0.1.0"
 edition = "2021"
 
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
+
 [dependencies]
 argon2 = { version = "=0.5.3", default-features = false, features = ["alloc"] }
 base64 = "=0.22.1"
