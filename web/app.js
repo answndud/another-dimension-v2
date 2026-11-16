@@ -85,6 +85,16 @@ let dismissedTransitionKey = '';
 let activeNetworkMode = 'general';
 let addedCodeSaved = false;
 
+function clearBackupImportState() {
+  backupImportWork.begin();
+  const result = document.querySelector('#history-backup-import-result');
+  result.textContent = '';
+  result.hidden = true;
+  delete result.dataset.result;
+  document.querySelector('#history-backup-file').value = '';
+  document.querySelector('#history-backup-import-password').value = '';
+}
+
 function chatDraftKey(identity = identityId.textContent.trim(), operation = operationId, session = identitySessionGeneration) {
   return identity && operation ? `${session}:${identity}:${operation}` : '';
 }
@@ -442,6 +452,7 @@ async function refreshIdentity() {
   const response = await request('/api/identity/status');
   if (response.status === 401) {
     identitySessionGeneration += 1;
+    clearBackupImportState();
     pendingConfirmationFocus = null;
     show('entry');
     return false;
@@ -451,6 +462,7 @@ async function refreshIdentity() {
   const previousIdentityId = identityId.textContent.trim();
   if (previousIdentityId !== currentIdentityId) {
     identitySessionGeneration += 1;
+    clearBackupImportState();
     pendingConfirmationFocus = null;
   }
   if (previousIdentityId && previousIdentityId !== currentIdentityId) {
@@ -1170,6 +1182,7 @@ async function restoreSession() {
     }
     token = null;
     identitySessionGeneration += 1;
+    clearBackupImportState();
     sessionStorage.removeItem(sessionKey);
     sessionStorage.removeItem(operationKey);
     show('bridge');
@@ -1188,6 +1201,7 @@ bridgeForm.addEventListener('submit', async (event) => {
     if (!response.ok) { message.textContent = '연결할 수 없습니다. 터미널에서 새 코드를 발급받으세요.'; return; }
     token = await response.text();
     identitySessionGeneration += 1;
+    clearBackupImportState();
     sessionStorage.setItem(sessionKey, token);
     await refreshIdentity();
   } catch (_) { message.textContent = '로컬 프로그램에 연결할 수 없습니다.'; }
@@ -1342,6 +1356,7 @@ loginForm.addEventListener('submit', async (event) => {
 
 document.querySelector('#logout').addEventListener('click', async () => {
   identitySessionGeneration += 1;
+  clearBackupImportState();
   chatViewGeneration += 1;
   pendingConfirmationFocus = null;
   sendingMessage = false;
@@ -1377,6 +1392,7 @@ document.querySelector('#logout').addEventListener('click', async () => {
 
 document.querySelectorAll('.disconnect').forEach((button) => button.addEventListener('click', async () => {
   identitySessionGeneration += 1;
+  clearBackupImportState();
   chatViewGeneration += 1;
   pendingConfirmationFocus = null;
   try {
