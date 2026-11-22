@@ -1935,6 +1935,10 @@ mod tests {
         let flood = "wss://flood.test".to_owned();
         let network = FakeRelayNetwork::default();
         network.overflow_subscription_buffer(&flood);
+        // The healthy route must become ready only after the flooding route has been
+        // read to overflow. Without this delay the outcome races with the grace period
+        // that follows the first ready route and fails on a loaded machine.
+        network.delay_subscription(&healthy, 1, Duration::from_millis(1500));
         let invite_for_connect = InviteCode::parse(&code).unwrap();
         let rendezvous = RelayRendezvous::connect_with(
             &[flood, healthy],
