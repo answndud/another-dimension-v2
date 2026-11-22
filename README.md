@@ -1,7 +1,28 @@
 # Another Dimension v2
 
+[![CI](https://github.com/answndud/another-dimension-v2/actions/workflows/ci.yml/badge.svg)](https://github.com/answndud/another-dimension-v2/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+A local, serverless 1:1 text chat for Apple Silicon macOS, written in Rust. A small Rust program serves a loopback-only web UI, peers connect through public Nostr relays over a Noise XX session with Ed25519 identity proofs, and history is stored encrypted on the device. There is no account server and no automatic cloud sync. It is a personal project built to practice applied security engineering, and **it has not been independently audited**: read [SECURITY.md](SECURITY.md) for the threat model and the known weaknesses before trusting it with anything.
+
 Apple Silicon Mac에서 실행하는 로컬 1:1 텍스트 채팅 앱입니다. Rust 프로그램이 로컬 웹 화면을 제공하고, 대화는 기기 안에 암호화해 저장합니다. 중앙 계정 서버나 자동 클라우드 동기화는 사용하지 않습니다.
 
+## 핵심 보안 설계
+
+구현을 직접 확인할 수 있도록 근거 파일을 함께 적었습니다. 전체 구조는 [docs/architecture.md](docs/architecture.md)를 보세요.
+
+- **로컬 API 방어** ([src/main.rs](src/main.rs)): 루프백 임의 포트에만 바인딩하고, 모든 요청의 `Host`와 POST의 `Origin`·`Content-Type`을 정확히 비교합니다. 256비트 일회용 연결 코드(TTL 5분, 시도 5회, 상수 시간 비교)로 세션 토큰을 받고, 토큰은 쿠키가 아닌 `sessionStorage`에 둡니다. 엄격한 CSP를 쓰고 CORS 헤더는 보내지 않으며 `Transfer-Encoding`과 중복 헤더는 거부합니다.
+- **신원과 통신 키 분리** ([src/channel.rs](src/channel.rs)): Noise의 static 키는 연결마다 새로 만들고, 장기 신원은 별도의 Ed25519 키입니다. 핸드셰이크 해시에 대한 서명을 암호화된 전송 안에서 교환하므로 relay가 신원을 볼 수 없습니다. 양쪽의 증명과 사용자 확인 전에는 채팅 API를 호출할 수 없도록 typestate로 설계했습니다.
+- **프레임 순번과 재정렬 창** ([src/channel.rs](src/channel.rs)): 프레임마다 순번이 있고 32개 범위 안의 재정렬을 허용하며 중복은 무시합니다. 인증 실패는 세션을 닫습니다.
+- **인증 암호화 저장** ([src/history.rs](src/history.rs)): 대화 로그, 인덱스, 확인된 상대 기록을 ChaCha20-Poly1305로 보호합니다. 파일명은 상대 ID의 HMAC이고, 중간 레코드의 인증 실패는 오류로 처리하며 꼬리의 불완전한 레코드만 복구합니다.
+- **스트리밍 백업 결속** ([src/history.rs](src/history.rs)): ADBACK7은 파일별 무작위 ID, 프레임 인덱스, 종료 프레임을 인증 데이터에 묶어 잘라내기·재정렬·파일 간 바꿔치기를 탐지합니다. ADPACK3는 적용 전에 묶음 전체를 HMAC으로 검증합니다. 백업 비밀번호는 Argon2id로 유도합니다.
+- **서명된 메시지와 복원 동의** ([src/history.rs](src/history.rs)): 새 메시지는 Ed25519 서명을 가지며, 상대 기록 복원은 전송 동의와 최종 병합 동의를 각각 거칩니다.
+- **Tor 모드의 우회 금지** ([src/relay.rs](src/relay.rs)): 모든 relay 연결이 지정한 SOCKS 프록시를 통하고 호스트 이름 해석도 프록시가 처리하며, 프록시가 실패해도 직접 연결로 전환하지 않습니다. 프록시 주소는 루프백만 허용합니다.
+- **입력 크기 상한**: HTTP 헤더·본문, 핸드셰이크 메시지, 프레임, relay 이벤트에 상한이 있고 할당 전에 검사합니다.
+- **작은 `unsafe` 범위**: `unsafe`는 파일 잠금(`flock`)과 `geteuid` 호출 6곳뿐이며 모두 [src/history.rs](src/history.rs)에 있습니다. 프런트엔드에는 `innerHTML`과 `eval`이 없습니다.
+- **재현 가능한 의존성**: 모든 의존성을 정확한 버전으로 고정하고 `Cargo.lock`을 커밋하며, CI에서 `cargo audit`을 실행합니다.
+
+한계도 공개합니다. 알려진 약점 목록은 [SECURITY.md](SECURITY.md#known-weaknesses)에 있고, 고친 문제는 [docs/security-fixes.md](docs/security-fixes.md)에 기록합니다.
 ## 설치와 실행
 
 1. Xcode Command Line Tools와 Rust stable(Cargo 포함)을 설치합니다. macOS 터미널에서 `xcode-select --install`을 실행하고, [rustup.rs](https://rustup.rs)의 안내에 따라 stable toolchain을 설치할 수 있습니다.
@@ -27,30 +48,11 @@ macOS에서 실행하면 신원·대화 기록과 앱 설정은 이 저장소의
 
 ## 기록과 수동 백업
 
-대화 기록과 확인된 상대 관계는 개인 코드에서 유도한 키로 암호화해 로컬에 보관합니다. 대화 화면에서 상대가 가진 누락 기록의 예상량을 확인한 뒤 전송 동의를 선택하고, 검증된 제안을 미리 본 다음 최종 병합 동의를 별도로 선택할 수 있습니다. 응답 시간이 초과되면 로컬 기록은 변경되지 않으며, 연결이 유지된 경우 복원을 다시 요청할 수 있습니다. 복원은 상대가 보유하고 있는 기록에 한정됩니다. 서명은 발신 키와 메시지 변조를 확인하는 데 쓰이며 실제 인물, 기록의 완전성 또는 메시지의 진실성을 증명하지 않습니다. 구형 서명 없는 기록은 미검증으로 표시되며, 본문과 시각이 같은 구형 메시지의 중복 판정에는 한계가 있습니다.
+대화 기록과 확인된 상대 관계는 개인 코드에서 유도한 키로 암호화해 로컬에 보관합니다. 관리 메뉴의 대화 기록 관리에서 선택한 대화를 암호화 파일로 내보내고 다른 기기에서 가져올 수 있습니다. 새 단일 대화 백업은 ADBACK7, 여러 대화 묶음은 ADPACK3이며, 단일 백업에는 선택적 백업 비밀번호를 설정할 수 있습니다. 백업 파일과 개인 접속 코드는 별도로 보관해야 하고, 앱은 파일을 자동 업로드하지 않습니다.
 
-관리 메뉴의 대화 기록 관리에서 선택한 대화를 암호화 파일로 내보내고 다른 기기에서 가져올 수 있습니다. 기록 관리 화면을 열 때 현재 신원의 저장 목록을 다시 불러오므로, 로그인 뒤 대화 중 새로 저장된 기록도 목록에 반영됩니다. 한 대화 또는 여러 대화를 선택해 백업할 수 있고, 단일 대화 백업에는 선택적 백업 비밀번호를 설정할 수 있습니다. 확인된 상대의 신원 관계 백업은 별도 관리 화면에서 내보내고 가져옵니다. 백업 파일과 개인 접속 코드는 별도로 보관해야 합니다. 파일은 앱이 자동 업로드하지 않으므로 USB나 사용자가 선택한 저장소로 직접 옮기세요.
-
-새 단일 대화 백업은 ADBACK7이고, 대화 묶음은 ADPACK3입니다. 단일 백업의 비밀번호는 선택 사항입니다. 비밀번호를 설정하면 개인 접속 코드와 비밀번호를 모두 보관해야 합니다. 대화 묶음은 한 번에 최대 128개 대화를 포함합니다. 새 스트리밍 형식에는 앱의 전체 파일 크기 제한이 없으며 저장 공간과 운영체제·브라우저의 파일 처리 한계가 적용됩니다.
-
-| 가져오기 형식 | 앱 사용 조건과 보호 범위 | 제한과 화면 안내 |
-|---|---|---|
-| ADBACK1 | 해당 신원의 저장 키로 인증 암호화 | 16 MiB |
-| ADBACK2 | 앱은 해당 신원과 백업 비밀번호를 요구합니다. 암호화 키는 비밀번호에서 유도하고 공개 신원 ID를 인증 데이터(AAD)로 사용합니다. 공개 ID는 비밀이 아니며 개인 코드는 암호화 키에 결합되지 않습니다. | 16 MiB |
-| ADBACK3–5 | 신원 저장 키를 사용합니다. 비밀번호가 설정된 형식은 비밀번호 유도 키도 결합합니다. ADBACK4부터 서명 메시지, ADBACK5부터 신원 관계 정보를 포함할 수 있습니다. | 16 MiB |
-| ADBACK6 | 스트리밍 형식입니다. 상대 공개 ID가 평문이며 비밀번호 없는 백업은 다른 파일의 같은 순번 프레임을 구분하지 못할 수 있습니다. | 앱 전체 파일 크기 제한 없음. 가져오기 전 구형 형식 경고 |
-| ADBACK7 | 신원 저장 키와 선택적 비밀번호로 보호합니다. 파일별 임의 ID로 프레임과 완료 정보를 결속하고 상대 ID를 암호화합니다. | 앱 전체 파일 크기 제한 없음 |
-| ADPACK1 | 자식 백업 형식별 조건이 적용됩니다. 묶음의 대화 수·순서를 인증하지 않습니다. | 전체 파일 16 MiB, 최대 128개 대화 |
-| ADPACK2 | ADBACK6 자식을 포함하며 묶음의 대화 수·순서를 인증하지 않습니다. | 앱 전체 파일 크기 제한 없음, 최대 128개 대화. 가져오기 전 구형 형식 경고 |
-| ADPACK3 | ADBACK7 자식과 묶음의 대화 수·순서·길이·파일 내용을 인증합니다. | 앱 전체 파일 크기 제한 없음, 최대 128개 대화 |
-
-ADBACK5–7과 ADPACK1–3을 가져올 때는 신원 관계 정보 복원 동의를 별도로 받습니다. 구형 파일에 관계 정보가 없으면 과거 키를 자동으로 신뢰하지 않습니다. 구형 파일은 새 형식의 보호를 소급 적용받지 않습니다. 위 파일 크기 제한은 로컬 기록 보관량 제한이나 자동 삭제를 뜻하지 않습니다.
-
-ADPACK3은 모든 자식 백업과 묶음 인증을 마친 뒤 적용합니다. 이후 저장 오류가 나면 앞서 적용한 대화 수와 오류를 표시하고 기록 목록을 새로고침해 적용된 대화를 확인하라고 안내합니다. 미적용 대화만 선택해 다시 가져오는 기능은 없습니다. 원본 백업 파일을 보관하고 전체 재가져오기를 안전한 재개로 간주하지 마세요. 여러 대화의 일괄 롤백은 하지 않습니다. 가져오기가 완료됐지만 임시 업로드 파일 정리에 실패했다는 안내가 나오면, 목록에서 가져온 기록을 확인한 뒤 아래 수동 정리 절차를 따르세요. 구형 묶음은 형식별 검증 범위가 다릅니다. 재보호와 저장은 새 파일을 사용합니다. 원본 백업은 덮어쓰거나 자동 삭제하지 마세요.
-
-백업 전송 파일은 신원별 `.backup-transfer/.process-<임의 ID>/` 작업 공간에 생성됩니다. 각 작업 공간은 실행 프로세스가 커널 파일 잠금을 보유하고, 생성한 `*.backup`, `bundle-child-*.tmp`, `bundle-import-child-*.tmp`의 파일명과 파일 식별자를 비공개 manifest에 기록합니다. 앱 시작 시 잠금을 실제로 획득한 작업 공간만 이전 프로세스의 잔여물로 판단해 manifest에 등록된 파일을 정리합니다. 파일명이나 수정 시각으로 프로세스 종료를 추정하지 않으며, 다른 실행 중 앱의 잠금은 획득할 수 없어 해당 파일은 보존됩니다. manifest가 없거나 읽히지 않거나 파일 소유권이 일치하지 않으면 해당 파일을 남기고 정리 실패를 로그에 기록합니다. 이전 버전이 만든 작업 공간 밖의 임시 파일도 소유권 증거가 없어 자동 삭제하지 않습니다. 정리 실패 파일을 수동으로 살펴야 한다면 모든 앱 프로세스를 종료한 뒤 manifest에 기록된 항목과 실제 파일 식별자가 일치하는지 확인하세요. 소유권을 확인할 수 없으면 삭제하지 마세요. 사용자가 저장한 원본 백업이나 그 밖의 파일은 삭제하지 않습니다.
-
-기록은 자동으로 삭제되지 않습니다. 사용자가 대화 전체, 선택한 메시지 또는 날짜 범위 삭제를 실행할 수 있습니다. 로컬에서 삭제해도 상대방 기록과 백업 파일은 삭제되지 않습니다. 저장장치·운영체제 스냅샷에서 완전히 복구 불가능하게 지운다고 보장하지 않습니다.
+- 상대가 가진 누락 기록은 예상량 확인, 전송 동의, 미리 보기, 최종 병합 동의를 각각 거쳐 복원합니다. 서명은 발신 키와 변조 여부를 확인할 뿐 실제 인물이나 기록의 완전성을 증명하지 않습니다.
+- 기록은 자동으로 삭제되지 않습니다. 사용자가 대화 전체, 선택한 메시지, 날짜 범위를 삭제할 수 있지만 상대방 기록과 백업 파일은 지워지지 않습니다.
+- 구형 백업 형식은 보호가 더 약합니다. 형식별 보호 범위, 크기 제한, 가져오기 동작, 임시 파일 정리 절차는 [docs/backup-formats.md](docs/backup-formats.md)에 정리했습니다.
 
 ## Relay와 Tor 설정
 
@@ -63,3 +65,30 @@ Tor 모드는 앱의 relay 연결에만 적용됩니다. 메시지 링크를 열
 ## 범위와 확인 상태
 
 이 프로젝트는 macOS Apple Silicon을 주요 대상으로 합니다. 실제 브라우저 레이아웃, 사용자 환경의 Tor 경로, 공개 relay의 가용성과 상호운용은 별도 환경에서 확인해야 합니다. 독립 보안 감사는 수행되지 않았으며, 암호화 구현을 보안 보증으로 해석해서는 안 됩니다.
+
+## 문서
+
+| 문서 | 내용 |
+|---|---|
+| [SECURITY.md](SECURITY.md) | 위협 모델, 보장하는 것과 하지 않는 것, 알려진 약점, 취약점 제보 |
+| [docs/architecture.md](docs/architecture.md) | 구성요소, 연결 흐름, 저장 키 구조 (다이어그램 포함) |
+| [docs/adr/](docs/adr/) | 설계 결정 기록 (로컬 웹 UI, Noise XX와 Nostr, 접속 코드, 백업 형식 정책) |
+| [docs/security-fixes.md](docs/security-fixes.md) | 발견한 문제와 수정, 회귀 테스트 기록 |
+| [docs/backup-formats.md](docs/backup-formats.md) | 백업 형식별 보호 범위와 가져오기 동작 |
+| [docs/frontend.md](docs/frontend.md) | 프런트엔드 구조와 접근성 원칙 |
+
+## 개발
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+node --check web/app.js
+node --test web/reprotect-ui.test.cjs
+```
+
+`cargo test`는 약 2~3분 걸립니다. 실제 대화 데이터를 건드리지 않도록 테스트는 임시 디렉터리를 사용합니다. 앱을 직접 실행해 시험할 때는 디버그 빌드에서 `ANOTHER_DIMENSION_DATA_DIR`에 임시 절대 경로를 지정하세요.
+
+## 라이선스
+
+[MIT](LICENSE)
