@@ -62,6 +62,7 @@ These are known and documented, not hidden. Items are removed from this list onl
 9. **Renames are not followed by a directory fsync**, so a crash can lose an operation that was reported as successful.
 10. **Secrets are not fully zeroized.** Key material is wrapped in `Zeroizing` where practical, but decrypted message text and some library-held keys are not wiped.
 11. **No audit and limited fuzzing.** The test suite is extensive but the parsers have not been fuzzed.
+12. **Dependency advisories.** `cargo audit` reports 9 `unsound` warnings for `heapless` 0.8.0, which `nostr` pulls in through `faster-hex`. They are not exploitable vulnerabilities in this application as far as I can tell, but I cannot remove them without upgrading the pinned `nostr` version.
 
 ## Supply chain
 
