@@ -384,8 +384,7 @@ impl RestoreStaging {
         let mut length = [0; 4];
         self.file.read_exact(&mut length)?;
         let length = u32::from_be_bytes(length) as usize;
-        if length < 13 + 1 + 16
-            || length > 13 + MAX_MESSAGE_BYTES + 145
+        if !(13 + 1 + 16..=13 + MAX_MESSAGE_BYTES + 145).contains(&length)
             || self.read_end - position < 4 + NONCE_BYTES as u64 + length as u64
         {
             return Err(invalid_data("invalid restore staging record length"));
@@ -703,20 +702,29 @@ fn acquire_conversation_file_lock_for_path(
     acquire_conversation_file_lock_at(directory, identity_id, peer_id, key)
 }
 
+fn remove_restore_result_file(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(test)]
+    if test_failure(FAIL_RESTORE_RESULT_CLEANUP) {
+        return Err(io::Error::other("injected restore result cleanup failure"));
+    }
+    std::fs::remove_file(path)
+}
+
 fn acquire_conversation_file_lock_at(
     directory: &std::path::Path,
     _identity_id: &str,
     peer_id: &str,
     key: &[u8; 32],
 ) -> io::Result<File> {
-    create_dir_all(&directory)?;
-    set_private_directory(&directory)?;
+    create_dir_all(directory)?;
+    set_private_directory(directory)?;
     let filename = format!(
         ".conversation-{}.lock",
         opaque_conversation_name(&derive_index_key(key), &peer_id.to_ascii_lowercase())
     );
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(directory.join(filename))?;
@@ -1116,7 +1124,6 @@ impl History {
                 .create_new(true)
                 .read(true)
                 .append(true)
-                .write(true)
                 .open(&temporary)?;
             set_private_file(&file)?;
             file.write_all(MAGIC)?;
@@ -1166,7 +1173,6 @@ impl History {
                 .create_new(true)
                 .read(true)
                 .append(true)
-                .write(true)
                 .open(&temporary)?;
             set_private_file(&output)?;
             output.write_all(MAGIC)?;
@@ -1226,7 +1232,7 @@ impl History {
             self.next_index = next_index;
             Ok(summary)
         })();
-        if result.is_err() && temporary.exists() {
+        if let (Err(error), true) = (&result, temporary.exists()) {
             #[cfg(test)]
             let cleanup = if test_failure_once(FAIL_HISTORY_DELETE_CLEANUP) {
                 Err(io::Error::other(
@@ -1238,7 +1244,6 @@ impl History {
             #[cfg(not(test))]
             let cleanup = std::fs::remove_file(&temporary);
             if let Err(cleanup_error) = cleanup {
-                let error = result.unwrap_err();
                 return Err(io::Error::other(format!(
                     "history rewrite failed ({error}); temporary cleanup failed ({cleanup_error}); recoverable file: {}",
                     temporary.display()
@@ -1474,16 +1479,7 @@ impl History {
             })
         })();
         let result = match (result, final_temp) {
-            (Err(error), Some(path)) => match {
-                #[cfg(test)]
-                if test_failure(FAIL_RESTORE_RESULT_CLEANUP) {
-                    Err(io::Error::other("injected restore result cleanup failure"))
-                } else {
-                    std::fs::remove_file(&path)
-                }
-                #[cfg(not(test))]
-                std::fs::remove_file(&path)
-            } {
+            (Err(error), Some(path)) => match remove_restore_result_file(&path) {
                 Ok(()) => Err(error),
                 Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => Err(error),
                 Err(cleanup) => Err(io::Error::other(format!(
@@ -1521,7 +1517,7 @@ impl History {
                 last_message,
             });
         }
-        summaries.sort_by(|left, right| right.last_message.cmp(&left.last_message));
+        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_message));
         Ok(summaries)
     }
 
@@ -2810,7 +2806,7 @@ fn decode_backup_stream_v6<R: Read>(
                 .try_into()
                 .expect("fixed slice"),
         ) as usize;
-        if length < 16 || length > MAX_MESSAGE_BYTES + 256 {
+        if !(16..=MAX_MESSAGE_BYTES + 256).contains(&length) {
             return Err(invalid_data("invalid backup frame length"));
         }
         let mut encrypted = vec![0; length];
@@ -2936,7 +2932,7 @@ fn decode_backup_stream<R: Read>(
                 .try_into()
                 .expect("fixed slice"),
         ) as usize;
-        if length < 16 || length > MAX_MESSAGE_BYTES + 256 {
+        if !(16..=MAX_MESSAGE_BYTES + 256).contains(&length) {
             return Err(invalid_data("invalid backup frame length"));
         }
         let mut encrypted = vec![0; length];
@@ -4297,13 +4293,16 @@ fn decode_wire_message(
 
 /// Return only aliases whose explicit link marker is in the current local
 /// conversation. Remote transition announcements alone are never sufficient.
+/// Linked identity keys for one conversation: (local aliases, peer aliases).
+type LinkedKeys = (Vec<[u8; 32]>, Vec<[u8; 32]>);
+
 pub(crate) fn linked_identity_keys(
     identity: &Identity,
     _messages: &[StoredMessage],
     identity_id: &str,
     peer_id: &str,
     previous_local_ids: &[String],
-) -> io::Result<(Vec<[u8; 32]>, Vec<[u8; 32]>)> {
+) -> io::Result<LinkedKeys> {
     let identity_id = identity_id.to_ascii_lowercase();
     let peer_id = peer_id.to_ascii_lowercase();
     validate_peer_id(&identity_id)?;
@@ -5450,6 +5449,8 @@ fn add_restore_run_level(
     }
 }
 
+// TODO(PLAN 3.2): group the restore sort state into a struct when history.rs is split.
+#[allow(clippy::too_many_arguments)]
 fn push_restore_sort_item(
     message: StoredMessage,
     buffer: &mut Vec<(u64, StoredMessage)>,
@@ -5539,7 +5540,7 @@ pub(crate) fn data_directory() -> io::Result<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        return Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("chat-data"));
+        Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("chat-data"))
     }
     #[cfg(target_os = "windows")]
     {
@@ -5583,6 +5584,39 @@ fn wait_history_delete_test_gate() {
     while !state.1 {
         state = changed.wait(state).unwrap();
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn home_dir() -> io::Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory is unavailable"))
+}
+
+#[cfg(unix)]
+fn set_private_directory(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_private_directory(_: &std::path::Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file(file: &File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_file(_: &File) -> io::Result<()> {
+    Ok(())
+}
+
+fn invalid_data(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 #[cfg(test)]
@@ -6561,11 +6595,15 @@ mod tests {
             super::decode_transfer(&bob, &local_peer_id, &alice.public_key(), &frame).unwrap();
         assert_eq!(received.sender, MessageSender::Other);
         assert_eq!(
-            super::merge_restored(&[], &[received.clone()]).unwrap(),
+            super::merge_restored(&[], std::slice::from_ref(&received)).unwrap(),
             vec![received.clone()]
         );
         assert_eq!(
-            super::merge_restored(&[received.clone()], &[received.clone()]).unwrap(),
+            super::merge_restored(
+                std::slice::from_ref(&received),
+                std::slice::from_ref(&received),
+            )
+            .unwrap(),
             vec![received.clone()]
         );
 
@@ -6859,7 +6897,8 @@ mod tests {
             super::encode_backup(&replacement, &peer_id, &[bad_signature], None).unwrap();
         assert!(History::verify_backup(&restored_identity, &bad_signature_backup, None).is_err());
 
-        let bundle = History::export_backup_bundle(&replacement, &[peer_id.clone()]).unwrap();
+        let bundle =
+            History::export_backup_bundle(&replacement, std::slice::from_ref(&peer_id)).unwrap();
         let store_c = root.join("store-c");
         std::fs::create_dir_all(&store_c).unwrap();
         super::TEST_DATA_DIRECTORY
@@ -6974,7 +7013,8 @@ mod tests {
         assert!(super::record_linked_local_identity(&current, &peer, &old_id).is_err());
         super::TEST_FAILURES.with(|flags| flags.set(0));
         assert_eq!(
-            super::pending_local_identity_links(&current, &peer, &[old_id.clone()]).unwrap(),
+            super::pending_local_identity_links(&current, &peer, std::slice::from_ref(&old_id))
+                .unwrap(),
             vec![old_id.clone()]
         );
         assert!(!history.append_system_once(&current, entry).unwrap());
@@ -8457,37 +8497,4 @@ mod tests {
             );
         }
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn home_dir() -> io::Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory is unavailable"))
-}
-
-#[cfg(unix)]
-fn set_private_directory(path: &std::path::Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn set_private_directory(_: &std::path::Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_private_file(file: &File) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_private_file(_: &File) -> io::Result<()> {
-    Ok(())
-}
-
-fn invalid_data(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
 }

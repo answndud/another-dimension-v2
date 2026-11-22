@@ -661,6 +661,9 @@ fn append_pending_restore_messages(
     Ok(appended)
 }
 
+// The rejected entry is handed back to the caller, so the Err variant is large.
+// TODO(PLAN 3.1): revisit (e.g. Box the entry) when handlers are split into modules.
+#[allow(clippy::result_large_err)]
 fn queue_message_during_restore_merge(
     messages: &mut VecDeque<history::StoredMessage>,
     queued_bytes: &mut usize,
@@ -2909,6 +2912,19 @@ fn relay_failure_message(error: &RelayError, phase: &str, using_tor: bool) -> St
     }
 }
 
+/// Everything `spawn_chat_worker` needs after a successful connection attempt.
+type ConnectedChat = (
+    RelaySession,
+    Option<history::History>,
+    Vec<ChatEntry>,
+    usize,
+    Option<String>,
+    [u8; 32],
+    String,
+);
+
+// TODO(PLAN 3.1): pass a config struct when the chat worker moves to its own module.
+#[allow(clippy::too_many_arguments)]
 fn spawn_chat_worker(
     operation: Arc<ChatOperation>,
     state_handle: Arc<Mutex<State>>,
@@ -2935,7 +2951,7 @@ fn spawn_chat_worker(
                 return;
             }
         };
-        let result = (|| -> Result<(RelaySession, Option<history::History>, Vec<ChatEntry>, usize, Option<String>, [u8; 32], String), String> {
+        let result = (|| -> Result<ConnectedChat, String> {
             let invite = InviteCode::parse(&code).ok_or("초대 코드를 확인하세요.")?;
             let mut rendezvous = match role {
                 RoleForChat::Create => RelayRendezvous::create(&relay_urls, &invite, tor_socks),
@@ -2960,7 +2976,10 @@ fn spawn_chat_worker(
                     .lock()
                     .map_err(|_| "local state unavailable".to_owned())?;
                 if history_delete_active(&state, &identity.public_id(), &peer_id) {
-                    return Err("해당 대화 기록을 삭제 중입니다. 삭제가 끝난 뒤 다시 연결하세요.".to_owned());
+                    return Err(
+                        "해당 대화 기록을 삭제 중입니다. 삭제가 끝난 뒤 다시 연결하세요."
+                            .to_owned(),
+                    );
                 }
                 let mut snapshot = operation
                     .snapshot
@@ -2972,38 +2991,62 @@ fn spawn_chat_worker(
                     snapshot.fingerprint = Some(fingerprint);
                 }
             }
-            let verification = if expected_peer.is_some() { verification } else { loop {
-                if operation.cancelled.load(Ordering::SeqCst) {
-                    return Err("취소되었습니다.".to_owned());
-                }
-                match commands.recv_timeout(Duration::from_millis(250)) {
-                    Ok(ChatCommand::Confirm) => break verification,
-                    Ok(ChatCommand::Cancel) => return Err("취소되었습니다.".to_owned()),
-                    Ok(ChatCommand::Send(_, _)) => {}
-                    Ok(ChatCommand::AcceptIdentityTransition(_, result)) => {
-                        let _ = result.send(Err("상대 기록 연결 요청을 처리할 수 없습니다.".to_owned()));
+            let verification = if expected_peer.is_some() {
+                verification
+            } else {
+                loop {
+                    if operation.cancelled.load(Ordering::SeqCst) {
+                        return Err("취소되었습니다.".to_owned());
                     }
-                    Ok(ChatCommand::RequestHistoryRestore(result)) => {
-                        let _ = result.send(Err("상대 기록 복원은 연결 확인 후 사용할 수 있습니다.".to_owned()));
+                    match commands.recv_timeout(Duration::from_millis(250)) {
+                        Ok(ChatCommand::Confirm) => break verification,
+                        Ok(ChatCommand::Cancel) => return Err("취소되었습니다.".to_owned()),
+                        Ok(ChatCommand::Send(_, _)) => {}
+                        Ok(ChatCommand::AcceptIdentityTransition(_, result)) => {
+                            let _ = result
+                                .send(Err("상대 기록 연결 요청을 처리할 수 없습니다.".to_owned()));
+                        }
+                        Ok(ChatCommand::RequestHistoryRestore(result)) => {
+                            let _ =
+                                result
+                                    .send(Err("상대 기록 복원은 연결 확인 후 사용할 수 있습니다."
+                                        .to_owned()));
+                        }
+                        Ok(ChatCommand::ResolveHistoryRestore(_)) => {}
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => {
+                            return Err("취소되었습니다.".to_owned())
+                        }
                     }
-                    Ok(ChatCommand::ResolveHistoryRestore(_)) => {}
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => return Err("취소되었습니다.".to_owned()),
                 }
-            }};
+            };
             chat_update(&operation, |snapshot| snapshot.phase = "confirming");
             let mut session = if expected_peer.is_some() {
-                rendezvous.confirm(verification).map_err(|error| relay_failure_message(&error, "confirmation", tor_socks.is_some()))?
+                rendezvous.confirm(verification).map_err(|error| {
+                    relay_failure_message(&error, "confirmation", tor_socks.is_some())
+                })?
             } else {
-            let (session, rendezvous_secret) = rendezvous
-                .confirm_with_contact(verification)
-                .map_err(|error| relay_failure_message(&error, "confirmation", tor_socks.is_some()))?;
-            let directory = history::data_directory()
-                .map_err(|_| "상대 확인 정보를 저장할 위치를 찾을 수 없습니다.".to_owned())?
-                .join(identity.public_id()).join("verified-contacts");
-            contacts::save_after_confirmation(&directory, &identity, &contacts::VerifiedContact { peer_key, rendezvous_secret })
-                .map_err(|_| "상대 확인 정보를 저장하지 못했습니다. 기존 확인 기록을 확인하세요.".to_owned())?;
-            session
+                let (session, rendezvous_secret) = rendezvous
+                    .confirm_with_contact(verification)
+                    .map_err(|error| {
+                        relay_failure_message(&error, "confirmation", tor_socks.is_some())
+                    })?;
+                let directory = history::data_directory()
+                    .map_err(|_| "상대 확인 정보를 저장할 위치를 찾을 수 없습니다.".to_owned())?
+                    .join(identity.public_id())
+                    .join("verified-contacts");
+                contacts::save_after_confirmation(
+                    &directory,
+                    &identity,
+                    &contacts::VerifiedContact {
+                        peer_key,
+                        rendezvous_secret,
+                    },
+                )
+                .map_err(|_| {
+                    "상대 확인 정보를 저장하지 못했습니다. 기존 확인 기록을 확인하세요.".to_owned()
+                })?;
+                session
             };
             let (history, entries, message_count, storage_error, pending_previous_ids) = match history::History::open_for_chat(&identity, &peer_id) {
                 Ok((history, message_count, recovered_partial)) => {
@@ -3023,9 +3066,19 @@ fn spawn_chat_worker(
                     "type": "identity-transition",
                     "previousPeerIds": pending_previous_ids,
                 }));
-                session.send(&announcement).map_err(|_| "신원 변경 안내를 상대에게 보내지 못했습니다.".to_owned())?;
+                session
+                    .send(&announcement)
+                    .map_err(|_| "신원 변경 안내를 상대에게 보내지 못했습니다.".to_owned())?;
             }
-            Ok((session, history, entries, message_count, storage_error, peer_key, peer_id))
+            Ok((
+                session,
+                history,
+                entries,
+                message_count,
+                storage_error,
+                peer_key,
+                peer_id,
+            ))
         })();
 
         let (mut session, mut history, peer_key, peer_id) = match result {
@@ -4584,14 +4637,8 @@ fn queue_history_deletion(
             }
         };
         if let Ok(mut state) = state_handle.lock() {
-            match &result {
-                Ok(summary) => update_closed_chat_history(
-                    &state,
-                    &identity_id,
-                    &peer_id,
-                    summary.remaining_count,
-                ),
-                Err(_) => {}
+            if let Ok(summary) = &result {
+                update_closed_chat_history(&state, &identity_id, &peer_id, summary.remaining_count);
             }
             state.active_history_deletions.remove(&reservation_key);
             if let Ok(mut snapshot) = operation.snapshot.lock() {
@@ -4752,7 +4799,7 @@ fn save_settings_to_path(path: &std::path::Path, settings: &AppSettings) -> io::
         set_private_file(&file)?;
         file.write_all(&contents)?;
         file.sync_all()?;
-        rename(&temporary, &path)?;
+        rename(&temporary, path)?;
         Ok(())
     })();
     if result.is_err() {
@@ -5541,8 +5588,6 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         {
             let status = if error == RESTORE_MERGE_SEND_REJECTION {
                 "409 Conflict"
-            } else if error.contains("전송 결과를 확인할 수 없습니다") {
-                "503 Service Unavailable"
             } else {
                 "503 Service Unavailable"
             };

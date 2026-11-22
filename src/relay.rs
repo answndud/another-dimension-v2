@@ -1381,7 +1381,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(input: &str) -> Option<Vec<u8>> {
-    if input.len() % 2 != 0 || input.len() > MAX_ENVELOPE * 2 {
+    if !input.len().is_multiple_of(2) || input.len() > MAX_ENVELOPE * 2 {
         return None;
     }
     let digit = |byte| match byte {
