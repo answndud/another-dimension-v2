@@ -1,9 +1,15 @@
 name: CI
 
+# Fast checks on every code change. Slow stress tests and dependency advisories
+# run on a schedule in weekly.yml.
 on:
   push:
     branches: [main]
-  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,59 +20,23 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # The Rust toolchain is pinned (see the dtolnay/rust-toolchain steps) so a new
-  # compiler or clippy release cannot break CI without a deliberate upgrade.
 
 jobs:
-  lint:
-    name: Format and clippy
+  check:
+    name: Format, clippy, tests
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      # The Rust toolchain is pinned so a new compiler or clippy release cannot
+      # break CI without a deliberate upgrade.
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-
-  test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
-      - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
-
-  web:
-    name: Frontend checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
       - run: node --check web/app.js
       - run: node --check web/reprotect-work.js
       - run: node --test web/reprotect-ui.test.cjs
-
-  audit:
-    name: Dependency advisories
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      checks: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}

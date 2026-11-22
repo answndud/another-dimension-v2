@@ -6132,6 +6132,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow stress test (large files / many records); run with --ignored"]
     fn streaming_selection_deletion_handles_over_one_hundred_thousand_records() {
         let _data = IsolatedData::new();
         let (identity, _) = Identity::create().unwrap();
@@ -6151,6 +6152,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow stress test (large files / many records); run with --ignored"]
     fn streaming_range_deletion_handles_over_sixty_four_mib_and_inclusive_cutoff() {
         let _data = IsolatedData::new();
         let (identity, _) = Identity::create().unwrap();
@@ -6525,6 +6527,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow stress test (large files / many records); run with --ignored"]
     fn transfer_estimate_scans_over_legacy_count_and_byte_thresholds_sequentially() {
         let _data = IsolatedData::new();
         let (identity, _) = Identity::create().unwrap();
@@ -7933,6 +7936,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow stress test (large files / many records); run with --ignored"]
     fn streaming_backup_import_bundle_and_reprotection_exceed_legacy_limit() {
         let data = IsolatedData::new();
         let (identity, identity_code) = Identity::create().unwrap();
@@ -8472,6 +8476,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow stress test (large files / many records); run with --ignored"]
     fn exports_enforce_the_final_file_size_limit_for_both_formats() {
         let _data = IsolatedData::new();
         let identity = Identity::create().unwrap().0;

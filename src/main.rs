@@ -2341,6 +2341,7 @@ mod send_tests {
     }
 
     #[test]
+    #[ignore = "slow stress test (large files / many records); run with --ignored"]
     fn history_sync_streams_large_offers_through_chunks_staging_and_final_merge() {
         let _data = TestDataDirectory::new();
         let (sender_identity, _) = Identity::create().unwrap();
