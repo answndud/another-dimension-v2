@@ -20,7 +20,11 @@ const MAGIC: &[u8; 8] = b"ADLOG2\0\0";
 const LEGACY_MAGIC: &[u8; 8] = b"ADLOG1\0\0";
 const MAX_MESSAGE_BYTES: usize = 4096;
 const NONCE_BYTES: usize = 12;
+// Index files written before 2026-11 encrypted with the same key that names the
+// conversation files (ADIDX1). ADIDX2 uses a key of its own; ADIDX1 is still read.
 const INDEX_MAGIC: &[u8; 8] = b"ADIDX1\0\0";
+const INDEX_MAGIC_V2: &[u8; 8] = b"ADIDX2\0\0";
+const INDEX_AEAD_LABEL: &[u8] = b"another-dimension-v2/history-index-aead/v2";
 const BACKUP_MAGIC: &[u8; 8] = b"ADBACK1\0";
 const BACKUP_PASSWORD_MAGIC: &[u8; 8] = b"ADBACK2\0";
 const BACKUP_COMBINED_MAGIC: &[u8; 8] = b"ADBACK3\0";
@@ -34,7 +38,11 @@ const BACKUP_STREAM_BUNDLE_V2_MAGIC: &[u8; 8] = b"ADPACK2\0";
 const BACKUP_STREAM_BUNDLE_MAGIC: &[u8; 8] = b"ADPACK3\0";
 const BACKUP_PEER_METADATA: &[u8; 8] = b"ADPEER1\0";
 const BACKUP_BUNDLE_TAG_BYTES: usize = 32;
+// ADLKEY1 stores were encrypted with the storage key itself, shared with the log
+// records. ADLKEY2 uses a key of its own; ADLKEY1 is still read.
 const LINKED_KEYS_MAGIC: &[u8; 8] = b"ADLKEY1\0";
+const LINKED_KEYS_MAGIC_V2: &[u8; 8] = b"ADLKEY2\0";
+const LINKED_KEYS_AEAD_LABEL: &[u8] = b"another-dimension-v2/linked-keys-aead/v2";
 const RESTORE_STAGING_MAGIC: &[u8; 8] = b"ADRSTG1\0";
 const TRANSFER_MAGIC: &[u8; 6] = b"ADREC1";
 const TRANSFER_CHUNK_MAGIC: &[u8; 5] = b"ADCH1";
@@ -4497,11 +4505,19 @@ fn read_linked_keys(identity: &Identity, peer_id: &str) -> io::Result<LinkedIds>
         }
         Err(error) => return Err(error),
     };
-    if bytes.len() < 8 + NONCE_BYTES + 16 || !bytes.starts_with(LINKED_KEYS_MAGIC) {
+    if bytes.len() < 8 + NONCE_BYTES + 16 {
         return Err(invalid_data("invalid linked identity key store"));
     }
+    let storage_key = identity.storage_key();
+    let key = if bytes.starts_with(LINKED_KEYS_MAGIC_V2) {
+        crate::identity::purpose_key(&storage_key, LINKED_KEYS_AEAD_LABEL)
+    } else if bytes.starts_with(LINKED_KEYS_MAGIC) {
+        // Written before the key was separated from the one used for log records.
+        Zeroizing::new(*storage_key)
+    } else {
+        return Err(invalid_data("invalid linked identity key store"));
+    };
     let nonce = Nonce::from_slice(&bytes[8..20]);
-    let key = identity.storage_key();
     let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
         .map_err(|_| invalid_data("linked identity key unavailable"))?;
     let aad = [identity_id.as_bytes(), peer_id.as_bytes()].concat();
@@ -4568,7 +4584,7 @@ fn write_linked_keys(identity: &Identity, peer_id: &str, linked: &LinkedIds) -> 
     }
     let mut nonce = [0; NONCE_BYTES];
     crate::random::fill(&mut nonce)?;
-    let key = identity.storage_key();
+    let key = crate::identity::purpose_key(&identity.storage_key(), LINKED_KEYS_AEAD_LABEL);
     let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
         .map_err(|_| invalid_data("linked identity key unavailable"))?;
     let aad = [identity_id.as_bytes(), peer_id.as_bytes()].concat();
@@ -4581,7 +4597,7 @@ fn write_linked_keys(identity: &Identity, peer_id: &str, linked: &LinkedIds) -> 
             },
         )
         .map_err(|_| io::Error::other("linked identity key encryption failed"))?;
-    let mut contents = LINKED_KEYS_MAGIC.to_vec();
+    let mut contents = LINKED_KEYS_MAGIC_V2.to_vec();
     contents.extend_from_slice(&nonce);
     contents.extend_from_slice(&encrypted);
     let temporary = path.with_extension(format!("{}.tmp", hex_encode(&random_nonce()?)));
@@ -4868,10 +4884,17 @@ fn read_index(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    if bytes.len() < INDEX_MAGIC.len() + NONCE_BYTES + 16 || &bytes[..8] != INDEX_MAGIC {
+    if bytes.len() < INDEX_MAGIC.len() + NONCE_BYTES + 16 {
         return Err(invalid_data("invalid history index"));
     }
-    let key = derive_index_key(&identity.storage_key());
+    let storage_key = identity.storage_key();
+    let key = if &bytes[..8] == INDEX_MAGIC_V2 {
+        crate::identity::purpose_key(&storage_key, INDEX_AEAD_LABEL)
+    } else if &bytes[..8] == INDEX_MAGIC {
+        derive_index_key(&storage_key)
+    } else {
+        return Err(invalid_data("invalid history index"));
+    };
     let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
         .map_err(|_| invalid_data("invalid history index key"))?;
     let nonce = &bytes[INDEX_MAGIC.len()..INDEX_MAGIC.len() + NONCE_BYTES];
@@ -4917,7 +4940,10 @@ fn write_index(
         }
     }
     let nonce = random_nonce()?;
-    let key = derive_index_key(&identity.storage_key());
+    let storage_key = identity.storage_key();
+    // The filename key only names files. The index is encrypted with its own key.
+    let filename_key = derive_index_key(&storage_key);
+    let key = crate::identity::purpose_key(&storage_key, INDEX_AEAD_LABEL);
     let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
         .map_err(|_| io::Error::other("history index key unavailable"))?;
     let encrypted = cipher
@@ -4931,7 +4957,7 @@ fn write_index(
         .map_err(|_| io::Error::other("history index encryption failed"))?;
     let temporary = directory.join(format!(
         ".index-{}.tmp",
-        opaque_conversation_name(&key, &hex_encode(&nonce))
+        opaque_conversation_name(&filename_key, &hex_encode(&nonce))
     ));
     let path = directory.join("conversations.idx");
     let mut file = crate::fsutil::private_options()
@@ -4939,7 +4965,7 @@ fn write_index(
         .write(true)
         .open(&temporary)?;
     set_private_file(&file)?;
-    file.write_all(INDEX_MAGIC)?;
+    file.write_all(INDEX_MAGIC_V2)?;
     file.write_all(&nonce)?;
     file.write_all(&encrypted)?;
     file.sync_all()?;
@@ -8022,6 +8048,154 @@ pub(crate) mod tests {
         // The warning only reports. The data stays where it was.
         assert!(legacy.join("conversation").exists());
         assert!(!current.exists());
+    }
+
+    /// The index as the previous version wrote it: ADIDX1, encrypted with the key that
+    /// also names the conversation files.
+    fn legacy_index_bytes(identity: &Identity, peers: &[String]) -> Vec<u8> {
+        let mut payload = (peers.len() as u32).to_be_bytes().to_vec();
+        for peer in peers {
+            payload.extend_from_slice(&super::decode_peer_id(peer).unwrap());
+        }
+        let nonce = [0x33; super::NONCE_BYTES];
+        let encrypted = ChaCha20Poly1305::new_from_slice(
+            super::derive_index_key(&identity.storage_key()).as_ref(),
+        )
+        .unwrap()
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &payload,
+                aad: identity.public_id().as_bytes(),
+            },
+        )
+        .unwrap();
+        let mut bytes = super::INDEX_MAGIC.to_vec();
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&encrypted);
+        bytes
+    }
+
+    #[test]
+    fn an_index_from_the_previous_version_still_lists_conversations_and_is_upgraded_on_write() {
+        let data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let (first, second) = ("b1".repeat(32), "b2".repeat(32));
+        let directory = data.0.join(identity.public_id());
+        std::fs::create_dir_all(&directory).unwrap();
+        let index_path = directory.join("conversations.idx");
+        std::fs::write(
+            &index_path,
+            legacy_index_bytes(&identity, std::slice::from_ref(&first)),
+        )
+        .unwrap();
+        assert_eq!(
+            History::known_peer_ids(&identity).unwrap(),
+            vec![first.clone()]
+        );
+
+        // Starting another conversation rewrites the index in the new format.
+        History::open(&identity, &second)
+            .unwrap()
+            .0
+            .append(&message(1, "x"))
+            .unwrap();
+        let rewritten = std::fs::read(&index_path).unwrap();
+        assert_eq!(&rewritten[..8], super::INDEX_MAGIC_V2);
+        let mut listed = History::known_peer_ids(&identity).unwrap();
+        listed.sort();
+        assert_eq!(listed, vec![first, second]);
+    }
+
+    #[test]
+    fn a_new_index_is_not_encrypted_with_the_key_that_names_files() {
+        let data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "b3".repeat(32);
+        History::open(&identity, &peer)
+            .unwrap()
+            .0
+            .append(&message(1, "x"))
+            .unwrap();
+        let bytes =
+            std::fs::read(data.0.join(identity.public_id()).join("conversations.idx")).unwrap();
+        assert_eq!(&bytes[..8], super::INDEX_MAGIC_V2);
+        let opens_with = |key: &[u8; 32]| {
+            ChaCha20Poly1305::new_from_slice(key)
+                .unwrap()
+                .decrypt(
+                    Nonce::from_slice(&bytes[8..8 + super::NONCE_BYTES]),
+                    Payload {
+                        msg: &bytes[8 + super::NONCE_BYTES..],
+                        aad: identity.public_id().as_bytes(),
+                    },
+                )
+                .is_ok()
+        };
+        let storage_key = identity.storage_key();
+        assert!(opens_with(&crate::identity::purpose_key(
+            &storage_key,
+            super::INDEX_AEAD_LABEL
+        )));
+        assert!(
+            !opens_with(&super::derive_index_key(&storage_key)),
+            "the filename key must not open the index"
+        );
+        assert!(!opens_with(&storage_key), "nor may the storage key");
+    }
+
+    #[test]
+    fn a_linked_key_store_from_the_previous_version_still_reads_and_is_upgraded_on_write() {
+        let data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "b4".repeat(32);
+        let (previous, other) = ("c1".repeat(32), "c2".repeat(32));
+        let path = super::linked_key_path(&identity, &peer).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // ADLKEY1: the storage key itself, with the identity and peer ids as AAD.
+        let mut plaintext = vec![1_u8, 1];
+        plaintext.extend_from_slice(&super::decode_peer_id(&previous).unwrap());
+        plaintext.extend_from_slice(&super::decode_peer_id(&other).unwrap());
+        let nonce = [0x55; super::NONCE_BYTES];
+        let aad = [identity.public_id().as_bytes(), peer.as_bytes()].concat();
+        let encrypted = ChaCha20Poly1305::new_from_slice(identity.storage_key().as_ref())
+            .unwrap()
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        let mut bytes = super::LINKED_KEYS_MAGIC.to_vec();
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&encrypted);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (locals, peers) = super::read_linked_keys(&identity, &peer).unwrap();
+        assert!(locals.contains(&previous));
+        assert!(peers.contains(&other));
+
+        super::write_linked_keys(&identity, &peer, &(locals, peers)).unwrap();
+        let rewritten = std::fs::read(&path).unwrap();
+        assert_eq!(&rewritten[..8], super::LINKED_KEYS_MAGIC_V2);
+        let (locals, peers) = super::read_linked_keys(&identity, &peer).unwrap();
+        assert!(locals.contains(&previous) && peers.contains(&other));
+        // The new store does not open with the storage key that log records use.
+        let opens_with_storage_key =
+            ChaCha20Poly1305::new_from_slice(identity.storage_key().as_ref())
+                .unwrap()
+                .decrypt(
+                    Nonce::from_slice(&rewritten[8..8 + super::NONCE_BYTES]),
+                    Payload {
+                        msg: &rewritten[8 + super::NONCE_BYTES..],
+                        aad: &aad,
+                    },
+                )
+                .is_ok();
+        assert!(!opens_with_storage_key);
+        drop(data);
     }
 
     #[test]

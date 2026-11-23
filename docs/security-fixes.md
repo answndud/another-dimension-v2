@@ -19,6 +19,30 @@
 
 ## 기록
 
+## SF-010 하나의 키를 여러 용도에 겹쳐 쓰던 저장 계층
+
+- 날짜: 2026-11-23
+- 심각도: Low-Medium
+- 위치: `src/history.rs`(대화 인덱스, 연결 키 저장소), `src/contacts.rs`(연락처 레코드와 백업)
+- 발견: 코드 리뷰에서 한 키가 둘 이상의 서로 다른 용도에 쓰이는 곳을 확인했습니다. 대화 인덱스를 암호화하는 키가 대화 파일 이름을 만드는 HMAC 키와 같았고, 연락처의 키는 파일 이름 HMAC, 레코드 암호화, 백업 암호화에 모두 쓰였으며, 연결 키 저장소는 대화 로그와 같은 저장 키를 그대로 썼습니다.
+- 영향: 지금 당장 악용 가능한 취약점은 아닙니다. 서로 다른 AAD와 형식이 혼동을 막고 있었지만 그것은 우연히 성립한 보호였고, 한 용도의 약점(예: nonce 재사용, 파일 이름 길이 노출)이 다른 용도에 번질 수 있었습니다. 형식이 늘어날수록 깨지기 쉬운 구조입니다.
+- 수정: `identity::purpose_key()`로 용도마다 HKDF 라벨이 다른 키를 만듭니다.
+  - 인덱스: `ADIDX2`, 라벨 `history-index-aead/v2`
+  - 연결 키 저장소: `ADLKEY2`, 라벨 `linked-keys-aead/v2`
+  - 연락처 레코드: `ADPEER2`, 라벨 `verified-contact-record-aead/v2`
+  - 연락처 백업: `ADCONB2`, 라벨 `contact-backup-aead/v2`
+  **기존 데이터는 그대로 열립니다.** 읽기는 이전 형식(ADIDX1, ADLKEY1, ADPEER1, ADCONB1)을 계속 지원하고, 쓰기는 항상 새 형식이라서 다음에 쓸 때 자연스럽게 새 형식으로 옮겨 갑니다.
+  **파일 이름을 만드는 HMAC 키는 일부러 바꾸지 않았습니다.** 바꾸면 기존 파일을 찾을 수 없고, 이름 변경을 전부 마이그레이션해야 합니다. 이 키는 이제 이름 용도로만 쓰입니다.
+- 회귀 테스트:
+  - 이전 형식 호환: `an_index_from_the_previous_version_still_lists_conversations_and_is_upgraded_on_write`, `a_linked_key_store_from_the_previous_version_still_reads_and_is_upgraded_on_write`, `a_record_written_by_the_previous_version_still_loads_and_is_upgraded_on_rewrite`, `a_backup_from_the_previous_version_still_imports_and_new_backups_use_their_own_key`. 이전 코드가 만들던 바이트를 테스트에서 직접 재현해 읽고, 다시 쓰면 새 형식이 되는지 확인합니다.
+  - 키 분리: `a_new_index_is_not_encrypted_with_the_key_that_names_files`, `a_new_record_is_not_encrypted_with_the_filename_key`와 위 백업 테스트. 새 데이터가 이전 키(파일 이름 키, 저장 키, 다른 용도의 키)로 열리지 않음을 확인합니다.
+  - 형식을 이전 것으로 되돌리거나, 이전 형식 읽기를 막거나, 키를 겹치게 하면 각각 해당 테스트가 실패하는 것을 확인했습니다(변이 검사 4건).
+- 남은 한계:
+  - **대화 로그 레코드는 아직 원시 저장 키를 씁니다.** 로그 형식(ADLOG)을 바꾸는 일은 세대 id와 끝 표시를 넣는 로그 변조 탐지 작업과 같은 형식 버전업으로 묶는 편이 낫기 때문입니다(계획의 3.6). 그 전까지 저장 키를 직접 쓰는 곳은 로그 레코드뿐입니다.
+  - 백업 키(ADBACK 계열)와 복원 스테이징 키는 이미 용도별 라벨을 쓰고 있어서 이번에 바꾸지 않았습니다.
+  - 이전 형식의 파일은 다시 쓰이기 전까지 이전 키로 남아 있습니다. 읽기만 하는 파일은 옮겨지지 않습니다.
+  - 이전 형식 읽기를 언제 없앨지는 정하지 않았습니다. 없애면 오래된 데이터를 열 수 없게 됩니다.
+
 ## SF-009 접속 코드 설명이 암호화로 보호되는 것처럼 읽힘
 
 - 날짜: 2026-11-23

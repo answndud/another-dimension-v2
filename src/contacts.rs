@@ -14,8 +14,15 @@ use std::path::Path;
 use std::sync::Mutex;
 use zeroize::Zeroizing;
 
-const MAGIC: &[u8; 8] = b"ADPEER1\0";
-const BACKUP_MAGIC: &[u8; 8] = b"ADCONB1\0";
+// Records and backups used to be encrypted with the same key that names the files
+// (ADPEER1, ADCONB1). The ADPEER2 and ADCONB2 formats give each use its own key. The
+// older formats are still read, and everything written is the new format.
+const LEGACY_MAGIC: &[u8; 8] = b"ADPEER1\0";
+const MAGIC: &[u8; 8] = b"ADPEER2\0";
+const LEGACY_BACKUP_MAGIC: &[u8; 8] = b"ADCONB1\0";
+const BACKUP_MAGIC: &[u8; 8] = b"ADCONB2\0";
+const RECORD_AEAD_LABEL: &[u8] = b"another-dimension-v2/verified-contact-record-aead/v2";
+const BACKUP_AEAD_LABEL: &[u8] = b"another-dimension-v2/contact-backup-aead/v2";
 static CONTACT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The rendezvous secret is separate from the initial invite and identifies
@@ -47,6 +54,16 @@ fn key(identity: &Identity) -> Zeroizing<[u8; 32]> {
         .expand(b"another-dimension-v2/verified-contact/v1", result.as_mut())
         .expect("valid HKDF output length");
     result
+}
+
+/// Key for contact records. Distinct from the filename key and the backup key.
+fn record_key(identity: &Identity) -> Zeroizing<[u8; 32]> {
+    crate::identity::purpose_key(&identity.storage_key(), RECORD_AEAD_LABEL)
+}
+
+/// Key for portable contact backups.
+fn backup_key(identity: &Identity) -> Zeroizing<[u8; 32]> {
+    crate::identity::purpose_key(&identity.storage_key(), BACKUP_AEAD_LABEL)
 }
 
 fn filename(identity: &Identity, peer: &[u8; 32]) -> String {
@@ -106,8 +123,8 @@ fn save_inner(
     }
     let mut nonce = [0; 12];
     crate::random::fill(&mut nonce)?;
-    let cipher =
-        ChaCha20Poly1305::new_from_slice(key(identity).as_ref()).map_err(io::Error::other)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(record_key(identity).as_ref())
+        .map_err(io::Error::other)?;
     let encrypted = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
@@ -150,14 +167,23 @@ pub fn load(
 ) -> io::Result<VerifiedContact> {
     let name = filename(identity, &peer_key);
     let bytes = fs::read(directory.join(format!("{name}.peer")))?;
-    if bytes.len() != 8 + 12 + 32 + 16 || &bytes[..8] != MAGIC {
+    if bytes.len() != 8 + 12 + 32 + 16 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid contact record",
         ));
     }
-    let cipher =
-        ChaCha20Poly1305::new_from_slice(key(identity).as_ref()).map_err(io::Error::other)?;
+    let record_key = if &bytes[..8] == MAGIC {
+        record_key(identity)
+    } else if &bytes[..8] == LEGACY_MAGIC {
+        key(identity)
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid contact record",
+        ));
+    };
+    let cipher = ChaCha20Poly1305::new_from_slice(record_key.as_ref()).map_err(io::Error::other)?;
     let plain = Zeroizing::new(
         cipher
             .decrypt(
@@ -187,8 +213,8 @@ pub fn export_backup(identity: &Identity, contact: &VerifiedContact) -> io::Resu
     let mut plain = Zeroizing::new(Vec::with_capacity(64));
     plain.extend_from_slice(&contact.peer_key);
     plain.extend_from_slice(contact.rendezvous_secret.as_ref());
-    let cipher =
-        ChaCha20Poly1305::new_from_slice(key(identity).as_ref()).map_err(io::Error::other)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(backup_key(identity).as_ref())
+        .map_err(io::Error::other)?;
     let encrypted = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
@@ -207,21 +233,31 @@ pub fn export_backup(identity: &Identity, contact: &VerifiedContact) -> io::Resu
 
 /// Authenticates before writing; a conflicting local record is preserved.
 pub fn import_backup(directory: &Path, identity: &Identity, backup: &[u8]) -> io::Result<[u8; 32]> {
-    if backup.len() != 8 + 12 + 64 + 16 || &backup[..8] != BACKUP_MAGIC {
+    if backup.len() != 8 + 12 + 64 + 16 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid contact backup",
         ));
     }
-    let cipher =
-        ChaCha20Poly1305::new_from_slice(key(identity).as_ref()).map_err(io::Error::other)?;
+    // The authenticated data is the magic the backup was written with.
+    let (backup_key, aad) = if &backup[..8] == BACKUP_MAGIC {
+        (backup_key(identity), BACKUP_MAGIC)
+    } else if &backup[..8] == LEGACY_BACKUP_MAGIC {
+        (key(identity), LEGACY_BACKUP_MAGIC)
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid contact backup",
+        ));
+    };
+    let cipher = ChaCha20Poly1305::new_from_slice(backup_key.as_ref()).map_err(io::Error::other)?;
     let plain = Zeroizing::new(
         cipher
             .decrypt(
                 Nonce::from_slice(&backup[8..20]),
                 Payload {
                     msg: &backup[20..],
-                    aad: BACKUP_MAGIC,
+                    aad,
                 },
             )
             .map_err(|_| {
@@ -363,5 +399,159 @@ mod tests {
         fs::write(file, bytes).unwrap();
         assert!(load(&path, &identity, [7; 32]).is_err());
         fs::remove_dir_all(path).unwrap();
+    }
+
+    fn scratch_directory(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("ad-contact-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// A contact record as the previous version wrote it: ADPEER1, encrypted with the
+    /// same key that names the file.
+    fn legacy_record(identity: &Identity, contact: &VerifiedContact) -> (String, Vec<u8>) {
+        let nonce = [0x42; 12];
+        let encrypted = ChaCha20Poly1305::new_from_slice(key(identity).as_ref())
+            .unwrap()
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: contact.rendezvous_secret.as_ref(),
+                    aad: &contact.peer_key,
+                },
+            )
+            .unwrap();
+        let mut bytes = LEGACY_MAGIC.to_vec();
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&encrypted);
+        (filename(identity, &contact.peer_key), bytes)
+    }
+
+    fn contact(value: u8) -> VerifiedContact {
+        VerifiedContact {
+            peer_key: [7; 32],
+            rendezvous_secret: Zeroizing::new([value; 32]),
+        }
+    }
+
+    #[test]
+    fn a_record_written_by_the_previous_version_still_loads_and_is_upgraded_on_rewrite() {
+        let directory = scratch_directory("legacy-record");
+        let (identity, _) = Identity::create().unwrap();
+        let (name, bytes) = legacy_record(&identity, &contact(3));
+        let path = directory.join(format!("{name}.peer"));
+        fs::write(&path, &bytes).unwrap();
+
+        let loaded = load(&directory, &identity, [7; 32]).unwrap();
+        assert_eq!(*loaded.rendezvous_secret, [3; 32]);
+
+        // Confirming a replacement rewrites it in the new format.
+        save_after_confirmation(&directory, &identity, &contact(4)).unwrap();
+        let rewritten = fs::read(&path).unwrap();
+        assert_eq!(&rewritten[..8], MAGIC, "the rewrite uses ADPEER2");
+        assert_eq!(
+            *load(&directory, &identity, [7; 32])
+                .unwrap()
+                .rendezvous_secret,
+            [4; 32]
+        );
+        // The upgrade must not have broken the legacy path for other records.
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_new_record_is_not_encrypted_with_the_filename_key() {
+        let directory = scratch_directory("new-record");
+        let (identity, _) = Identity::create().unwrap();
+        save(&directory, &identity, &contact(5)).unwrap();
+        let path = directory.join(format!("{}.peer", filename(&identity, &[7; 32])));
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[..8], MAGIC);
+        let decrypt_with = |key: &[u8; 32]| {
+            ChaCha20Poly1305::new_from_slice(key)
+                .unwrap()
+                .decrypt(
+                    Nonce::from_slice(&bytes[8..20]),
+                    Payload {
+                        msg: &bytes[20..],
+                        aad: &[7; 32],
+                    },
+                )
+                .is_ok()
+        };
+        assert!(decrypt_with(&record_key(&identity)));
+        assert!(
+            !decrypt_with(&key(&identity)),
+            "the key that names files must not open records"
+        );
+        assert!(!decrypt_with(&backup_key(&identity)), "nor the backup key");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_backup_from_the_previous_version_still_imports_and_new_backups_use_their_own_key() {
+        let directory = scratch_directory("backups");
+        let (identity, _) = Identity::create().unwrap();
+        // ADCONB1 as the previous version exported it.
+        let nonce = [0x24; 12];
+        let mut plain = Vec::new();
+        plain.extend_from_slice(&[7; 32]);
+        plain.extend_from_slice(&[8; 32]);
+        let encrypted = ChaCha20Poly1305::new_from_slice(key(&identity).as_ref())
+            .unwrap()
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plain,
+                    aad: LEGACY_BACKUP_MAGIC,
+                },
+            )
+            .unwrap();
+        let mut legacy = LEGACY_BACKUP_MAGIC.to_vec();
+        legacy.extend_from_slice(&nonce);
+        legacy.extend_from_slice(&encrypted);
+        assert_eq!(
+            import_backup(&directory, &identity, &legacy).unwrap(),
+            [7; 32]
+        );
+        assert_eq!(
+            *load(&directory, &identity, [7; 32])
+                .unwrap()
+                .rendezvous_secret,
+            [8; 32]
+        );
+
+        // New exports are ADCONB2 under the backup key, and they import too.
+        let exported = export_backup(&identity, &contact(9)).unwrap();
+        assert_eq!(&exported[..8], BACKUP_MAGIC);
+        let opens_with = |key: &[u8; 32]| {
+            ChaCha20Poly1305::new_from_slice(key)
+                .unwrap()
+                .decrypt(
+                    Nonce::from_slice(&exported[8..20]),
+                    Payload {
+                        msg: &exported[20..],
+                        aad: BACKUP_MAGIC,
+                    },
+                )
+                .is_ok()
+        };
+        assert!(opens_with(&backup_key(&identity)));
+        assert!(!opens_with(&key(&identity)));
+        assert!(!opens_with(&record_key(&identity)));
+        let second_directory = scratch_directory("backups-second");
+        assert_eq!(
+            import_backup(&second_directory, &identity, &exported).unwrap(),
+            [7; 32]
+        );
+        // A backup cannot be passed off under the other format's magic.
+        let mut mislabelled = exported.clone();
+        mislabelled[..8].copy_from_slice(LEGACY_BACKUP_MAGIC);
+        assert!(
+            import_backup(&scratch_directory("backups-third"), &identity, &mislabelled).is_err()
+        );
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(second_directory).unwrap();
     }
 }

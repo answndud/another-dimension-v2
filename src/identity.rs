@@ -235,6 +235,17 @@ impl Identity {
     }
 }
 
+/// A key for one purpose, derived from the storage key under its own label. A key that
+/// encrypts one kind of file is never also used to encrypt another or as a MAC key, so
+/// a weakness in one use cannot reach the others.
+pub(crate) fn purpose_key(storage_key: &[u8; 32], label: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0; 32]);
+    Hkdf::<Sha256>::new(None, storage_key)
+        .expand(label, key.as_mut())
+        .expect("32 bytes is a valid HKDF output length");
+    key
+}
+
 pub(crate) fn previous_public_ids(identity: &Identity) -> io::Result<Vec<String>> {
     let path = crate::history::data_directory()?
         .join(identity.public_id())
