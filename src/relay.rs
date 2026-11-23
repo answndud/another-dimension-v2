@@ -45,6 +45,8 @@ const EPOCH_INFO: &[u8] = b"another-dimension-v2/reconnect-epoch/v3";
 /// that stored an old event and replays it later is thereby ignored.
 const MAX_EVENT_AGE_SECONDS: u64 = 5 * 60;
 const READY_REQUEST_PREFIX: &[u8] = b"\0AD2-READY-1:";
+/// Length of the nonce in a ready request, as hex text.
+const READY_NONCE_HEX_LEN: usize = 24;
 const READY_ACK_PREFIX: &[u8] = b"\0AD2-READY-ACK-1:";
 /// The largest frame exchanged while a session is being set up. Unlike chat messages
 /// these frames are not padded: each is as long as its content (the identity proof is the
@@ -966,6 +968,8 @@ pub struct RelayRendezvous {
     clock: fn() -> u64,
     role: Role,
     seen: BTreeSet<String>,
+    /// The ids in `seen` in the order they arrived, so the oldest is the one forgotten.
+    seen_order: VecDeque<String>,
     attempt_tag: Option<String>,
     cancelled: Option<Arc<AtomicBool>>,
     timeout: Duration,
@@ -1065,6 +1069,7 @@ impl RelayRendezvous {
             clock: unix_now,
             role,
             seen: BTreeSet::new(),
+            seen_order: VecDeque::new(),
             attempt_tag,
             cancelled: None,
             timeout: RENDEZVOUS_TIMEOUT,
@@ -1122,7 +1127,7 @@ impl RelayRendezvous {
                     .map(|last: Instant| last.elapsed() >= READY_RETRY_INTERVAL)
                     .unwrap_or(true)
             {
-                let nonce = random_hex(12)?;
+                let nonce = random_hex(READY_NONCE_HEX_LEN / 2)?;
                 let mut request = READY_REQUEST_PREFIX.to_vec();
                 request.extend_from_slice(nonce.as_bytes());
                 self.publish_frame(&request)?;
@@ -1143,7 +1148,13 @@ impl RelayRendezvous {
                         }
                     }
                     Role::Responder => {
-                        if let Some(nonce) = frame.strip_prefix(READY_REQUEST_PREFIX) {
+                        // Our own requests carry a nonce of fixed length. A longer one
+                        // would make the acknowledgement too long to publish and end the
+                        // rendezvous, so it is ignored.
+                        if let Some(nonce) = frame
+                            .strip_prefix(READY_REQUEST_PREFIX)
+                            .filter(|nonce| nonce.len() == READY_NONCE_HEX_LEN)
+                        {
                             let mut acknowledgement = READY_ACK_PREFIX.to_vec();
                             acknowledgement.extend_from_slice(nonce);
                             self.publish_frame(&acknowledgement)?;
@@ -1386,13 +1397,14 @@ impl RelayRendezvous {
                             Some(_) => {}
                             None => self.attempt_tag = Some(attempt.to_owned()),
                         }
-                        if !self.seen.insert(event_id) {
+                        if !self.seen.insert(event_id.clone()) {
                             return Ok(None);
                         }
+                        self.seen_order.push_back(event_id);
                         // Forget the oldest ids instead of giving up: an attacker who can
                         // publish to the topic must not be able to end the rendezvous.
-                        while self.seen.len() > 64 {
-                            if let Some(oldest) = self.seen.iter().next().cloned() {
+                        while self.seen_order.len() > 64 {
+                            if let Some(oldest) = self.seen_order.pop_front() {
                                 self.seen.remove(&oldest);
                             }
                         }
@@ -3189,6 +3201,28 @@ mod tests {
             assert_eq!(receiver.receive_frame("test").unwrap(), index.to_be_bytes());
         }
         assert!(receiver.seen.len() <= 64);
+        assert_eq!(receiver.seen.len(), receiver.seen_order.len());
+        assert!(receiver
+            .seen_order
+            .iter()
+            .all(|id| receiver.seen.contains(id)));
+    }
+
+    #[test]
+    fn a_ready_request_with_an_oversized_nonce_does_not_end_the_rendezvous() {
+        let (mut sender, mut receiver) = rendezvous_pair(&reconnect_invite(), now, now);
+        let mut request = super::READY_REQUEST_PREFIX.to_vec();
+        // The request itself still fits (13 + 258), its acknowledgement (17 + 258) does not.
+        request.extend_from_slice("a".repeat(258).as_bytes());
+        sender.publish_frame(&request).unwrap();
+        // Echoing the nonce back would not fit in a bootstrap frame. The request is
+        // ignored, so the wait simply times out instead of failing on the publish.
+        receiver.peer_wait = Duration::from_millis(400);
+        let outcome = receiver.wait_for_peer_subscription();
+        assert!(
+            matches!(outcome, Err(RelayError::TimedOut(_))),
+            "{outcome:?}"
+        );
     }
 
     #[test]
