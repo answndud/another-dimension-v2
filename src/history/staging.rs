@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// Plaintext of a staged record: time 8, sender 1, text length 4, the text, a proof flag 1
+/// and, for a signed message, id 16 + signer 32 + recipient 32 + signature 64.
+const STAGED_PLAIN_FIXED: usize = 8 + 1 + 4 + 1;
+const STAGED_PROOF_BYTES: usize = 16 + 32 + 32 + 64;
+const AEAD_TAG_BYTES: usize = 16;
+/// Smallest and largest encrypted record the reader accepts (nonce excluded). The largest
+/// is a signed message of the longest accepted text, tag included.
+const STAGED_RECORD_MIN: usize = STAGED_PLAIN_FIXED + 1 + AEAD_TAG_BYTES;
+const STAGED_RECORD_MAX: usize =
+    STAGED_PLAIN_FIXED + MAX_MESSAGE_BYTES + STAGED_PROOF_BYTES + AEAD_TAG_BYTES;
+
 pub(crate) struct RestoreStaging {
     pub(crate) directory: PathBuf,
     pub(crate) file: File,
@@ -148,7 +159,7 @@ impl RestoreStaging {
         let mut length = [0; 4];
         self.file.read_exact(&mut length)?;
         let length = u32::from_be_bytes(length) as usize;
-        if !(13 + 1 + 16..=13 + MAX_MESSAGE_BYTES + 145).contains(&length)
+        if !(STAGED_RECORD_MIN..=STAGED_RECORD_MAX).contains(&length)
             || self.read_end - position < 4 + NONCE_BYTES as u64 + length as u64
         {
             return Err(invalid_data("invalid restore staging record length"));

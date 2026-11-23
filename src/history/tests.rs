@@ -606,6 +606,24 @@ fn chat_history_open_keeps_only_count_and_page_sized_results() {
 }
 
 #[test]
+fn restore_staging_holds_a_signed_message_of_the_largest_accepted_size() {
+    // A peer's signed message may carry up to MAX_MESSAGE_BYTES of text. The staging
+    // record then is the largest the reader has to accept: the length bound has to
+    // include the signature proof and the AEAD tag, or one such message makes every
+    // restore and backup check of that conversation fail.
+    let _data = IsolatedData::new();
+    let (identity, _) = Identity::create().unwrap();
+    let peer = "5a".repeat(32);
+    let signed =
+        super::sign_message(&identity, &peer, 77, "x".repeat(super::MAX_MESSAGE_BYTES)).unwrap();
+    let mut staging = super::RestoreStaging::create(&identity, &peer, &"5b".repeat(32)).unwrap();
+    staging.append_verified(&signed).unwrap();
+    staging.finish().unwrap();
+    assert_eq!(staging.next_record().unwrap(), Some(signed));
+    assert_eq!(staging.next_record().unwrap(), None);
+}
+
+#[test]
 fn restore_staging_encrypts_records_and_removes_only_its_owned_directory() {
     let _data = IsolatedData::new();
     let (identity, _) = Identity::create().unwrap();
