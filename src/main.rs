@@ -26,6 +26,7 @@ use zeroize::Zeroizing;
 
 const PAGE: &[u8] = include_bytes!("../web/index.html");
 const SCRIPT: &[u8] = include_bytes!("../web/app.js");
+const STYLESHEET: &[u8] = include_bytes!("../web/app.css");
 const REPROTECT_WORK_SCRIPT: &[u8] = include_bytes!("../web/reprotect-work.js");
 const MAX_HEADER: usize = 8192;
 // Full backups use the chunked transfer API; regular JSON bodies stay bounded.
@@ -1400,6 +1401,112 @@ mod send_tests {
             status_line(&ok_again).starts_with("HTTP/1.1 200"),
             "{ok_again}"
         );
+    }
+
+    const REQUIRED_RESPONSE_HEADERS: [&str; 6] = [
+        "Content-Security-Policy:",
+        "X-Content-Type-Options: nosniff",
+        "Cache-Control: no-store",
+        "Referrer-Policy: no-referrer",
+        "Cross-Origin-Opener-Policy: same-origin",
+        "Cross-Origin-Resource-Policy: same-origin",
+    ];
+
+    fn assert_security_headers(response: &str) {
+        let head = response.split("\r\n\r\n").next().unwrap_or("");
+        for header in REQUIRED_RESPONSE_HEADERS {
+            assert!(head.contains(header), "missing {header} in:\n{head}");
+        }
+        assert!(head.contains("Permissions-Policy: camera=()"), "{head}");
+        assert!(head.contains("frame-ancestors 'none'"), "{head}");
+        assert!(head.contains("style-src 'self';"), "{head}");
+        assert!(
+            !head.contains("unsafe-inline") && !head.contains("unsafe-eval"),
+            "the policy must not allow inline code: {head}"
+        );
+    }
+
+    #[test]
+    fn every_response_carries_the_security_headers_and_the_page_has_no_inline_style() {
+        let server = TestServer::start();
+        let get = |path: &str| {
+            let mut stream = server.connect();
+            write!(
+                stream,
+                "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                server.address
+            )
+            .unwrap();
+            read_response(&mut stream)
+        };
+        let page = get("/");
+        let stylesheet = get("/app.css");
+        let script = get("/app.js");
+        let missing = get("/nothing");
+        for response in [&page, &stylesheet, &script, &missing] {
+            assert_security_headers(response);
+        }
+        assert!(page.starts_with("HTTP/1.1 200 OK"), "{page}");
+        assert!(stylesheet.starts_with("HTTP/1.1 200 OK"), "{stylesheet}");
+        assert!(
+            stylesheet.contains("Content-Type: text/css"),
+            "{stylesheet}"
+        );
+        assert!(stylesheet.len() > 5000, "the stylesheet is served in full");
+        assert!(missing.starts_with("HTTP/1.1 400") || missing.starts_with("HTTP/1.1 404"));
+        // `style-src 'self'` blocks <style> and style="" so neither may come back.
+        let body = page.split("\r\n\r\n").nth(1).unwrap();
+        assert!(body.contains(r#"<link rel="stylesheet" href="/app.css">"#));
+        assert!(!body.contains("<style"), "no inline <style> block");
+        assert!(!body.contains(" style=\""), "no inline style attribute");
+        // Rejections carry the headers too.
+        let rejected = {
+            let mut stream = server.connect();
+            write!(
+                stream,
+                "POST /api/identity/status HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                server.address
+            )
+            .unwrap();
+            read_response(&mut stream)
+        };
+        assert!(rejected.starts_with("HTTP/1.1 403"), "{rejected}");
+        assert_security_headers(&rejected);
+    }
+
+    #[test]
+    fn paths_in_error_text_are_reduced_to_the_file_name() {
+        assert_eq!(
+            redact_paths("history rewrite failed (disk full); recoverable file: /Users/alec/project/chat-data/abc/.tmp-12.adlog"),
+            "history rewrite failed (disk full); recoverable file: …/.tmp-12.adlog"
+        );
+        assert_eq!(
+            redact_paths("open (/var/folders/xx/secret/file.backup): denied"),
+            "open (…/file.backup): denied"
+        );
+        // Words that merely look like routes or fractions are left alone.
+        assert_eq!(
+            redact_paths("backup import failed: invalid data /api"),
+            "backup import failed: invalid data /api"
+        );
+        assert_eq!(redact_paths("a/b is not a path"), "a/b is not a path");
+        assert_eq!(redact_paths(""), "");
+        // Several paths, and a path at the very end.
+        assert_eq!(
+            redact_paths("copy /a/b/c.txt to /d/e/f.txt"),
+            "copy …/c.txt to …/f.txt"
+        );
+    }
+
+    #[test]
+    fn client_message_hides_the_directory_layout_of_the_machine() {
+        let error = io::Error::other(
+            "restore failed; recoverable file: /Users/someone/private/chat-data/store/result.tmp",
+        );
+        let message = client_message("테스트", &error);
+        assert!(message.contains("result.tmp"));
+        assert!(!message.contains("/Users/"), "{message}");
+        assert!(!message.contains("private"), "{message}");
     }
 
     #[test]
@@ -4921,7 +5028,8 @@ fn spawn_chat_worker(
                                                 snapshot.history_restore_in_progress = false;
                                                 snapshot.history_restore_state = "failed";
                                                 snapshot.history_restore_status = Some(format!(
-                                                    "임시 기록을 검증하지 못했습니다: {error}"
+                                                    "임시 기록을 검증하지 못했습니다: {}",
+                                                    client_message("임시 기록 검증 오류", &error)
                                                 ));
                                             });
                                             continue;
@@ -5298,7 +5406,7 @@ fn queue_history_deletion(
                     }
                     Err(error) => {
                         snapshot.state = "failed";
-                        snapshot.error = Some(error.to_string());
+                        snapshot.error = Some(client_message("기록 삭제 오류", &error));
                     }
                 }
             }
@@ -5617,13 +5725,53 @@ fn read_request_head(
     }
 }
 
+/// Replaces absolute file system paths in an error text with `…/<file name>`. The
+/// directory layout of the user's machine does not belong in a response, while the
+/// file name is still enough to find a temporary file by hand.
+fn redact_paths(text: &str) -> String {
+    text.split(' ')
+        .map(|word| {
+            let is_edge =
+                |character: char| matches!(character, '(' | ')' | ',' | ';' | ':' | '"' | '\'');
+            let start = word.len() - word.trim_start_matches(is_edge).len();
+            let end = word.trim_end_matches(is_edge).len().max(start);
+            let core = &word[start..end];
+            if core.starts_with('/') && core[1..].contains('/') {
+                let name = core.rsplit('/').next().unwrap_or("");
+                format!("{}…/{name}{}", &word[..start], &word[end..])
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The text of an error for the page. The full error, which may name paths, goes to
+/// the terminal log so a person at the machine can still diagnose it.
+fn client_message(context: &str, error: &dyn std::fmt::Display) -> String {
+    let full = error.to_string();
+    eprintln!("{context}: {full}");
+    redact_paths(&full)
+}
+
+/// Sent with every response, including rejections. No inline styles or scripts are
+/// allowed, nothing may frame the page, and nothing is shared across origins.
+const SECURITY_HEADERS: &str = "Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'\r\n\
+X-Content-Type-Options: nosniff\r\n\
+Cache-Control: no-store\r\n\
+Referrer-Policy: no-referrer\r\n\
+Cross-Origin-Opener-Policy: same-origin\r\n\
+Cross-Origin-Resource-Policy: same-origin\r\n\
+Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=()\r\n";
+
 fn respond(
     stream: &mut TcpStream,
     status: &str,
     content_type: &str,
     body: &[u8],
 ) -> io::Result<()> {
-    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nContent-Security-Policy: default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", body.len())?;
+    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{SECURITY_HEADERS}Connection: close\r\n\r\n", body.len())?;
     stream.write_all(body)
 }
 
@@ -5689,6 +5837,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     }
     if first == "GET / HTTP/1.1" {
         return respond(&mut stream, "200 OK", "text/html; charset=utf-8", PAGE);
+    }
+    if first == "GET /app.css HTTP/1.1" {
+        return respond(&mut stream, "200 OK", "text/css; charset=utf-8", STYLESHEET);
     }
     if first == "GET /app.js HTTP/1.1" {
         return respond(
@@ -5896,7 +6047,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                     &mut stream,
                     "400 Bad Request",
                     "text/plain; charset=utf-8",
-                    error.to_string().as_bytes(),
+                    client_message("요청 처리 오류", &error).as_bytes(),
                 );
             }
             return reject(&mut stream, "500 Internal Server Error");
@@ -6762,7 +6913,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 &mut stream,
                 "500 Internal Server Error",
                 "text/plain; charset=utf-8",
-                error.to_string().as_bytes(),
+                client_message("요청 처리 오류", &error).as_bytes(),
             );
         }
         update_closed_chat_history(&state, &identity.public_id(), body, 0);
@@ -6906,7 +7057,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                         &mut stream,
                         status,
                         "text/plain; charset=utf-8",
-                        error.to_string().as_bytes(),
+                        client_message("요청 처리 오류", &error).as_bytes(),
                     );
                 }
                 let size = match std::fs::metadata(&path) {
@@ -7059,9 +7210,39 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 let cleanup = std::fs::remove_file(&path);
                 let restored = match (result, cleanup) {
                     (Ok(restored), Ok(())) => restored,
-                    (Err(error), Ok(())) => return respond(&mut stream, "400 Bad Request", "text/plain; charset=utf-8", error.to_string().as_bytes()),
-                    (Ok(_), Err(error)) => return respond(&mut stream, "500 Internal Server Error", "text/plain; charset=utf-8", format!("backup import completed but temporary upload cleanup failed ({error})").as_bytes()),
-                    (Err(error), Err(cleanup)) => return respond(&mut stream, "500 Internal Server Error", "text/plain; charset=utf-8", format!("backup import failed ({error}); temporary upload cleanup failed ({cleanup})").as_bytes()),
+                    (Err(error), Ok(())) => {
+                        return respond(
+                            &mut stream,
+                            "400 Bad Request",
+                            "text/plain; charset=utf-8",
+                            client_message("백업 가져오기 오류", &error).as_bytes(),
+                        )
+                    }
+                    (Ok(_), Err(error)) => {
+                        return respond(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "text/plain; charset=utf-8",
+                            format!(
+                                "backup import completed but temporary upload cleanup failed ({})",
+                                client_message("백업 업로드 정리 오류", &error)
+                            )
+                            .as_bytes(),
+                        )
+                    }
+                    (Err(error), Err(cleanup)) => {
+                        return respond(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "text/plain; charset=utf-8",
+                            format!(
+                                "backup import failed ({}); temporary upload cleanup failed ({})",
+                                client_message("백업 가져오기 오류", &error),
+                                client_message("백업 업로드 정리 오류", &cleanup)
+                            )
+                            .as_bytes(),
+                        )
+                    }
                 };
                 {
                     let state = state_handle
@@ -7115,7 +7296,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                         &mut stream,
                         "400 Bad Request",
                         "text/plain; charset=utf-8",
-                        error.to_string().as_bytes(),
+                        client_message("요청 처리 오류", &error).as_bytes(),
                     ),
                 };
             }
@@ -7191,16 +7372,35 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                             &mut stream,
                             "400 Bad Request",
                             "text/plain; charset=utf-8",
-                            error.to_string().as_bytes(),
+                            client_message("요청 처리 오류", &error).as_bytes(),
                         );
                     }
                     (Ok(_), Err(error)) => {
                         let _ = std::fs::remove_file(&output_path);
-                        return respond(&mut stream, "500 Internal Server Error", "text/plain; charset=utf-8", format!("reprotection completed but temporary upload cleanup failed ({error})").as_bytes());
+                        return respond(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "text/plain; charset=utf-8",
+                            format!(
+                                "reprotection completed but temporary upload cleanup failed ({})",
+                                client_message("재보호 업로드 정리 오류", &error)
+                            )
+                            .as_bytes(),
+                        );
                     }
                     (Err(error), Err(cleanup)) => {
                         let _ = std::fs::remove_file(&output_path);
-                        return respond(&mut stream, "500 Internal Server Error", "text/plain; charset=utf-8", format!("reprotection failed ({error}); temporary upload cleanup failed ({cleanup})").as_bytes());
+                        return respond(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "text/plain; charset=utf-8",
+                            format!(
+                                "reprotection failed ({}); temporary upload cleanup failed ({})",
+                                client_message("재보호 오류", &error),
+                                client_message("재보호 업로드 정리 오류", &cleanup)
+                            )
+                            .as_bytes(),
+                        );
                     }
                 };
                 let size = match std::fs::metadata(&output_path) {
@@ -7234,7 +7434,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                         &mut stream,
                         "500 Internal Server Error",
                         "text/plain; charset=utf-8",
-                        error.to_string().as_bytes(),
+                        client_message("요청 처리 오류", &error).as_bytes(),
                     ),
                 };
             }

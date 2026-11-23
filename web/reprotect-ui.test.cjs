@@ -4,6 +4,12 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const ReprotectWork = require('./reprotect-work.js');
 
+// The page is markup in index.html plus a stylesheet in app.css (the CSP forbids inline
+// styles), so tests that check either read both.
+function pageSource() {
+  return `${fs.readFileSync(`${__dirname}/index.html`, 'utf8')}\n${fs.readFileSync(`${__dirname}/app.css`, 'utf8')}`;
+}
+
 function deferred() {
   let resolve;
   let reject;
@@ -482,7 +488,7 @@ test('dashboard menu closes on outside click and Escape; management dialog reuse
   assert.equal(addedCodeView.hidden, true);
   assert.equal(harness.element('#identity-menu-toggle').focused, true);
 
-  const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
+  const html = pageSource();
   const menuPanel = html.slice(html.indexOf('id="identity-menu"'), html.indexOf('id="management-dialog"'));
   assert.ok(menuPanel.indexOf('class="menu-group-label">관리') < menuPanel.indexOf('class="menu-group menu-account"'));
   assert.match(html, /\.identity-menu-panel\s*\{[^}]*width:\s*min\(240px/);
@@ -576,7 +582,7 @@ test('brand button returns to the dashboard and global status has consistent sep
   assert.equal(returnButton.hidden, true);
   assert.equal(h.evaluate('operationId'), null);
 
-  const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
+  const html = pageSource();
   assert.match(html, /<h1><button id="brand-home"[^>]*>Another Dimension<\/button><\/h1>/);
   assert.match(html, /main\s*>\s*#message\s*\{[^}]*margin-top:\s*var\(--space-4\)/);
   assert.match(html, /main\s*>\s*:not\(\[hidden\]\):has\(\+ #message:not\(:empty\)\)\s*\{[^}]*margin-bottom:\s*0/);
@@ -603,7 +609,7 @@ test('chat UI keeps the message DOM safe and follows new messages only when alre
   harness.evaluate(`appendMessages([{ sender: '상대', time: 1700000001, text: 'older message' }])`);
   assert.equal(conversation.scrollTop, 200);
 
-  const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
+  const html = pageSource();
   assert.match(html, /main:has\(#chat-view:\s*not\(\[hidden\]\)\)[^{]*\{[^}]*width:\s*min\(100%,\s*960px\)/);
   assert.match(html, /#chat-view\s+#conversation\s*\{[^}]*min-height:\s*0;[^}]*max-height:\s*none;[^}]*overflow-y:\s*auto/s);
   assert.match(html, /#chat-view\s+\.entry\.mine\s*\{[^}]*align-self:\s*flex-end;[^}]*margin-left:\s*auto/s);
@@ -713,7 +719,7 @@ test('chat date separators and sender grouping survive polling batches and reset
 });
 
 test('history detail separates browsing, backup and deletion without replacing feature controls', () => {
-  const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
+  const html = pageSource();
   const detailStart = html.indexOf('<section id="history-detail"');
   const detail = html.slice(detailStart, html.indexOf('<p id="message"', detailStart));
   const ids = [...html.matchAll(/\bid="([^\"]+)"/g)].map((match) => match[1]);
@@ -778,7 +784,7 @@ test('bundle export accepts 128 selections and rejects 129 before requesting a b
   assert.equal(h.element('#message').textContent, '');
   assert.equal(h.requests.some((request) => request.path === '/api/history/backup-transfer'), false);
 
-  const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
+  const html = pageSource();
   const historyPane = html.slice(html.indexOf('id="management-history-pane"'), html.indexOf('</dialog>', html.indexOf('id="management-history-pane"')));
   assert.match(historyPane, /id="management-history-status"[^>]*role="status"[^>]*aria-live="polite"/);
 });
@@ -1198,7 +1204,7 @@ test('backup restore asks before applying authenticated linked identity data', a
 });
 
 test('backup import result stays visible without hover or focus', () => {
-  const html = fs.readFileSync(require.resolve('./index.html'), 'utf8');
+  const html = pageSource();
   assert.match(html, /<div id="history-backup-import-result" class="history-import-result" role="status" aria-live="polite" hidden><\/div>/);
   assert.match(html, /\.history-import-result\s*\{[^}]*display:\s*block/);
   assert.match(html, /\.history-import-result\[hidden\]\s*\{\s*display:\s*none\s*!important;/);
@@ -2582,7 +2588,7 @@ test('actual UI: chat phases show only the actions available at each step', asyn
   assert.equal(h.element('#send-form').hidden, true);
   assert.equal(h.element('#history-restore-request').hidden, true);
   assert.equal(h.element('#confirm-peer').disabled, false);
-  const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
+  const html = pageSource();
   assert.match(html, /<p class="verification-warning">하나라도 다르면 확인하지 마세요\.<\/p>\s*<button id="confirm-peer"/);
   assert.match(html, /id="confirm-peer"[^>]*>두 값을 비교했고 일치함을 확인했습니다</);
   assert.match(html, /#chat-view\[data-phase="verification"\] \.chat-workflows\s*\{[^}]*max-height:\s*none;[^}]*overflow:\s*visible;/);
@@ -3254,4 +3260,16 @@ test('polling stops when the session ends and does not retry with a dead token',
   await new Promise((resolve) => setTimeout(resolve, 450));
   assert.equal(h.requests.filter((item) => item.path === '/api/chat/status').length, 1,
     'no further poll is scheduled after the session ended');
+});
+
+test('the page keeps its styling in app.css so the content security policy needs no inline styles', () => {
+  const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
+  assert.match(html, /<link rel="stylesheet" href="\/app\.css">/);
+  assert.doesNotMatch(html, /<style[\s>]/);
+  assert.doesNotMatch(html, /\sstyle="/);
+  // Scripts may use the CSSOM (element.style.x = ...) but not set the attribute as text.
+  const script = fs.readFileSync(`${__dirname}/app.js`, 'utf8');
+  assert.doesNotMatch(script, /setAttribute\(\s*['"]style['"]/);
+  assert.doesNotMatch(script, /\.cssText\s*=/);
+  assert.doesNotMatch(script, /insertAdjacentHTML|\.innerHTML\s*=/);
 });

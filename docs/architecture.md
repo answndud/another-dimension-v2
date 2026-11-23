@@ -54,7 +54,7 @@ flowchart LR
 2. 모든 요청의 `Host`가 `127.0.0.1:<포트>`와 정확히 일치해야 합니다 (DNS rebinding 방어).
 3. 모든 POST는 정확한 `Origin`과 고정 `Content-Type`을 요구하며, 본문을 읽기 전에 검사합니다 (CSRF 방어).
 4. 터미널에 출력된 256비트 일회용 연결 코드(TTL 5분, 시도 5회)로 세션 토큰을 받고, 이후 요청은 `Authorization: Bearer`로 인증합니다. 토큰은 `sessionStorage`에만 둡니다. 세션은 1시간 동안 쓰지 않으면, 어떤 경우에도 12시간이 지나면 만료되고, 새 연결 코드 발급·로그아웃·연결 해제 때 끝납니다(동시 세션은 최대 4개). 토큰이 무효이면 401, 세션은 유효하지만 신원이 로그인되어 있지 않으면 412를 돌려주므로 화면이 두 경우를 구분합니다.
-5. 응답은 CSP(`default-src 'none'`, `script-src 'self'`, `frame-ancestors 'none'`), `nosniff`, `no-store`를 포함하며 CORS 헤더는 보내지 않습니다.
+5. 모든 응답(거절 포함)은 CSP(`default-src 'none'`, `script-src 'self'`, `style-src 'self'`, `frame-ancestors 'none'`), `nosniff`, `no-store`, `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy`·`Cross-Origin-Resource-Policy: same-origin`, `Permissions-Policy`를 포함하며 CORS 헤더는 보내지 않습니다. CSS는 `app.css`로 분리해 인라인 스타일이 없습니다. 오류 응답은 절대 경로를 파일명만 남기고 가립니다.
 6. 정적 파일은 `include_bytes!`로 내장해 파일 경로를 다루지 않습니다.
 7. 요청은 연결마다 별도 스레드에서 처리하며(동시 최대 16개, 넘으면 503), 헤더는 5초·본문은 30초 안에 도착해야 합니다(넘으면 408). 헤더 크기 제한(8 KiB)은 헤더에만 적용하고, `Content-Length`는 숫자만, 헤더 이름에 공백이 있으면 거부합니다. 백업 가져오기처럼 오래 걸리는 작업은 전역 락을 풀고 실행하며, 그동안 충돌하는 작업은 409로 막습니다.
 

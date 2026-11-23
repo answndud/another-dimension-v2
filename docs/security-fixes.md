@@ -19,6 +19,27 @@
 
 ## 기록
 
+## SF-005 응답 헤더 보강과 오류 응답의 경로 노출
+
+- 날짜: 2026-11-23
+- 심각도: Low
+- 위치: `src/main.rs`의 `respond()`, 오류를 응답 본문으로 보내는 약 11곳
+- 발견: 코드 리뷰에서 CSP가 `style-src 'unsafe-inline'`을 허용하고, `Referrer-Policy`와 교차 출처 격리 헤더가 없으며, 내부 `io::Error` 문자열(임시 파일의 절대 경로를 담을 수 있음)이 응답에 그대로 실린다는 점을 확인했습니다.
+- 영향: 로컬 전용 서버라 영향은 작습니다. 다만 인라인 스타일 허용은 마크업 삽입이 생길 경우 스타일 기반 데이터 유출의 문턱을 낮추고, 오류 문구는 사용자 계정 이름과 디렉터리 구조를 화면과 로그에 드러냅니다.
+- 수정:
+  1. 모든 응답(거절 포함)에 `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin`, 쓰지 않는 기능을 막는 `Permissions-Policy`를 붙였습니다.
+  2. `<style>` 블록을 `web/app.css`로 옮기고 `/app.css`로 제공하며 CSP를 `style-src 'self'`로 강화했습니다. 인라인 `style` 속성은 이미 없었고 스크립트는 CSSOM만 써서 막히지 않습니다.
+  3. 오류 응답의 절대 경로를 `…/파일명`으로 가리고, 전체 오류는 터미널 로그에만 남깁니다. 파일명은 남겨서 사용자가 복구용 임시 파일을 직접 찾을 수 있습니다.
+- 회귀 테스트:
+  - `every_response_carries_the_security_headers_and_the_page_has_no_inline_style`: 페이지, 스타일시트, 스크립트, 404, 거절 응답 모두에 헤더가 있고 `unsafe-inline`이 없으며 페이지에 `<style>`·`style=`이 없다.
+  - `paths_in_error_text_are_reduced_to_the_file_name`, `client_message_hides_the_directory_layout_of_the_machine`: 경로 가림.
+  - JS: 페이지가 `/app.css`를 링크하고 인라인 스타일, `setAttribute('style')`, `innerHTML` 대입이 없다.
+  - 헤더 한 줄을 빼거나, CSP에 `unsafe-inline`을 되돌리거나, 경로 가림을 끄면 각각 테스트가 실패하는 것을 확인했습니다.
+- 남은 한계:
+  - 채팅 상태 JSON으로 가는 오류(예: 임시 파일 정리 실패 안내)는 사용자가 직접 정리할 수 있도록 경로를 남깁니다. `client_message`를 거치는 곳만 가려집니다.
+  - 가림은 공백으로 구분된 `/`로 시작하는 단어를 기준으로 하는 휴리스틱입니다. 공백이 들어간 경로는 일부가 남을 수 있습니다.
+  - 터미널 로그에는 전체 오류(경로 포함)가 남습니다. 같은 기기 사용자의 터미널이므로 의도한 동작입니다.
+
 ## SF-004 느린 클라이언트 하나가 로컬 서버 전체를 멈출 수 있음
 
 - 날짜: 2026-11-23
