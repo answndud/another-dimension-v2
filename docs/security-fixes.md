@@ -19,6 +19,32 @@
 
 ## 기록
 
+## SF-007 비공개 파일의 생성 시점 권한과 rename 뒤의 디렉터리 동기화
+
+- 날짜: 2026-11-23
+- 심각도: Low (권한), Medium (내구성)
+- 위치: `src/history.rs`, `src/contacts.rs`, `src/identity.rs`, `src/main.rs`의 파일 생성·교체 지점(`OpenOptions` 30곳, 디렉터리 생성 11곳, rename 13곳)
+- 발견: 코드 리뷰에서 두 가지를 확인했습니다. 첫째, 대부분의 파일이 기본 umask로 만들어진 **뒤에** `set_private_file`로 권한을 줄여서, 그 사이에는 다른 사용자가 읽을 수 있는 상태였습니다(연락처와 신원 계보 파일만 생성 시 0600을 줬습니다). 둘째, 임시 파일을 쓰고 `sync_all` 한 다음 `rename` 했지만, 디렉터리 항목을 디스크에 내리지 않았습니다.
+- 영향:
+  - 권한: 데이터 디렉터리가 0700이라 실제 노출은 작았지만, 디렉터리가 느슨해지는 경우를 가정하면 비밀을 담은 파일이 잠깐 읽힐 수 있었습니다. 데이터 루트(`chat-data/`)는 기본 권한으로 만들어졌습니다.
+  - 내구성: 충돌이나 정전이 나면 성공으로 보고된 교체, 삭제, 복원이 사라지거나 인덱스와 대화 파일이 어긋날 수 있었습니다.
+- 수정: `src/fsutil.rs`에 공용 도우미를 만들고 운영 코드가 이것만 쓰도록 했습니다.
+  1. `private_options()`: 생성 시점에 모드 0600을 줍니다.
+  2. `create_private_dir_all()`: 새로 만드는 모든 디렉터리(없는 상위 포함)를 0700으로 만듭니다.
+  3. `rename_durable()`: rename 뒤에 바뀐 디렉터리를 동기화합니다. `sync_parent()`는 `hard_link`로 만든 항목에 같은 일을 합니다. macOS에서는 표준 라이브러리의 `sync_all`이 `F_FULLFSYNC`를 사용합니다.
+  디렉터리 동기화가 실패하면 로그만 남깁니다. 그 시점에 rename은 이미 일어났으므로, 오류를 돌려주면 호출자가 이미 바뀐 상태를 되돌리려고 해서 더 나빠집니다.
+- 회귀 테스트:
+  - `fsutil::tests::files_are_private_from_the_moment_they_are_created`: 느슨한 umask에서 일반 `OpenOptions`는 0666이 되고 `private_options`는 0600이다.
+  - `fsutil::tests::every_missing_directory_is_private`: 없는 상위 디렉터리까지 모두 0700이다.
+  - `fsutil::tests::production_code_creates_and_replaces_files_through_the_helpers`: 운영 코드가 `OpenOptions::new()`, `create_dir_all`, `rename`을 직접 쓰면 실패한다. 한 곳에서 일부러 되돌려 보면 실패하는 것을 확인했습니다.
+  - rename 관련 단위 테스트(대상 덮어쓰기, 디렉터리 간 이동, 없는 원본은 오류이고 대상 보존, `sync_parent`는 호출자를 실패시키지 않음).
+  - `history::tests::everything_written_for_an_identity_ends_up_owner_only_under_a_permissive_umask`와 설정 파일 테스트: 신원 데이터를 만드는 실제 경로를 느슨한 umask에서 실행하고, 결과 파일은 0600, 디렉터리는 0700임을 확인합니다.
+- 남은 한계:
+  - 위 통합 테스트는 **최종 상태만** 봅니다. 코드가 생성 직후 `set_private_file`을 다시 호출하는 곳이 남아 있어서, 헬퍼가 망가져도 이 테스트는 통과합니다(일부러 0644로 바꿔 보고 확인했습니다). 생성 시점의 보장은 헬퍼 단위 테스트와 소스 가드 테스트가 맡습니다.
+  - 새로 만든 파일이나 디렉터리의 항목 자체(rename이나 hard_link를 거치지 않는 첫 생성)는 동기화하지 않습니다. 충돌이 나면 막 만든 대화 로그와 첫 레코드가 함께 사라질 수 있습니다.
+  - 디렉터리 동기화는 Unix에서만 합니다.
+  - 이미 존재하던 파일의 권한은 `set_private_file`이 계속 담당합니다.
+
 ## SF-006 난수를 장치 파일에서 직접 읽던 18곳
 
 - 날짜: 2026-11-23

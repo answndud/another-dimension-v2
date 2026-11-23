@@ -10,7 +10,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::fs::{create_dir_all, read_dir, remove_dir, remove_file, rename, File, OpenOptions};
+use std::fs::{read_dir, remove_dir, remove_file, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -263,21 +263,21 @@ impl RestoreStaging {
         let root = data_directory()?
             .join(&identity_id)
             .join(".history-restore");
-        create_dir_all(&root)?;
+        crate::fsutil::create_private_dir_all(&root)?;
         set_private_directory(&root)?;
         cleanup_stale_restore_staging(&root)?;
         let directory = root.join(hex_encode(&random_nonce()?));
         std::fs::create_dir(&directory)?;
         set_private_directory(&directory)?;
         let result = (|| {
-            let lock = OpenOptions::new()
+            let lock = crate::fsutil::private_options()
                 .create_new(true)
                 .read(true)
                 .write(true)
                 .open(directory.join("owner.lock"))?;
             set_private_file(&lock)?;
             lock_restore_directory(&lock)?;
-            let mut file = OpenOptions::new()
+            let mut file = crate::fsutil::private_options()
                 .create_new(true)
                 .read(true)
                 .write(true)
@@ -623,7 +623,7 @@ fn migrate_legacy_history_streaming(
     let suffix = hex_encode(&random_nonce()?);
     let temporary = path.with_file_name(format!(".history-migrate-{suffix}.tmp"));
     let result = (|| {
-        let mut output = OpenOptions::new()
+        let mut output = crate::fsutil::private_options()
             .create_new(true)
             .read(true)
             .write(true)
@@ -656,7 +656,7 @@ fn migrate_legacy_history_streaming(
             }
         }
         output.sync_all()?;
-        rename(&temporary, path)?;
+        crate::fsutil::rename_durable(&temporary, path)?;
         Ok(truncated)
     })();
     if result.is_err() {
@@ -757,13 +757,13 @@ fn acquire_conversation_file_lock_at(
     peer_id: &str,
     key: &[u8; 32],
 ) -> io::Result<File> {
-    create_dir_all(directory)?;
+    crate::fsutil::create_private_dir_all(directory)?;
     set_private_directory(directory)?;
     let filename = format!(
         ".conversation-{}.lock",
         opaque_conversation_name(&derive_index_key(key), &peer_id.to_ascii_lowercase())
     );
-    let file = OpenOptions::new()
+    let file = crate::fsutil::private_options()
         .create(true)
         .truncate(false)
         .read(true)
@@ -804,7 +804,7 @@ impl History {
         let peer_id = peer_id.to_ascii_lowercase();
         let key = identity.storage_key();
         let directory = data_directory()?.join(&identity_id);
-        create_dir_all(&directory)?;
+        crate::fsutil::create_private_dir_all(&directory)?;
         set_private_directory(&directory)?;
         let operation_lock = conversation_operation_lock(&identity_id, &peer_id)?;
         let operation_guard = operation_lock
@@ -827,7 +827,7 @@ impl History {
             ));
         }
         let mut recovered_partial = false;
-        let mut file = OpenOptions::new()
+        let mut file = crate::fsutil::private_options()
             .create(true)
             .read(true)
             .append(true)
@@ -872,7 +872,7 @@ impl History {
                 Err(error) if reader.was_truncated() => {
                     let valid_end = reader.valid_end();
                     drop(reader);
-                    let file = OpenOptions::new().write(true).open(&path)?;
+                    let file = crate::fsutil::private_options().write(true).open(&path)?;
                     file.set_len(valid_end)?;
                     file.sync_all()?;
                     recovered_partial = true;
@@ -882,7 +882,10 @@ impl History {
                 Err(error) => return Err(error),
             }
         }
-        let file = OpenOptions::new().read(true).append(true).open(&path)?;
+        let file = crate::fsutil::private_options()
+            .read(true)
+            .append(true)
+            .open(&path)?;
         set_private_file(&file)?;
         let file_version = history_file_version(&file)?;
         register_conversation(identity, &identity_id, &peer_id, &directory)?;
@@ -966,7 +969,7 @@ impl History {
         let peer_id = peer_id.to_ascii_lowercase();
         let key = identity.storage_key();
         let directory = data_directory()?.join(&identity_id);
-        create_dir_all(&directory)?;
+        crate::fsutil::create_private_dir_all(&directory)?;
         set_private_directory(&directory)?;
         let operation_lock = conversation_operation_lock(&identity_id, &peer_id)?;
         let operation_guard = operation_lock
@@ -989,7 +992,7 @@ impl History {
                 format!("indexed conversation file is missing: {}", path.display()),
             ));
         }
-        let mut file = OpenOptions::new()
+        let mut file = crate::fsutil::private_options()
             .create(true)
             .read(true)
             .append(true)
@@ -1047,7 +1050,7 @@ impl History {
         let peer_id = peer_id.to_ascii_lowercase();
         let key = identity.storage_key();
         let directory = data_directory()?.join(&identity_id);
-        create_dir_all(&directory)?;
+        crate::fsutil::create_private_dir_all(&directory)?;
         set_private_directory(&directory)?;
         let operation_lock = conversation_operation_lock(&identity_id, &peer_id)?;
         let operation_guard = operation_lock
@@ -1069,7 +1072,7 @@ impl History {
                 format!("indexed conversation file is missing: {}", path.display()),
             ));
         }
-        let mut file = OpenOptions::new()
+        let mut file = crate::fsutil::private_options()
             .create(true)
             .read(true)
             .append(true)
@@ -1161,7 +1164,7 @@ impl History {
         let suffix = hex_encode(&random_nonce()?);
         let temporary = self.path.with_extension(format!("{suffix}.tmp"));
         let result = (|| {
-            let mut file = OpenOptions::new()
+            let mut file = crate::fsutil::private_options()
                 .create_new(true)
                 .read(true)
                 .append(true)
@@ -1179,7 +1182,7 @@ impl History {
                 file.write_all(&record)?;
             }
             file.sync_all()?;
-            rename(&temporary, &self.path)?;
+            crate::fsutil::rename_durable(&temporary, &self.path)?;
             let file_version = history_file_version(&file)?;
             self.file = file;
             self.next_index = messages.len() as u64;
@@ -1210,7 +1213,7 @@ impl History {
             filename.to_string_lossy()
         ));
         let result = (|| {
-            let mut output = OpenOptions::new()
+            let mut output = crate::fsutil::private_options()
                 .create_new(true)
                 .read(true)
                 .append(true)
@@ -1267,7 +1270,7 @@ impl History {
                 return Err(io::Error::other("injected history delete replace failure"));
             }
             let file_version = history_file_version(&output)?;
-            rename(&temporary, &self.path)?;
+            crate::fsutil::rename_durable(&temporary, &self.path)?;
             self.file_version = file_version;
             self.file = output;
             self.next_index = next_index;
@@ -1331,7 +1334,7 @@ impl History {
                     .ok_or_else(|| invalid_data("history record index overflow"))?;
             }
         }
-        let file = OpenOptions::new()
+        let file = crate::fsutil::private_options()
             .read(true)
             .append(true)
             .open(&self.path)?;
@@ -1495,7 +1498,7 @@ impl History {
                 &self.identity_id,
                 &self.peer_id,
             )?;
-            let append_file = OpenOptions::new()
+            let append_file = crate::fsutil::private_options()
                 .read(true)
                 .append(true)
                 .open(&temporary)?;
@@ -1506,7 +1509,7 @@ impl History {
                     "injected restore atomic replacement failure",
                 ));
             }
-            rename(&temporary, &self.path)?;
+            crate::fsutil::rename_durable(&temporary, &self.path)?;
             final_temp = None;
             let file_version = history_file_version(&append_file)?;
             self.file = append_file;
@@ -1729,7 +1732,10 @@ impl History {
                 identity_id.clone(),
                 peer_id.clone(),
             )?;
-            let append_file = OpenOptions::new().read(true).append(true).open(&path)?;
+            let append_file = crate::fsutil::private_options()
+                .read(true)
+                .append(true)
+                .open(&path)?;
             let mut history = History {
                 file: append_file,
                 path,
@@ -1803,7 +1809,7 @@ impl History {
         }
         let tombstone = directory.join(format!(".deleted-{}.tmp", hex_encode(&random_nonce()?)));
         if path.exists() {
-            rename(&path, &tombstone)?;
+            crate::fsutil::rename_durable(&path, &tombstone)?;
         }
         peers.retain(|existing| existing != &peer_id);
         if let Err(error) = write_index(identity, &identity_id, &directory, &peers) {
@@ -1814,10 +1820,10 @@ impl History {
                         "injected prior conversation restore failure",
                     ))
                 } else {
-                    rename(&tombstone, &path)
+                    crate::fsutil::rename_durable(&tombstone, &path)
                 };
                 #[cfg(not(test))]
-                let restore_result = rename(&tombstone, &path);
+                let restore_result = crate::fsutil::rename_durable(&tombstone, &path);
                 if let Err(restore_error) = restore_result {
                     return Err(io::Error::other(format!(
                         "history index update failed ({error}); restoring prior conversation failed ({restore_error}); recoverable file: {}",
@@ -1959,7 +1965,7 @@ impl History {
         }
         let workspace = backup_transfer_workspace(identity)?;
         let path = workspace.path.join(name);
-        let file = OpenOptions::new()
+        let file = crate::fsutil::private_options()
             .create_new(true)
             .read(true)
             .write(true)
@@ -2005,7 +2011,7 @@ impl History {
         let directory = data_directory()?
             .join(identity.public_id())
             .join(".backup-transfer");
-        create_dir_all(&directory)?;
+        crate::fsutil::create_private_dir_all(&directory)?;
         if !std::fs::symlink_metadata(&directory)?.file_type().is_dir() {
             return Err(invalid_data(
                 "backup transfer directory is not a real directory",
@@ -3215,7 +3221,7 @@ fn create_backup_transfer_workspace(root: &std::path::Path) -> io::Result<Backup
             return Err(error);
         }
         let lock_path = path.join("owner.lock");
-        let lock = match OpenOptions::new()
+        let lock = match crate::fsutil::private_options()
             .read(true)
             .write(true)
             .create_new(true)
@@ -3234,7 +3240,7 @@ fn create_backup_transfer_workspace(root: &std::path::Path) -> io::Result<Backup
             return Err(error);
         }
         let manifest_path = path.join("manifest");
-        let mut manifest = match OpenOptions::new()
+        let mut manifest = match crate::fsutil::private_options()
             .write(true)
             .create_new(true)
             .open(&manifest_path)
@@ -3439,7 +3445,7 @@ fn is_hex_string(value: &str, length: usize) -> bool {
 }
 
 fn open_nofollow(path: &std::path::Path, read_write: bool) -> io::Result<File> {
-    let mut options = OpenOptions::new();
+    let mut options = crate::fsutil::private_options();
     options.read(true).write(read_write);
     #[cfg(unix)]
     {
@@ -3450,7 +3456,7 @@ fn open_nofollow(path: &std::path::Path, read_write: bool) -> io::Result<File> {
 }
 
 fn open_manifest_append_nofollow(path: &std::path::Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
+    let mut options = crate::fsutil::private_options();
     options.append(true);
     #[cfg(unix)]
     {
@@ -4547,7 +4553,7 @@ fn write_linked_keys(identity: &Identity, peer_id: &str, linked: &LinkedIds) -> 
     let directory = path
         .parent()
         .ok_or_else(|| invalid_data("linked key directory unavailable"))?;
-    create_dir_all(directory)?;
+    crate::fsutil::create_private_dir_all(directory)?;
     set_private_directory(directory)?;
     let mut plaintext = Zeroizing::new(Vec::with_capacity(
         2 + (linked.0.len() + linked.1.len()) * 32,
@@ -4579,7 +4585,7 @@ fn write_linked_keys(identity: &Identity, peer_id: &str, linked: &LinkedIds) -> 
     contents.extend_from_slice(&nonce);
     contents.extend_from_slice(&encrypted);
     let temporary = path.with_extension(format!("{}.tmp", hex_encode(&random_nonce()?)));
-    let mut options = OpenOptions::new();
+    let mut options = crate::fsutil::private_options();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
@@ -4590,7 +4596,7 @@ fn write_linked_keys(identity: &Identity, peer_id: &str, linked: &LinkedIds) -> 
         let mut file = options.open(&temporary)?;
         file.write_all(&contents)?;
         file.sync_all()?;
-        rename(&temporary, &path)
+        crate::fsutil::rename_durable(&temporary, &path)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(temporary);
@@ -4928,7 +4934,7 @@ fn write_index(
         opaque_conversation_name(&key, &hex_encode(&nonce))
     ));
     let path = directory.join("conversations.idx");
-    let mut file = OpenOptions::new()
+    let mut file = crate::fsutil::private_options()
         .create_new(true)
         .write(true)
         .open(&temporary)?;
@@ -4938,7 +4944,7 @@ fn write_index(
     file.write_all(&encrypted)?;
     file.sync_all()?;
     drop(file);
-    rename(temporary, path)?;
+    crate::fsutil::rename_durable(temporary, path)?;
     Ok(())
 }
 
@@ -5205,7 +5211,11 @@ fn cleanup_stale_restore_staging(root: &std::path::Path) -> io::Result<()> {
             continue;
         }
         let lock_path = entry.path().join("owner.lock");
-        let lock = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+        let lock = match crate::fsutil::private_options()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
@@ -5292,7 +5302,7 @@ impl RestoreDiskIndex {
             .and_then(u64::checked_next_power_of_two)
             .unwrap_or(u64::MAX)
             .max(16);
-        let file = OpenOptions::new()
+        let file = crate::fsutil::private_options()
             .create_new(true)
             .read(true)
             .write(true)
@@ -5461,7 +5471,7 @@ fn write_restore_sort_run(
     *serial = serial
         .checked_add(1)
         .ok_or_else(|| invalid_data("restore sort run counter overflow"))?;
-    let mut file = OpenOptions::new()
+    let mut file = crate::fsutil::private_options()
         .create_new(true)
         .read(true)
         .write(true)
@@ -5511,7 +5521,7 @@ fn merge_encrypted_runs(
         }
         current.push(message);
     }
-    let mut output = OpenOptions::new()
+    let mut output = crate::fsutil::private_options()
         .create_new(true)
         .read(true)
         .write(true)
@@ -7761,6 +7771,77 @@ pub(crate) mod tests {
             messages.is_empty(),
             "forged messages must not reach history"
         );
+    }
+
+    /// Every file and directory below `root` as (path, mode), excluding `root` itself.
+    #[cfg(unix)]
+    fn modes_below(root: &std::path::Path) -> Vec<(PathBuf, u32)> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_owned()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                found.push((path.clone(), metadata.permissions().mode() & 0o777));
+                if metadata.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn everything_written_for_an_identity_ends_up_owner_only_under_a_permissive_umask() {
+        let data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let (older, _) = Identity::create().unwrap();
+        let peer = "a1".repeat(32);
+        crate::fsutil::with_permissive_umask(|| {
+            let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+            history.append(&message(1, "first")).unwrap();
+            // Replacing goes through a temporary file and a rename.
+            history
+                .replace(&[message(1, "first"), message(2, "second")])
+                .unwrap();
+            drop(history);
+            // The linked-key store and the identity lineage are separate files.
+            super::record_linked_local_identity(&identity, &peer, &older.public_id()).ok();
+            crate::identity::replace_previous_public_ids(&identity, &[older.public_id()]).unwrap();
+            let contacts = data.0.join(identity.public_id()).join("verified-contacts");
+            crate::contacts::save(
+                &contacts,
+                &identity,
+                &crate::contacts::VerifiedContact {
+                    peer_key: [7; 32],
+                    rendezvous_secret: zeroize::Zeroizing::new([9; 32]),
+                },
+            )
+            .unwrap();
+            // A backup transfer file and its workspace.
+            let (_, mut file) = History::create_backup_transfer_file(
+                &identity,
+                &format!("{}.backup", "0".repeat(64)),
+            )
+            .unwrap();
+            History::export_backup_stream(&identity, &peer, None, &mut file).unwrap();
+        });
+        let found = modes_below(&data.0);
+        assert!(
+            found.len() >= 8,
+            "the scenario should have written files: {found:?}"
+        );
+        for (path, mode) in &found {
+            let expected = if path.is_dir() { 0o700 } else { 0o600 };
+            assert_eq!(
+                *mode,
+                expected,
+                "{} is {mode:o} but must be {expected:o}",
+                path.display()
+            );
+        }
     }
 
     #[test]

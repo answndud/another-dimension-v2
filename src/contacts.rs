@@ -8,7 +8,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Mutex;
@@ -83,7 +83,7 @@ fn save_inner(
     let _guard = CONTACT_WRITE_LOCK
         .lock()
         .map_err(|_| io::Error::other("contact storage unavailable"))?;
-    fs::create_dir_all(directory)?;
+    crate::fsutil::create_private_dir_all(directory)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -122,23 +122,20 @@ fn save_inner(
         nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()
     ));
     let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
+        let mut file = crate::fsutil::private_options()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
         file.write_all(MAGIC)?;
         file.write_all(&nonce)?;
         file.write_all(&encrypted)?;
         file.sync_all()?;
         if replace_confirmed {
-            fs::rename(&temporary, &path)?;
+            crate::fsutil::rename_durable(&temporary, &path)?;
         } else {
             // A hard link avoids overwriting a concurrent writer.
             fs::hard_link(&temporary, &path)?;
+            crate::fsutil::sync_parent(&path);
         }
         Ok(())
     })();

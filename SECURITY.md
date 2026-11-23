@@ -37,6 +37,7 @@ Please do not open a public issue for a vulnerability. Use GitHub's private vuln
 - In Tor mode, every relay connection goes through the configured SOCKS proxy with remote name resolution, and the application never falls back to a direct connection.
 - The local web server binds to loopback only, checks `Host` and `Origin`, requires a 256-bit bearer token, and sends no CORS headers.
 - Requests are handled on separate threads (at most 16 at once). A client has 5 seconds to send the request head and 30 seconds for the body, so a client that sends bytes slowly cannot hold up the others. A running backup import does not block other requests; it only blocks work that would conflict with it.
+- Files and directories the application creates are owner-only from the moment they exist, and a rename is followed by a flush of the directory entry, so a crash does not bring back the old file after a write that was reported as successful. A newly created file's own directory entry is not flushed.
 - A session token expires after one hour without use and after twelve hours in any case. A new connection code, a logout, or an explicit disconnect ends sessions, so a copied token does not outlive the pairing it came from. At most four sessions exist at once.
 
 ## What it does not guarantee
@@ -59,10 +60,9 @@ These are known and documented, not hidden. Items are removed from this list onl
 4. **A single lost relay event stalls the chat.** Ephemeral events are not retransmitted, so a sequence gap eventually ends the session.
 5. **Reconnects reuse the same relay topic and key**, which lets a relay link the sessions of one pair over time.
 6. **The local history log has no generation id or end marker**, so a rolled-back or truncated file at a record boundary is not detected. An attacker who can replace every file together can always roll back; that case cannot be fully prevented on a single device.
-7. **Renames are not followed by a directory fsync**, so a crash can lose an operation that was reported as successful.
-8. **Secrets are not fully zeroized.** Key material is wrapped in `Zeroizing` where practical, but decrypted message text and some library-held keys are not wiped.
-9. **No audit and limited fuzzing.** The test suite is extensive but the parsers have not been fuzzed.
-10. **Dependency advisories.** `cargo audit` reports 9 `unsound` warnings for `heapless` 0.8.0, which `nostr` pulls in through `faster-hex`. They are not exploitable vulnerabilities in this application as far as I can tell, but I cannot remove them without upgrading the pinned `nostr` version.
+7. **Secrets are not fully zeroized.** Key material is wrapped in `Zeroizing` where practical, but decrypted message text and some library-held keys are not wiped.
+8. **No audit and limited fuzzing.** The test suite is extensive but the parsers have not been fuzzed.
+9. **Dependency advisories.** `cargo audit` reports 9 `unsound` warnings for `heapless` 0.8.0, which `nostr` pulls in through `faster-hex`. They are not exploitable vulnerabilities in this application as far as I can tell, but I cannot remove them without upgrading the pinned `nostr` version.
 
 ## Supply chain
 

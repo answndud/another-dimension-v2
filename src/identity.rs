@@ -3,7 +3,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use zeroize::Zeroizing;
 
@@ -161,7 +161,7 @@ impl Identity {
         }
 
         let result = (|| {
-            fs::create_dir_all(&destination)?;
+            crate::fsutil::create_private_dir_all(&destination)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -179,7 +179,7 @@ impl Identity {
             }
             let origin_path = destination.join(ORIGINS_FILE);
             let temporary = destination.join(format!(".{ORIGINS_FILE}.tmp"));
-            let mut options = OpenOptions::new();
+            let mut options = crate::fsutil::private_options();
             options.write(true).create_new(true);
             #[cfg(unix)]
             {
@@ -191,7 +191,7 @@ impl Identity {
                 writeln!(file, "{id}")?;
             }
             file.sync_all()?;
-            fs::rename(temporary, origin_path)?;
+            crate::fsutil::rename_durable(temporary, origin_path)?;
             for peer_id in crate::history::History::known_peer_ids(self)? {
                 let (messages, recovered_partial) =
                     crate::history::History::read_for_identity_copy(self, &peer_id)?;
@@ -287,7 +287,7 @@ pub(crate) fn replace_previous_public_ids(identity: &Identity, ids: &[String]) -
         ));
     }
     let directory = crate::history::data_directory()?.join(current);
-    fs::create_dir_all(&directory)?;
+    crate::fsutil::create_private_dir_all(&directory)?;
     let path = directory.join(ORIGINS_FILE);
     let mut suffix = [0_u8; 12];
     crate::random::fill(&mut suffix)?;
@@ -296,7 +296,7 @@ pub(crate) fn replace_previous_public_ids(identity: &Identity, ids: &[String]) -
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let temporary = directory.join(format!(".{ORIGINS_FILE}.{suffix}.tmp"));
-    let mut options = OpenOptions::new();
+    let mut options = crate::fsutil::private_options();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
@@ -309,7 +309,7 @@ pub(crate) fn replace_previous_public_ids(identity: &Identity, ids: &[String]) -
             writeln!(file, "{id}")?;
         }
         file.sync_all()?;
-        fs::rename(&temporary, path)
+        crate::fsutil::rename_durable(&temporary, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(temporary);

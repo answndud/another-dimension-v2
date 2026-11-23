@@ -1,5 +1,6 @@
 pub mod channel;
 mod contacts;
+mod fsutil;
 pub mod history;
 mod identity;
 mod random;
@@ -12,7 +13,7 @@ use identity::Identity;
 use relay::{InviteCode, RelayError, RelayRendezvous, RelaySession, RelayUpdate, DEFAULT_RELAY};
 use session::SessionStore;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{create_dir_all, rename, File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufRead, Read, Seek, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -1508,6 +1509,21 @@ mod send_tests {
         assert!(message.contains("result.tmp"));
         assert!(!message.contains("/Users/"), "{message}");
         assert!(!message.contains("private"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_settings_file_is_owner_only_under_a_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = TestDataDirectory::new();
+        let path = data.0.join("nested").join("preferences.json");
+        fsutil::with_permissive_umask(|| {
+            save_settings_to_path(&path, &AppSettings::default()).unwrap();
+        });
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
     }
 
     #[test]
@@ -5551,7 +5567,7 @@ fn save_settings_to_path(path: &std::path::Path, settings: &AppSettings) -> io::
     let directory = path
         .parent()
         .ok_or_else(|| io::Error::other("settings directory unavailable"))?;
-    create_dir_all(directory)?;
+    crate::fsutil::create_private_dir_all(directory)?;
     set_private_directory(directory)?;
     let contents = serde_json::to_vec(&serde_json::json!({
         "torSocks": settings.tor_socks.map(|address| address.to_string()),
@@ -5566,14 +5582,14 @@ fn save_settings_to_path(path: &std::path::Path, settings: &AppSettings) -> io::
     }
     let temporary = path.with_extension(format!("{}.tmp", random_token()?));
     let result = (|| {
-        let mut file = OpenOptions::new()
+        let mut file = crate::fsutil::private_options()
             .write(true)
             .create_new(true)
             .open(&temporary)?;
         set_private_file(&file)?;
         file.write_all(&contents)?;
         file.sync_all()?;
-        rename(&temporary, path)?;
+        crate::fsutil::rename_durable(&temporary, path)?;
         Ok(())
     })();
     if result.is_err() {
@@ -7113,7 +7129,11 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 let Some(path) = get_transfer_path(&id) else {
                     return reject(&mut stream, "400 Bad Request");
                 };
-                let mut file = match OpenOptions::new().read(true).append(true).open(path) {
+                let mut file = match crate::fsutil::private_options()
+                    .read(true)
+                    .append(true)
+                    .open(path)
+                {
                     Ok(file) => file,
                     Err(_) => return reject(&mut stream, "404 Not Found"),
                 };
