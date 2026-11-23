@@ -7,6 +7,13 @@ use std::fs;
 use std::io::{self, Write};
 use zeroize::Zeroizing;
 
+// Access code formats. Neither protects the seed with a secret: the code itself is
+// the secret. Anyone who has a code can recover the identity.
+//
+// * `AD1-<seed hex>` holds the seed in the clear.
+// * `AD2-<wrap key>-<nonce>-<ciphertext>` holds the seed encrypted under a random
+//   wrap key that is printed in the same code. That does not add confidentiality; its
+//   only effect is that every code issued for one identity is a different string.
 const LEGACY_PREFIX: &str = "AD1-";
 const PREFIX: &str = "AD2-";
 const KEY_CONTEXT: &[u8] = b"another-dimension-v2/identity-signing/v1";
@@ -74,8 +81,10 @@ impl Identity {
         Some(Self::from_seed(seed_bytes))
     }
 
-    /// Creates a fresh code that unlocks the same identity seed.
-    /// Older codes remain valid because they contain their own encrypted seed envelope.
+    /// Creates a fresh code for the same identity. Each code is a different string, but
+    /// all of them carry their own wrap key, so possession of any one of them is enough
+    /// to recover the identity (see the format notes above). Older codes stay valid and
+    /// cannot be revoked individually.
     pub fn create_access_code(&self) -> io::Result<Zeroizing<String>> {
         let mut wrap_key = Zeroizing::new([0_u8; CODE_KEY_BYTES]);
         let mut nonce = [0_u8; NONCE_BYTES];
@@ -367,5 +376,42 @@ mod tests {
         assert!(Identity::from_code(&code.to_ascii_uppercase()).is_none());
         let (_, other_code) = Identity::create().unwrap();
         assert_ne!(code.as_str(), other_code.as_str());
+    }
+
+    #[test]
+    fn a_code_is_the_whole_secret_and_codes_for_one_identity_cannot_be_told_apart_by_it() {
+        let (identity, first) = Identity::create().unwrap();
+        let second = identity.create_access_code().unwrap();
+        // Different strings, same identity: that is all the wrapping achieves.
+        assert_ne!(first.as_str(), second.as_str());
+        for code in [&first, &second] {
+            assert!(code.starts_with("AD2-"));
+            assert_eq!(
+                Identity::from_code(code).unwrap().public_id(),
+                identity.public_id()
+            );
+        }
+        // The wrap key is part of the code, so the code alone decrypts the seed. If a
+        // code ever needed something else, this would fail and the documentation
+        // (SECURITY.md, ADR 0003) would have to change with it.
+        let parts: Vec<_> = first.split('-').collect();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[1].len(), 64, "the wrap key is printed in the code");
+    }
+
+    #[test]
+    fn a_legacy_code_holds_the_seed_in_the_clear_and_still_restores_the_identity() {
+        let (identity, _) = Identity::create().unwrap();
+        let legacy = format!("AD1-{}", {
+            let mut seed_hex = String::new();
+            for byte in identity._seed.iter() {
+                seed_hex.push_str(&format!("{byte:02x}"));
+            }
+            seed_hex
+        });
+        assert_eq!(
+            Identity::from_code(&legacy).unwrap().public_id(),
+            identity.public_id()
+        );
     }
 }
