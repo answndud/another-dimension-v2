@@ -10,19 +10,6 @@ pub(crate) const PEER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 pub(crate) const PEER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 
-pub(crate) const SYNC_CHUNK_RECORDS: usize = 32;
-
-pub(crate) const SYNC_CHUNK_BYTES: usize = 64 * 1024;
-
-pub(crate) const RESTORE_PREVIEW_RECORDS: usize = 12;
-
-pub(crate) const MAX_MERGE_PENDING_MESSAGES: usize = 256;
-
-pub(crate) const MAX_MERGE_PENDING_BYTES: usize = 1024 * 1024;
-
-pub(crate) const RESTORE_MERGE_SEND_REJECTION: &str =
-    "기록 병합 중이라 메시지를 전송하지 않았습니다. 병합 완료 후 다시 보내세요.";
-
 pub(crate) enum ChatCommand {
     Confirm,
     Send(String, Sender<Result<(), String>>),
@@ -133,100 +120,6 @@ pub(crate) struct ChatSnapshot {
     pub(crate) message_epoch: u64,
 }
 
-pub(crate) const HISTORY_RESTORE_TIMEOUT: Duration = Duration::from_secs(30);
-
-pub(crate) fn history_restore_timed_out(started_at: Option<Instant>, now: Instant) -> bool {
-    started_at.is_some_and(|started| now.duration_since(started) > HISTORY_RESTORE_TIMEOUT)
-}
-
-pub(crate) fn history_restore_work_timed_out(
-    started_at: Option<Instant>,
-    request_pending: bool,
-    staging_pending: bool,
-    now: Instant,
-) -> bool {
-    (request_pending || staging_pending) && history_restore_timed_out(started_at, now)
-}
-
-pub(crate) fn reserve_history_restore_resolution(
-    snapshot: &mut ChatSnapshot,
-    accept: bool,
-) -> Result<&'static str, &'static str> {
-    if snapshot.phase != "connected" {
-        return Err("restore operation is not available");
-    }
-    let state = if accept {
-        if snapshot.history_restore_in_progress {
-            return Err("restore approval is already in progress");
-        }
-        match snapshot.history_restore_state {
-            "awaiting-transfer-consent" => "transfer-queued",
-            "awaiting-merge-consent" => "merge-queued",
-            _ => return Err("restore approval was already handled"),
-        }
-    } else if matches!(
-        snapshot.history_restore_state,
-        "idle" | "failed" | "merging" | "merge-queued" | "cancel-queued" | "completed"
-    ) {
-        return Err("restore operation cannot be declined in this state");
-    } else {
-        "cancel-queued"
-    };
-    snapshot.history_restore_state = state;
-    snapshot.history_restore_in_progress = true;
-    snapshot.history_restore_status = Some(match state {
-        "merge-queued" => {
-            "최종 병합 요청을 접수했습니다. 완료 여부는 연결 상태에서 확인합니다.".to_owned()
-        }
-        "transfer-queued" => "전송 동의 요청을 접수했습니다.".to_owned(),
-        _ => "복원 취소 요청을 접수했습니다.".to_owned(),
-    });
-    Ok(state)
-}
-
-pub(crate) fn history_restore_request_allowed(snapshot: &ChatSnapshot) -> bool {
-    snapshot.phase == "connected"
-        && !snapshot.history_restore_in_progress
-        && snapshot.history_restore_offer.is_empty()
-        && matches!(
-            snapshot.history_restore_state,
-            "idle" | "failed" | "completed"
-        )
-}
-
-pub(crate) fn mark_history_restore_timeout(snapshot: &mut ChatSnapshot) {
-    snapshot.history_restore_in_progress = false;
-    snapshot.history_restore_state = "failed";
-    snapshot.history_restore_received = 0;
-    snapshot.history_restore_total = 0;
-    snapshot.history_restore_offer.clear();
-    snapshot.history_restore_offer_count = 0;
-    snapshot.history_restore_legacy_count = 0;
-    snapshot.history_restore_estimate_bytes = 0;
-    snapshot.history_restore_status = Some(
-        "상대 기록 응답 시간이 초과되었습니다. 로컬 기록은 변경하지 않았습니다. 다시 연결되어 있으면 복원을 다시 요청할 수 있습니다."
-            .to_owned(),
-    );
-}
-
-pub(crate) fn reserve_history_restore_timeout(snapshot: &mut ChatSnapshot) -> bool {
-    if !matches!(
-        snapshot.history_restore_state,
-        "estimating" | "awaiting-transfer-consent" | "receiving" | "awaiting-merge-consent"
-    ) {
-        return false;
-    }
-    mark_history_restore_timeout(snapshot);
-    true
-}
-
-pub(crate) fn try_reserve_history_restore_timeout(operation: &ChatOperation) -> bool {
-    operation
-        .snapshot
-        .lock()
-        .is_ok_and(|mut snapshot| reserve_history_restore_timeout(&mut snapshot))
-}
-
 #[derive(Clone)]
 pub(crate) struct ChatEntry {
     pub(crate) unix_time: u64,
@@ -240,287 +133,6 @@ pub(crate) struct RestoreOfferEntry {
     pub(crate) sender: &'static str,
     pub(crate) text: String,
     pub(crate) signed: bool,
-}
-
-pub(crate) struct HistorySyncSender {
-    pub(crate) request_id: String,
-    pub(crate) reader: history::HistoryReader,
-    pub(crate) total_records: usize,
-    pub(crate) sent_records: usize,
-    pub(crate) next_chunk: usize,
-    pub(crate) pending_record: Option<history::StoredMessage>,
-    pub(crate) awaiting_chunk: Option<usize>,
-    pub(crate) awaiting_count: usize,
-    #[cfg(test)]
-    pub(crate) test_next_record: usize,
-    #[cfg(test)]
-    pub(crate) test_generated: Option<(usize, usize)>,
-}
-
-impl HistorySyncSender {
-    pub(crate) fn new(
-        request_id: String,
-        reader: history::HistoryReader,
-        total_records: usize,
-    ) -> Self {
-        Self {
-            request_id,
-            reader,
-            total_records,
-            sent_records: 0,
-            next_chunk: 0,
-            pending_record: None,
-            awaiting_chunk: None,
-            awaiting_count: 0,
-            #[cfg(test)]
-            test_next_record: 0,
-            #[cfg(test)]
-            test_generated: None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_generated_test(request_id: String, count: usize, text_bytes: usize) -> Self {
-        let file = File::open("/dev/null").expect("null file for test reader");
-        let reader = history::HistoryReader::empty_for_test(file);
-        let mut sender = Self::new(request_id, reader, count);
-        sender.test_generated = Some((count, text_bytes));
-        sender
-    }
-
-    pub(crate) fn next_record(&mut self) -> io::Result<Option<history::StoredMessage>> {
-        #[cfg(test)]
-        if let Some((count, text_bytes)) = self.test_generated {
-            if self.test_next_record >= count {
-                return Ok(None);
-            }
-            let index = self.test_next_record;
-            self.test_next_record += 1;
-            return Ok(Some(history::StoredMessage {
-                unix_time: index as u64,
-                sender: history::MessageSender::Me,
-                text: "x".repeat(text_bytes),
-                proof: None,
-            }));
-        }
-        self.reader.next_record()
-    }
-
-    pub(crate) fn next_chunk(&mut self) -> io::Result<Option<(usize, Vec<Vec<u8>>)>> {
-        if self.awaiting_chunk.is_some() || self.sent_records >= self.total_records {
-            return Ok(None);
-        }
-        let chunk_index = self.next_chunk;
-        let mut frames = Vec::new();
-        let mut bytes = 0usize;
-        while self.sent_records + frames.len() < self.total_records
-            && frames.len() < SYNC_CHUNK_RECORDS
-        {
-            let message = match self.pending_record.take() {
-                Some(message) => message,
-                None => self
-                    .next_record()?
-                    .ok_or_else(|| io::Error::other("history snapshot ended before estimate"))?,
-            };
-            let frame = history::encode_transfer_chunk(&message, &self.request_id, chunk_index)?;
-            if !frames.is_empty() && bytes.saturating_add(frame.len()) > SYNC_CHUNK_BYTES {
-                self.pending_record = Some(message);
-                break;
-            }
-            if frame.len() > SYNC_CHUNK_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "history record exceeds chunk limit",
-                ));
-            }
-            bytes += frame.len();
-            frames.push(frame);
-        }
-        self.awaiting_chunk = Some(chunk_index);
-        self.awaiting_count = frames.len();
-        Ok(Some((chunk_index, frames)))
-    }
-
-    pub(crate) fn acknowledge(&mut self, request_id: &str, chunk_index: usize) -> io::Result<bool> {
-        if request_id != self.request_id {
-            return Ok(false);
-        }
-        if self.awaiting_chunk != Some(chunk_index) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "duplicate or out-of-order history chunk acknowledgment",
-            ));
-        }
-        self.awaiting_chunk = None;
-        self.sent_records = self.sent_records.saturating_add(self.awaiting_count);
-        self.awaiting_count = 0;
-        self.next_chunk += 1;
-        Ok(self.sent_records == self.total_records)
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct HistorySyncReceiver {
-    pub(crate) request_id: Option<String>,
-    pub(crate) total_records: usize,
-    pub(crate) next_chunk: usize,
-    pub(crate) active_chunk: Option<(usize, usize, usize, usize)>,
-    pub(crate) received_records: usize,
-    pub(crate) received_bytes: usize,
-}
-
-impl HistorySyncReceiver {
-    pub(crate) fn begin(&mut self, request_id: &str, total_records: usize) -> io::Result<()> {
-        if !valid_sync_request_id(request_id) || self.request_id.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid history transfer start",
-            ));
-        }
-        *self = Self {
-            request_id: Some(request_id.to_owned()),
-            total_records,
-            ..Self::default()
-        };
-        Ok(())
-    }
-
-    pub(crate) fn begin_chunk(
-        &mut self,
-        request_id: &str,
-        chunk: usize,
-        count: usize,
-    ) -> io::Result<()> {
-        if self.request_id.as_deref() != Some(request_id)
-            || self.active_chunk.is_some()
-            || chunk != self.next_chunk
-            || count == 0
-            || count > SYNC_CHUNK_RECORDS
-            || self.received_records.saturating_add(count) > self.total_records
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "missing, duplicate, or out-of-order history chunk",
-            ));
-        }
-        self.active_chunk = Some((chunk, count, 0, 0));
-        Ok(())
-    }
-
-    pub(crate) fn record(
-        &mut self,
-        request_id: &str,
-        chunk: usize,
-        bytes: usize,
-    ) -> io::Result<()> {
-        let Some((active_chunk, expected, received, chunk_bytes)) = self.active_chunk else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "history record outside a chunk",
-            ));
-        };
-        if self.request_id.as_deref() != Some(request_id)
-            || chunk != active_chunk
-            || received >= expected
-            || chunk_bytes.saturating_add(bytes) > SYNC_CHUNK_BYTES
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "history chunk size or sequence is invalid",
-            ));
-        }
-        self.received_records += 1;
-        self.received_bytes += bytes;
-        self.active_chunk = Some((chunk, expected, received + 1, chunk_bytes + bytes));
-        Ok(())
-    }
-
-    pub(crate) fn end_chunk(&mut self, request_id: &str, chunk: usize) -> io::Result<()> {
-        let Some((expected_chunk, expected_records, received, _)) = self.active_chunk else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "history chunk end without a chunk",
-            ));
-        };
-        if self.request_id.as_deref() != Some(request_id)
-            || chunk != expected_chunk
-            || received != expected_records
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "history chunk end is out of order",
-            ));
-        }
-        self.active_chunk = None;
-        self.next_chunk += 1;
-        Ok(())
-    }
-
-    pub(crate) fn finish(&self, request_id: &str, total_records: usize) -> io::Result<()> {
-        if self.request_id.as_deref() != Some(request_id)
-            || self.active_chunk.is_some()
-            || total_records != self.total_records
-            || self.received_records != self.total_records
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "history transfer is incomplete",
-            ));
-        }
-        Ok(())
-    }
-}
-
-pub(crate) fn valid_sync_request_id(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-pub(crate) fn send_next_history_chunk(
-    session: &mut RelaySession,
-    sync: &mut HistorySyncSender,
-) -> io::Result<()> {
-    let (chunk, frames) = sync.next_chunk()?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "history sender is already awaiting acknowledgment",
-        )
-    })?;
-    session
-        .send(&chat_control(serde_json::json!({
-            "type": "history-sync-chunk-begin",
-            "requestId": sync.request_id,
-            "chunk": chunk,
-            "count": frames.len(),
-        })))
-        .map_err(|error| io::Error::other(format!("{error:?}")))?;
-    for frame in &frames {
-        session
-            .send(frame)
-            .map_err(|error| io::Error::other(format!("{error:?}")))?;
-    }
-    session
-        .send(&chat_control(serde_json::json!({
-            "type": "history-sync-chunk-end",
-            "requestId": sync.request_id,
-            "chunk": chunk,
-        })))
-        .map(|_| ())
-        .map_err(|error| io::Error::other(format!("{error:?}")))
-}
-
-pub(crate) fn send_history_sync_done(
-    session: &mut RelaySession,
-    request_id: &str,
-    count: usize,
-) -> io::Result<()> {
-    session
-        .send(&chat_control(serde_json::json!({
-            "type": "history-sync-done",
-            "requestId": request_id,
-            "totalCount": count,
-        })))
-        .map(|_| ())
-        .map_err(|error| io::Error::other(format!("{error:?}")))
 }
 
 /// Sender of entries that describe the connection itself. The page shows them apart from
@@ -539,33 +151,6 @@ pub(crate) fn chat_update(operation: &ChatOperation, update: impl FnOnce(&mut Ch
     }
 }
 
-pub(crate) fn discard_restore_staging(
-    staging: &mut Option<history::RestoreStaging>,
-    operation: &ChatOperation,
-) {
-    let mut cleanup_error = None;
-    if let Some(staging) = staging.take() {
-        if let Err(error) = staging.cleanup() {
-            cleanup_error = Some(error.to_string());
-            chat_update(operation, |snapshot| {
-                snapshot.history_restore_cleanup_error = Some(error.to_string());
-                snapshot.history_restore_state = "failed";
-                snapshot.history_restore_in_progress = false;
-            });
-        }
-    }
-    chat_update(operation, |snapshot| {
-        if snapshot.history_restore_state == "merge-queued" {
-            snapshot.history_restore_state = "failed";
-            snapshot.history_restore_in_progress = false;
-            snapshot.history_restore_status = Some(match cleanup_error {
-                Some(error) => format!("채팅 종료 전에 병합이 시작되지 않았습니다. 기존 기록은 변경되지 않았습니다. 임시 저장소 정리 실패: {error}"),
-                None => "채팅 종료 전에 병합이 시작되지 않았습니다. 기존 기록은 변경되지 않았습니다. 다시 연결해 복원을 다시 요청하세요.".to_owned(),
-            });
-        }
-    });
-}
-
 pub(crate) fn submit_chat_message(
     sender: &Sender<ChatCommand>,
     text: String,
@@ -579,79 +164,6 @@ pub(crate) fn submit_chat_message(
         "전송 결과를 확인할 수 없습니다. 입력을 보존하고 다시 보내기 전 기록을 확인하세요."
             .to_owned()
     })?
-}
-
-pub(crate) fn restore_merge_active(operation: &ChatOperation) -> bool {
-    operation
-        .snapshot
-        .lock()
-        .map(|snapshot| history_restore_is_merging(snapshot.history_restore_state))
-        .unwrap_or(true)
-}
-
-pub(crate) fn history_restore_is_merging(state: &str) -> bool {
-    matches!(state, "merge-queued" | "merging")
-}
-
-pub(crate) fn restore_merge_send_error(operation: &ChatOperation) -> Option<&'static str> {
-    restore_merge_active(operation).then_some(RESTORE_MERGE_SEND_REJECTION)
-}
-
-pub(crate) fn queue_incoming_message(operation: &ChatOperation, queued_len: usize) -> bool {
-    queued_len > 0 || restore_merge_active(operation)
-}
-
-pub(crate) fn append_pending_restore_messages(
-    operation: &ChatOperation,
-    history: &mut Option<history::History>,
-    messages: &mut VecDeque<history::StoredMessage>,
-    queued_bytes: &mut usize,
-    max_messages: usize,
-) -> io::Result<usize> {
-    if messages.is_empty() {
-        return Ok(0);
-    }
-    let _history_state_guard = operation
-        .history_state_lock
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let mut appended = 0usize;
-    while appended < max_messages {
-        let Some(entry) = messages.pop_front() else {
-            break;
-        };
-        *queued_bytes = queued_bytes.saturating_sub(entry.text.len());
-        let Some(current) = history.as_mut() else {
-            return Err(io::Error::other("대화 기록 핸들을 사용할 수 없습니다."));
-        };
-        current.append(&entry)?;
-        chat_update(operation, |snapshot| {
-            snapshot.message_count = snapshot.message_count.saturating_add(1);
-            snapshot.message_epoch = snapshot.message_epoch.wrapping_add(1);
-            snapshot.messages.push(chat_entry(entry));
-        });
-        appended += 1;
-    }
-    Ok(appended)
-}
-
-// The rejected entry is handed back to the caller, so the Err variant is large.
-// TODO(PLAN 3.1): revisit (e.g. Box the entry) when handlers are split into modules.
-#[allow(clippy::result_large_err)]
-pub(crate) fn queue_message_during_restore_merge(
-    messages: &mut VecDeque<history::StoredMessage>,
-    queued_bytes: &mut usize,
-    entry: history::StoredMessage,
-) -> Result<(), history::StoredMessage> {
-    let bytes = entry.text.len();
-    if messages.len() >= MAX_MERGE_PENDING_MESSAGES
-        || queued_bytes.saturating_add(bytes) > MAX_MERGE_PENDING_BYTES
-    {
-        return Err(entry);
-    }
-    *queued_bytes += bytes;
-    messages.push_back(entry);
-    Ok(())
 }
 
 pub(crate) fn chat_control(value: serde_json::Value) -> Vec<u8> {
@@ -684,14 +196,6 @@ pub(crate) fn reject_unframed_live_chat_message(operation: &ChatOperation, messa
         false,
     );
     true
-}
-
-pub(crate) fn restore_transfer_allowed(operation: &ChatOperation) -> bool {
-    operation
-        .snapshot
-        .lock()
-        .map(|snapshot| snapshot.history_restore_state == "receiving")
-        .unwrap_or(false)
 }
 
 pub(crate) fn chat_entry(item: history::StoredMessage) -> ChatEntry {
@@ -1031,10 +535,8 @@ pub(crate) fn spawn_chat_worker(
                     .map_err(|error| {
                         relay_failure_message(&error, "confirmation", tor_socks.is_some())
                     })?;
-                let directory = history::data_directory()
-                    .map_err(|_| "상대 확인 정보를 저장할 위치를 찾을 수 없습니다.".to_owned())?
-                    .join(identity.public_id())
-                    .join("verified-contacts");
+                let directory = contacts::directory_for(&identity)
+                    .map_err(|_| "상대 확인 정보를 저장할 위치를 찾을 수 없습니다.".to_owned())?;
                 contacts::save_after_confirmation(
                     &directory,
                     &identity,
@@ -1906,13 +1408,12 @@ pub(crate) fn spawn_chat_worker(
                                         .get("requestId")
                                         .and_then(serde_json::Value::as_str)
                                         .unwrap_or("");
-                                    if outgoing_sync
-                                        .as_ref()
-                                        .is_none_or(|sync| sync.request_id != request_id)
-                                    {
+                                    let Some(sync) = outgoing_sync
+                                        .as_mut()
+                                        .filter(|sync| sync.request_id == request_id)
+                                    else {
                                         continue;
-                                    }
-                                    let sync = outgoing_sync.as_mut().expect("checked sender");
+                                    };
                                     let begin = chat_control(serde_json::json!({
                                         "type": "history-sync-begin", "requestId": request_id,
                                         "totalCount": sync.total_records,
@@ -2153,10 +1654,10 @@ pub(crate) fn spawn_chat_worker(
                                             snapshot.history_restore_total = 0;
                                             snapshot.history_restore_status = Some(format!("기록 묶음이 완전하지 않아 전송을 중단했습니다: {error}. 로컬 기록은 변경하지 않았습니다."));
                                         });
-                                    } else {
+                                    } else if let Some(chunk) = chunk {
                                         restore_started_at = Some(Instant::now());
                                         let _ = session.send(&chat_control(serde_json::json!({
-                                            "type": "history-sync-ack", "requestId": request_id, "chunk": chunk.unwrap(),
+                                            "type": "history-sync-ack", "requestId": request_id, "chunk": chunk,
                                         })));
                                         chat_update(&operation, |snapshot| {
                                             snapshot.history_restore_received =

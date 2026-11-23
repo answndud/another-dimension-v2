@@ -10,9 +10,16 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use zeroize::Zeroizing;
+
+/// Where one identity's verified-contact records live.
+pub(crate) fn directory_for(identity: &Identity) -> io::Result<PathBuf> {
+    Ok(crate::history::data_directory()?
+        .join(identity.public_id())
+        .join("verified-contacts"))
+}
 
 // Records and backups used to be encrypted with the same key that names the files
 // (ADPEER1, ADCONB1). The ADPEER2 and ADCONB2 formats give each use its own key. The

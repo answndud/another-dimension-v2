@@ -50,7 +50,7 @@ pub(crate) fn encode_hex(bytes: &[u8]) -> String {
 pub(crate) fn random_token() -> io::Result<String> {
     let mut bytes = [0_u8; 32];
     crate::random::fill(&mut bytes)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(encode_hex(&bytes))
 }
 
 pub(crate) fn equal_token(left: &str, right: &str) -> bool {

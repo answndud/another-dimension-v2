@@ -11,7 +11,7 @@ Apple Silicon Mac에서 실행하는 로컬 1:1 텍스트 채팅 앱입니다. R
 
 구현을 직접 확인할 수 있도록 근거 파일을 함께 적었습니다. 전체 구조는 [docs/architecture.md](docs/architecture.md)를 보세요.
 
-- **로컬 API 방어** ([src/main.rs](src/main.rs)): 루프백 임의 포트에만 바인딩하고, 모든 요청의 `Host`와 POST의 `Origin`·`Content-Type`을 정확히 비교합니다. 256비트 일회용 연결 코드(TTL 5분, 시도 5회, 상수 시간 비교)로 세션 토큰을 받고, 토큰은 쿠키가 아닌 `sessionStorage`에 두고, 1시간 유휴·12시간 절대 만료이며 새 연결 코드 발급이나 로그아웃 때 모두 폐기합니다. 엄격한 CSP(인라인 스크립트·스타일 없음)와 `Referrer-Policy`·COOP·CORP·`Permissions-Policy`를 모든 응답에 붙이고 CORS 헤더는 보내지 않으며 `Transfer-Encoding`과 중복 헤더는 거부합니다.
+- **로컬 API 방어** ([src/http.rs](src/http.rs), [src/api/mod.rs](src/api/mod.rs)): 루프백 임의 포트에만 바인딩하고, 모든 요청의 `Host`와 POST의 `Origin`·`Content-Type`을 정확히 비교합니다. 256비트 일회용 연결 코드(TTL 5분, 시도 5회, 상수 시간 비교)로 세션 토큰을 받고, 토큰은 쿠키가 아닌 `sessionStorage`에 두고, 1시간 유휴·12시간 절대 만료이며 새 연결 코드 발급이나 로그아웃 때 모두 폐기합니다. 엄격한 CSP(인라인 스크립트·스타일 없음)와 `Referrer-Policy`·COOP·CORP·`Permissions-Policy`를 모든 응답에 붙이고 CORS 헤더는 보내지 않으며 `Transfer-Encoding`과 중복 헤더는 거부합니다.
 - **신원과 통신 키 분리** ([src/channel.rs](src/channel.rs)): Noise의 static 키는 연결마다 새로 만들고, 장기 신원은 별도의 Ed25519 키입니다. 핸드셰이크 해시에 대한 서명을 암호화된 전송 안에서 교환하므로 relay가 신원을 볼 수 없습니다. 양쪽의 증명과 사용자 확인 전에는 채팅 API를 호출할 수 없도록 typestate로 설계했습니다.
 - **프레임 순번과 재정렬 창** ([src/channel.rs](src/channel.rs)): 프레임마다 순번이 있고 32개 범위 안의 재정렬을 허용하며 중복은 무시합니다. 인증 실패는 세션을 닫습니다.
 - **인증 암호화 저장** ([src/history.rs](src/history.rs)): 대화 로그, 인덱스, 확인된 상대 기록을 ChaCha20-Poly1305로 보호합니다. 파일명은 상대 ID의 HMAC이고, 중간 레코드의 인증 실패는 오류로 처리하며 꼬리의 불완전한 레코드만 복구합니다.

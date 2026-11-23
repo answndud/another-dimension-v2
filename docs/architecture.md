@@ -9,8 +9,8 @@ flowchart LR
     subgraph Device["사용자 기기 (macOS)"]
         UI["브라우저 UI<br/>web/app.js, index.html"]
         subgraph Rust["Rust 프로세스 (127.0.0.1:임의포트)"]
-            HTTP["로컬 HTTP 서버<br/>main.rs"]
-            WORKER["채팅 워커<br/>main.rs"]
+            HTTP["로컬 HTTP 서버<br/>http.rs, api/"]
+            WORKER["채팅 워커<br/>chat_worker.rs"]
             CH["채널 상태 기계<br/>channel.rs (Noise + 서명)"]
             RELAY["relay 어댑터<br/>relay.rs (Nostr, wss, SOCKS)"]
             HIST["암호화 기록·백업<br/>history.rs"]
@@ -38,7 +38,14 @@ flowchart LR
 
 | 모듈 | 역할 |
 |---|---|
-| `src/main.rs` | 로컬 HTTP 서버, 연결 코드·세션 인증, API 라우팅, 채팅 워커, 설정 |
+| `src/main.rs` | 시작점: 데이터 위치 안내, 연결 코드 발급, 서버 시작 |
+| `src/http.rs` | 요청 파싱·deadline·크기 한도, 응답과 보안 헤더, 연결 수 제한, 서버 루프 |
+| `src/api/` | `mod.rs`의 라우트 표(메서드·경로 → 핸들러, 404/405, 세션 필요 여부)와 영역별 핸들러(`account`, `preferences`, `chat`, `conversations`, `contact_backup`, `backup_transfer`) |
+| `src/state.rs` | 공유 상태(세션, 신원, 진행 중인 채팅·삭제)와 그 보조 함수 |
+| `src/chat_worker.rs` | 채팅 워커 스레드(핸드셰이크 이후 송수신, heartbeat, 확인 대기) |
+| `src/history_sync.rs`, `src/restore.rs` | 기록 복원 제안의 청크 전송, 복원 중 시간 제한·대기열 |
+| `src/settings.rs` | 설정 파일 읽기·쓰기, 알림 |
+| `src/anchor.rs` | 대화 로그의 세대 id와 레코드 수를 따로 기억해 되돌림을 알아차림 |
 | `src/identity.rs` | 신원 시드 생성, 접속 코드(AD1/AD2) 복원, 서명 키·저장 키 유도, 신원 교체 시 데이터 복사 |
 | `src/channel.rs` | Noise XX 핸드셰이크, 신원 증명, 지문 확인, 세션 프레임 순번·재정렬 창 |
 | `src/relay.rs` | 초대 코드, Nostr 이벤트 송수신, 랑데부, wss/TLS, SOCKS5 |
@@ -126,6 +133,5 @@ flowchart TB
 
 ## 5. 알려진 구조적 한계
 
-- `main.rs`와 `history.rs`가 각각 6천 줄 이상으로 커서 모듈 분리가 필요합니다.
-- 저장 키가 일부 용도에서 같은 키로 직접 쓰이고 있어 용도별 키 분리가 필요합니다.
+- `history.rs`가 1만 줄 가까이 커서 분리가 필요합니다. `chat_worker.rs`의 `spawn_chat_worker`는 하나의 긴 함수로 남아 있습니다.
 - 보안 한계의 전체 목록은 [SECURITY.md](../SECURITY.md#known-weaknesses)에 있습니다.

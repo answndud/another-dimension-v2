@@ -1029,6 +1029,121 @@ fn call_test_api(state: &Arc<Mutex<State>>, path: &str, body: &str, token: &str)
     response
 }
 
+/// Sends an arbitrary request line with valid headers, to test routing.
+fn call_test_request_line(state: &Arc<Mutex<State>>, request_line: &str, token: &str) -> String {
+    use std::io::{Read, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(address).unwrap();
+    let request = format!(
+        "{request_line}\r\nHost: {address}\r\nOrigin: http://{address}\r\nAuthorization: Bearer {token}\r\nContent-Type: text/plain;charset=UTF-8\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    client.write_all(request.as_bytes()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    handle(server, &address.to_string(), state).unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    response
+}
+
+fn routing_test_state() -> Arc<Mutex<State>> {
+    Arc::new(Mutex::new(State {
+        code: String::new(),
+        issued: Instant::now(),
+        attempts: 0,
+        sessions: SessionStore::with_token("test-session"),
+        identity: None,
+        chats: HashMap::new(),
+        history_deletions: HashMap::new(),
+        active_history_deletions: HashSet::new(),
+        history_import_active: false,
+        tor_socks: None,
+        active_relays: vec![DEFAULT_RELAY.to_owned()],
+        settings: AppSettings::default(),
+        notifications_enabled: Arc::new(AtomicBool::new(false)),
+        last_notification: Arc::new(Mutex::new(None)),
+    }))
+}
+
+#[test]
+fn an_unknown_path_is_404_and_a_known_path_with_the_wrong_method_is_405() {
+    let state = routing_test_state();
+    for line in [
+        "GET /nothing HTTP/1.1",
+        "POST /api/nothing HTTP/1.1",
+        "POST /api/chat/send/extra HTTP/1.1",
+        "POST /api/chat/send HTTP/2",
+        "POST /api/chat/send",
+        "",
+    ] {
+        let response = call_test_request_line(&state, line, "test-session");
+        assert!(
+            response.starts_with("HTTP/1.1 404 Not Found"),
+            "{line:?}: {response}"
+        );
+    }
+    for line in [
+        "GET /api/chat/send HTTP/1.1",
+        "PUT /api/identity/status HTTP/1.1",
+        "DELETE /api/history/list HTTP/1.1",
+        "POST / HTTP/1.1",
+        "POST /app.js HTTP/1.1",
+    ] {
+        let response = call_test_request_line(&state, line, "test-session");
+        assert!(
+            response.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "{line:?}: {response}"
+        );
+    }
+}
+
+#[test]
+fn assets_are_served_without_a_session_and_every_api_route_needs_one() {
+    let state = routing_test_state();
+    for line in [
+        "GET / HTTP/1.1",
+        "GET /app.css HTTP/1.1",
+        "GET /app.js HTTP/1.1",
+        "GET /reprotect-work.js HTTP/1.1",
+    ] {
+        let response = call_test_request_line(&state, line, "");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "{line}: {response}"
+        );
+    }
+    for route in ROUTES.iter().filter(|route| match route.target {
+        Target::Api { session, .. } => session,
+        Target::Asset { .. } => false,
+    }) {
+        let line = format!("{} {} HTTP/1.1", route.method, route.path);
+        let response = call_test_request_line(&state, &line, "not-a-session");
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{line}: {response}"
+        );
+    }
+}
+
+#[test]
+fn the_route_table_has_no_duplicates_and_only_the_code_exchange_skips_the_session() {
+    let mut seen = HashSet::new();
+    for route in ROUTES {
+        assert!(
+            seen.insert((route.method, route.path)),
+            "{} {} appears twice",
+            route.method,
+            route.path
+        );
+    }
+    let open: Vec<_> = ROUTES
+        .iter()
+        .filter(|route| matches!(route.target, Target::Api { session: false, .. }))
+        .map(|route| route.path)
+        .collect();
+    assert_eq!(open, ["/api/connect"]);
+}
+
 fn closed_test_operation(owner: &str, peer: &str, count: usize, epoch: u64) -> Arc<ChatOperation> {
     let (sender, _) = mpsc::channel();
     Arc::new(ChatOperation {

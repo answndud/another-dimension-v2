@@ -49,8 +49,22 @@ mod tests {
             ("http.rs", include_str!("http.rs")),
             ("state.rs", include_str!("state.rs")),
             ("settings.rs", include_str!("settings.rs")),
-            ("api.rs", include_str!("api.rs")),
+            ("api/mod.rs", include_str!("api/mod.rs")),
+            ("api/account.rs", include_str!("api/account.rs")),
+            (
+                "api/backup_transfer.rs",
+                include_str!("api/backup_transfer.rs"),
+            ),
+            ("api/chat.rs", include_str!("api/chat.rs")),
+            (
+                "api/contact_backup.rs",
+                include_str!("api/contact_backup.rs"),
+            ),
+            ("api/conversations.rs", include_str!("api/conversations.rs")),
+            ("api/preferences.rs", include_str!("api/preferences.rs")),
             ("chat_worker.rs", include_str!("chat_worker.rs")),
+            ("history_sync.rs", include_str!("history_sync.rs")),
+            ("restore.rs", include_str!("restore.rs")),
         ] {
             assert!(
                 !source.contains(device),

@@ -140,7 +140,9 @@ fn main() -> io::Result<()> {
 
 mod api;
 mod chat_worker;
+mod history_sync;
 mod http;
+mod restore;
 #[cfg(test)]
 mod send_tests;
 mod settings;
@@ -148,6 +150,8 @@ mod state;
 
 use api::*;
 use chat_worker::*;
+use history_sync::*;
 use http::*;
+use restore::*;
 use settings::*;
 use state::*;
