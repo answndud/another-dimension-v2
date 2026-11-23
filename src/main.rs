@@ -17,7 +17,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -30,6 +30,21 @@ const REPROTECT_WORK_SCRIPT: &[u8] = include_bytes!("../web/reprotect-work.js");
 const MAX_HEADER: usize = 8192;
 // Full backups use the chunked transfer API; regular JSON bodies stay bounded.
 const MAX_BODY: usize = 2 * 1024 * 1024;
+/// Total time a client may take to send the request line and headers. A client that
+/// trickles one byte at a time is cut off instead of holding a connection open.
+const HEADER_DEADLINE: Duration = if cfg!(test) {
+    Duration::from_millis(700)
+} else {
+    Duration::from_secs(5)
+};
+/// Total time for the request body once the headers have arrived.
+const BODY_DEADLINE: Duration = if cfg!(test) {
+    Duration::from_millis(900)
+} else {
+    Duration::from_secs(30)
+};
+/// Requests handled at the same time. Further connections get 503 right away.
+const MAX_CONNECTIONS: usize = if cfg!(test) { 4 } else { 16 };
 const CHAT_CONTROL_PREFIX: &[u8] = b"[AD2-CONTROL/1] ";
 const CODE_LIFETIME: Duration = Duration::from_secs(300);
 const MAX_ATTEMPTS: u8 = 5;
@@ -56,6 +71,9 @@ struct State {
     chats: HashMap<String, Arc<ChatOperation>>,
     history_deletions: HashMap<String, Arc<HistoryDeletionOperation>>,
     active_history_deletions: HashSet<String>,
+    /// True while a backup import runs outside the State lock. It blocks the same
+    /// operations that an active chat or deletion would.
+    history_import_active: bool,
     tor_socks: Option<SocketAddr>,
     active_relays: Vec<String>,
     settings: AppSettings,
@@ -869,6 +887,7 @@ mod send_tests {
             chats: HashMap::new(),
             history_deletions: HashMap::new(),
             active_history_deletions: HashSet::new(),
+            history_import_active: false,
             tor_socks: None,
             active_relays: vec![DEFAULT_RELAY.to_owned()],
             settings: AppSettings::default(),
@@ -965,6 +984,7 @@ mod send_tests {
             chats: HashMap::new(),
             history_deletions: HashMap::new(),
             active_history_deletions: HashSet::new(),
+            history_import_active: false,
             tor_socks: None,
             active_relays: vec![DEFAULT_RELAY.to_owned()],
             settings: AppSettings::default(),
@@ -999,6 +1019,387 @@ mod send_tests {
 
     fn status_line(response: &str) -> &str {
         response.lines().next().unwrap_or("")
+    }
+
+    /// Feeds prepared chunks, then reports a stall, like a client that went quiet.
+    struct ChunkedReader {
+        chunks: VecDeque<Vec<u8>>,
+        closed: bool,
+    }
+
+    impl ChunkedReader {
+        fn new(data: &[u8], chunk: usize) -> Self {
+            Self {
+                chunks: data.chunks(chunk).map(<[u8]>::to_vec).collect(),
+                closed: false,
+            }
+        }
+    }
+
+    impl ReadWithin for ChunkedReader {
+        fn read_within(&mut self, buffer: &mut [u8], _: Instant) -> io::Result<usize> {
+            match self.chunks.pop_front() {
+                Some(chunk) => {
+                    buffer[..chunk.len()].copy_from_slice(&chunk);
+                    Ok(chunk.len())
+                }
+                None if self.closed => Ok(0),
+                None => Err(io::ErrorKind::TimedOut.into()),
+            }
+        }
+    }
+
+    fn head_of(size: usize) -> Vec<u8> {
+        // A request head of exactly `size` bytes, ending in the blank line.
+        let mut head = b"POST /x HTTP/1.1\r\nX-Pad: ".to_vec();
+        head.resize(size - 4, b'a');
+        head.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(head.len(), size);
+        head
+    }
+
+    fn read_head(data: &[u8], chunk: usize) -> (Result<usize, RequestReadError>, Vec<u8>) {
+        let mut reader = ChunkedReader::new(data, chunk);
+        let mut request = Vec::new();
+        let result = read_request_head(&mut reader, &mut request, Instant::now());
+        (result, request)
+    }
+
+    #[test]
+    fn a_head_that_fits_is_accepted_even_when_the_read_overshoots_the_limit() {
+        // The head ends at 8100 bytes, below the 8192 limit, and a body follows in the
+        // same reads. 1000-byte reads put the end of the head in a read that carries
+        // the buffer past the limit, which the old check rejected.
+        let mut data = head_of(8100);
+        data.extend_from_slice(&[b'b'; 1000]);
+        let (result, request) = read_head(&data, 1000);
+        assert_eq!(result, Ok(8100));
+        assert!(
+            request.len() > 8100,
+            "the start of the body stays in the buffer"
+        );
+    }
+
+    #[test]
+    fn a_head_over_the_limit_is_invalid() {
+        assert_eq!(
+            read_head(&vec![b'a'; 9000], 1000).0,
+            Err(RequestReadError::Invalid)
+        );
+        // The blank line exists but only after the limit.
+        assert_eq!(
+            read_head(&head_of(MAX_HEADER + 4), 1024).0,
+            Err(RequestReadError::Invalid)
+        );
+        assert_eq!(read_head(&head_of(MAX_HEADER), 1024).0, Ok(MAX_HEADER));
+    }
+
+    #[test]
+    fn the_end_of_the_head_is_found_across_read_boundaries() {
+        let head = head_of(200);
+        for chunk in [1, 2, 3, 7, 50] {
+            assert_eq!(read_head(&head, chunk).0, Ok(200), "chunk size {chunk}");
+        }
+    }
+
+    #[test]
+    fn a_closed_or_silent_client_is_not_a_complete_head() {
+        let mut reader = ChunkedReader::new(b"POST /x HTTP/1.1\r\n", 8);
+        reader.closed = true;
+        let mut request = Vec::new();
+        assert_eq!(
+            read_request_head(&mut reader, &mut request, Instant::now()),
+            Err(RequestReadError::Invalid)
+        );
+        assert_eq!(
+            read_head(b"POST /x HTTP/1.1\r\n", 8).0,
+            Err(RequestReadError::TimedOut)
+        );
+    }
+
+    struct TestServer {
+        address: String,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn start() -> Self {
+            let (identity, _) = Identity::create().unwrap();
+            let state = test_state_for(identity);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let (host, stop) = (address.clone(), Arc::clone(&stop));
+                thread::spawn(move || serve(listener, host, state, stop))
+            };
+            Self {
+                address,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn connect(&self) -> TcpStream {
+            let stream = TcpStream::connect(&self.address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+        }
+
+        fn get_page(&self) -> String {
+            let mut stream = self.connect();
+            write!(
+                stream,
+                "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                self.address
+            )
+            .unwrap();
+            let mut response = String::new();
+            let _ = stream.read_to_string(&mut response);
+            response
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // Wake the blocking accept so the loop sees the flag.
+            let _ = TcpStream::connect(&self.address);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn read_response(stream: &mut TcpStream) -> String {
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        response
+    }
+
+    #[test]
+    fn a_stalled_client_does_not_block_other_clients() {
+        let server = TestServer::start();
+        let mut stalled = server.connect();
+        stalled
+            .write_all(b"POST /api/identity/status HTTP/1.1\r\nHost: ")
+            .unwrap();
+        // While that connection sits half-open, another client is served at once.
+        let started = Instant::now();
+        let page = server.get_page();
+        assert!(page.starts_with("HTTP/1.1 200 OK"), "{page}");
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "served after {:?}, the stalled client held up the server",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_client_that_trickles_bytes_is_cut_off_at_the_header_deadline() {
+        let server = TestServer::start();
+        let mut slow = server.connect();
+        let started = Instant::now();
+        // One byte every 150 ms never hits a per-read timeout, but the head is not
+        // complete when the deadline passes.
+        for byte in b"POST /api/x HTTP/1.1".iter() {
+            // Once the server has cut the connection off, further writes fail.
+            if slow.write_all(&[*byte]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(150));
+        }
+        let response = read_response(&mut slow);
+        assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "cut off after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_stalled_body_is_cut_off_at_the_body_deadline() {
+        let server = TestServer::start();
+        let mut stream = server.connect();
+        write!(
+            stream,
+            "POST /api/identity/status HTTP/1.1\r\nHost: {0}\r\nOrigin: http://{0}\r\n\
+             Content-Type: text/plain;charset=UTF-8\r\nContent-Length: 100\r\n\r\n0123456789",
+            server.address
+        )
+        .unwrap();
+        let response = read_response(&mut stream);
+        assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+    }
+
+    #[test]
+    fn connections_beyond_the_limit_are_refused_and_capacity_recovers() {
+        let server = TestServer::start();
+        let idle: Vec<TcpStream> = (0..MAX_CONNECTIONS).map(|_| server.connect()).collect();
+        thread::sleep(Duration::from_millis(150));
+        let mut extra = server.connect();
+        let response = read_response(&mut extra);
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        // The idle clients hit the header deadline, which frees their slots.
+        thread::sleep(HEADER_DEADLINE + Duration::from_millis(400));
+        let page = server.get_page();
+        assert!(page.starts_with("HTTP/1.1 200 OK"), "{page}");
+        drop(idle);
+    }
+
+    #[test]
+    fn malformed_framing_headers_are_rejected() {
+        let server = TestServer::start();
+        let post = |extra: &str| {
+            let mut stream = server.connect();
+            write!(
+                stream,
+                "POST /api/identity/status HTTP/1.1\r\nHost: {0}\r\nOrigin: http://{0}\r\n\
+                 Content-Type: text/plain;charset=UTF-8\r\n{extra}\r\n",
+                server.address
+            )
+            .unwrap();
+            read_response(&mut stream)
+        };
+        // "+5" parsed as a valid length before.
+        assert!(post("Content-Length: +5\r\n").starts_with("HTTP/1.1 400"));
+        assert!(post("Content-Length: 0x5\r\n").starts_with("HTTP/1.1 400"));
+        assert!(post("Content-Length: \r\n").starts_with("HTTP/1.1 400"));
+        // A header name with whitespace was ignored silently before.
+        assert!(post("Content-Length : 0\r\n").starts_with("HTTP/1.1 400"));
+        // A normal request still gets through to the session check.
+        assert!(post("Content-Length: 0\r\n").starts_with("HTTP/1.1 401"));
+    }
+
+    /// Runs a request that is expected to finish quickly on another thread, so a test
+    /// fails with a message instead of hanging if the server is blocked.
+    fn call_within(
+        state: &Arc<Mutex<State>>,
+        path: &'static str,
+        body: &str,
+        limit: Duration,
+    ) -> Result<String, String> {
+        let (sender, receiver) = mpsc::channel();
+        let (state, body, data) = (
+            Arc::clone(state),
+            body.to_owned(),
+            history::test_data_directory(),
+        );
+        thread::spawn(move || {
+            history::set_test_data_directory(data);
+            let _ = sender.send(call_test_api(&state, path, &body, "test-session"));
+        });
+        receiver
+            .recv_timeout(limit)
+            .map_err(|_| format!("{path} did not answer within {limit:?}"))
+    }
+
+    #[test]
+    fn a_running_import_does_not_hold_the_state_lock_but_blocks_conflicting_work() {
+        let _data = TestDataDirectory::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "ef".repeat(32);
+        history::History::open(&identity, &peer)
+            .unwrap()
+            .0
+            .append(&history::StoredMessage {
+                unix_time: 7,
+                sender: history::MessageSender::Me,
+                text: "to be merged".to_owned(),
+                proof: None,
+            })
+            .unwrap();
+        let mut backup = Vec::new();
+        history::History::export_backup_stream(&identity, &peer, None, &mut backup).unwrap();
+        let state = test_state_for(identity);
+        let upload_id = upload_backup_bytes(&state, &backup);
+
+        // Make the import wait on the conversation lock after it has been reserved.
+        let hold = history::hold_conversation_for_test(
+            state.lock().unwrap().identity.as_ref().unwrap(),
+            &peer,
+        )
+        .unwrap();
+        let import_state = Arc::clone(&state);
+        let data = history::test_data_directory();
+        let import = thread::spawn(move || {
+            history::set_test_data_directory(data);
+            call_test_api(
+                &import_state,
+                "/api/history/backup-transfer",
+                &serde_json::json!({ "action": "import", "transferId": upload_id, "password": "" })
+                    .to_string(),
+                "test-session",
+            )
+        });
+        // try_lock, so a State lock held by the import fails the test instead of hanging it.
+        let started = Instant::now();
+        loop {
+            if state
+                .try_lock()
+                .is_ok_and(|guard| guard.history_import_active)
+            {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the import never started, or it is holding the State lock"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // The import is parked inside the history code. If it still held the State
+        // lock, none of these would be answered.
+        let limit = Duration::from_secs(3);
+        let ok = |path: &'static str| {
+            let response = call_within(&state, path, "", limit).unwrap();
+            assert!(
+                status_line(&response).starts_with("HTTP/1.1 200"),
+                "{path}: {response}"
+            );
+        };
+        ok("/api/identity/status");
+        ok("/api/settings/get");
+        // Work that would race with the import is refused.
+        for (path, body) in [
+            ("/api/chat/create", "x"),
+            ("/api/history/delete-conversation", peer.as_str()),
+            ("/api/contacts/import-backup", "{}"),
+        ] {
+            let response = call_within(&state, path, body, limit).unwrap();
+            assert!(
+                status_line(&response).starts_with("HTTP/1.1 409"),
+                "{path}: {response}"
+            );
+        }
+        let second = call_within(
+            &state,
+            "/api/history/backup-transfer",
+            r#"{"action":"import","transferId":"0000000000000000000000000000000000000000000000000000000000000000","password":""}"#,
+            limit,
+        )
+        .unwrap();
+        assert!(status_line(&second).starts_with("HTTP/1.1 409"), "{second}");
+
+        drop(hold);
+        let response = import.join().unwrap();
+        assert!(
+            status_line(&response).starts_with("HTTP/1.1 200"),
+            "{response}"
+        );
+        assert!(
+            !state.lock().unwrap().history_import_active,
+            "the reservation ends with the import"
+        );
+        let ok_again = call_within(&state, "/api/history/list", "", limit).unwrap();
+        assert!(
+            status_line(&ok_again).starts_with("HTTP/1.1 200"),
+            "{ok_again}"
+        );
     }
 
     #[test]
@@ -1253,6 +1654,7 @@ mod send_tests {
             chats: HashMap::new(),
             history_deletions: HashMap::new(),
             active_history_deletions: HashSet::new(),
+            history_import_active: false,
             tor_socks: None,
             active_relays: vec![DEFAULT_RELAY.to_owned()],
             settings: AppSettings::default(),
@@ -1980,6 +2382,7 @@ mod send_tests {
             chats,
             history_deletions: HashMap::new(),
             active_history_deletions: HashSet::new(),
+            history_import_active: false,
             tor_socks: None,
             active_relays: vec![DEFAULT_RELAY.to_owned()],
             settings: AppSettings::default(),
@@ -2124,6 +2527,7 @@ mod send_tests {
             chats,
             history_deletions: HashMap::new(),
             active_history_deletions: HashSet::new(),
+            history_import_active: false,
             tor_socks: None,
             active_relays: vec![DEFAULT_RELAY.to_owned()],
             settings: AppSettings::default(),
@@ -2410,6 +2814,7 @@ mod send_tests {
             chats: HashMap::from([("count-operation".to_owned(), Arc::clone(&operation))]),
             history_deletions: HashMap::new(),
             active_history_deletions: HashSet::new(),
+            history_import_active: false,
             tor_socks: None,
             active_relays: vec![DEFAULT_RELAY.to_owned()],
             settings: AppSettings::default(),
@@ -2746,6 +3151,7 @@ mod send_tests {
             ]),
             history_deletions: HashMap::new(),
             active_history_deletions: HashSet::new(),
+            history_import_active: false,
             tor_socks: None,
             active_relays: vec![DEFAULT_RELAY.to_owned()],
             settings: AppSettings::default(),
@@ -2804,6 +3210,7 @@ mod send_tests {
             ]),
             history_deletions: HashMap::new(),
             active_history_deletions: HashSet::new(),
+            history_import_active: false,
             tor_socks: None,
             active_relays: vec![DEFAULT_RELAY.to_owned()],
             settings: AppSettings::default(),
@@ -4750,10 +5157,25 @@ fn conversation_history_key(identity_id: &str, peer_id: &str) -> String {
     format!("{identity_id}:{}", peer_id.to_ascii_lowercase())
 }
 
+/// Whether history for this conversation is being changed: a deletion for it, or an
+/// import (which can touch any conversation).
 fn history_delete_active(state: &State, identity_id: &str, peer_id: &str) -> bool {
-    state
-        .active_history_deletions
-        .contains(&conversation_history_key(identity_id, peer_id))
+    state.history_import_active
+        || state
+            .active_history_deletions
+            .contains(&conversation_history_key(identity_id, peer_id))
+}
+
+/// Clears `history_import_active` when the import ends, including by panic, so one
+/// failed import cannot block chats until the next restart.
+struct ImportGuard(Arc<Mutex<State>>);
+
+impl Drop for ImportGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.history_import_active = false;
+        }
+    }
 }
 
 fn update_closed_chat_history(state: &State, identity_id: &str, peer_id: &str, message_count: u64) {
@@ -4798,6 +5220,9 @@ fn queue_history_deletion(
         } else {
             Err("deletion operation ID already exists")
         };
+    }
+    if state.history_import_active {
+        return Err("a backup import is in progress");
     }
     let reservation_key = conversation_history_key(&identity_id, &peer_id);
     if state.active_history_deletions.contains(&reservation_key) {
@@ -5114,6 +5539,84 @@ fn should_send_notification(last_notification: &Mutex<Option<Instant>>) -> bool 
     true
 }
 
+/// Reads that give up at an absolute deadline, so the limit covers the whole request
+/// and not each individual read.
+trait ReadWithin {
+    fn read_within(&mut self, buffer: &mut [u8], deadline: Instant) -> io::Result<usize>;
+}
+
+impl ReadWithin for TcpStream {
+    fn read_within(&mut self, buffer: &mut [u8], deadline: Instant) -> io::Result<usize> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.set_read_timeout(Some(remaining.min(Duration::from_secs(2))))?;
+        self.read(buffer)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RequestReadError {
+    TimedOut,
+    Invalid,
+}
+
+impl RequestReadError {
+    fn status(&self) -> &'static str {
+        match self {
+            Self::TimedOut => "408 Request Timeout",
+            Self::Invalid => "400 Bad Request",
+        }
+    }
+}
+
+fn read_error(error: &io::Error) -> RequestReadError {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    ) {
+        RequestReadError::TimedOut
+    } else {
+        RequestReadError::Invalid
+    }
+}
+
+/// Reads until the end of the headers and returns the header length. Bytes after the
+/// headers (the start of the body) stay in `request`. The size limit applies to the
+/// headers only, so a small body arriving in the same read is not counted against it.
+fn read_request_head(
+    stream: &mut impl ReadWithin,
+    request: &mut Vec<u8>,
+    deadline: Instant,
+) -> Result<usize, RequestReadError> {
+    let mut buffer = Zeroizing::new([0_u8; 1024]);
+    let mut searched: usize = 0;
+    loop {
+        let start = searched.saturating_sub(3);
+        if let Some(index) = request[start..]
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+        {
+            let end = start + index + 4;
+            return if end > MAX_HEADER {
+                Err(RequestReadError::Invalid)
+            } else {
+                Ok(end)
+            };
+        }
+        searched = request.len();
+        if request.len() > MAX_HEADER {
+            return Err(RequestReadError::Invalid);
+        }
+        match stream.read_within(buffer.as_mut(), deadline) {
+            Ok(0) => return Err(RequestReadError::Invalid),
+            Ok(n) => request.extend_from_slice(&buffer[..n]),
+            Err(error) => return Err(read_error(&error)),
+        }
+    }
+}
+
 fn respond(
     stream: &mut TcpStream,
     status: &str,
@@ -5129,23 +5632,13 @@ fn reject(stream: &mut TcpStream, status: &str) -> io::Result<()> {
 }
 
 fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>) -> io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut request = Zeroizing::new(Vec::new());
-    let mut buffer = Zeroizing::new([0; 1024]);
-    let header_end = loop {
-        if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-            break index + 4;
-        }
-        let n = stream.read(buffer.as_mut())?;
-        if n == 0 || request.len() + n > MAX_HEADER {
-            return reject(&mut stream, "400 Bad Request");
-        }
-        request.extend_from_slice(&buffer[..n]);
-    };
-    if header_end > MAX_HEADER {
-        return reject(&mut stream, "400 Bad Request");
-    }
+    let header_end =
+        match read_request_head(&mut stream, &mut request, Instant::now() + HEADER_DEADLINE) {
+            Ok(end) => end,
+            Err(error) => return reject(&mut stream, error.status()),
+        };
     let header = match std::str::from_utf8(&request[..header_end]) {
         Ok(value) => value,
         Err(_) => return reject(&mut stream, "400 Bad Request"),
@@ -5161,6 +5654,14 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some((name, value)) = line.split_once(':') else {
             return reject(&mut stream, "400 Bad Request");
         };
+        // A name with whitespace (for example "Host :") must not be silently ignored.
+        if name.is_empty()
+            || name
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        {
+            return reject(&mut stream, "400 Bad Request");
+        }
         let value = value.trim();
         let slot = if name.eq_ignore_ascii_case("host") {
             Some(&mut host)
@@ -5248,18 +5749,23 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     {
         return reject(&mut stream, "403 Forbidden");
     }
-    let body_len = match length.and_then(|value| value.parse::<usize>().ok()) {
+    let body_len = match length
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<usize>().ok())
+    {
         Some(value) if value <= MAX_BODY => value,
         _ => return reject(&mut stream, "400 Bad Request"),
     };
     let first = first.to_owned();
     let auth = authorization.map(str::to_owned);
     let mut body_buffer = Zeroizing::new([0; 8192]);
+    let body_deadline = Instant::now() + BODY_DEADLINE;
     while request.len() < header_end + body_len {
-        let n = stream.read(body_buffer.as_mut())?;
-        if n == 0 {
-            return reject(&mut stream, "400 Bad Request");
-        }
+        let n = match stream.read_within(body_buffer.as_mut(), body_deadline) {
+            Ok(0) => return reject(&mut stream, "400 Bad Request"),
+            Ok(n) => n,
+            Err(error) => return reject(&mut stream, read_error(&error).status()),
+        };
         request.extend_from_slice(&body_buffer[..n]);
     }
     if request.len() != header_end + body_len {
@@ -5420,7 +5926,10 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         if state.identity.is_none() {
             return reject(&mut stream, IDENTITY_REQUIRED);
         }
-        if !body.is_empty() || any_chat_active(&state) || !state.active_history_deletions.is_empty()
+        if !body.is_empty()
+            || any_chat_active(&state)
+            || !state.active_history_deletions.is_empty()
+            || state.history_import_active
         {
             return reject(&mut stream, "409 Conflict");
         }
@@ -5466,6 +5975,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     ) {
         if state.tor_socks != state.settings.tor_socks
             || state.active_relays != state.settings.relays
+            || state.history_import_active
         {
             return reject(&mut stream, "409 Conflict");
         }
@@ -5932,7 +6442,10 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let Some(identity) = state.identity.as_ref() else {
             return reject(&mut stream, IDENTITY_REQUIRED);
         };
-        if any_chat_active(&state) || !state.active_history_deletions.is_empty() {
+        if any_chat_active(&state)
+            || !state.active_history_deletions.is_empty()
+            || state.history_import_active
+        {
             return reject(&mut stream, "409 Conflict");
         }
         if body.len() > 256 {
@@ -6256,9 +6769,11 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
     }
     if first == "POST /api/history/backup-transfer HTTP/1.1" {
-        let Some(identity) = state.identity.as_ref() else {
+        // Owned, so the heavy actions below can release the State lock while they run.
+        let Some(identity_owned) = state.identity.as_ref().cloned() else {
             return reject(&mut stream, IDENTITY_REQUIRED);
         };
+        let identity = &identity_owned;
         let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(body) else {
             return reject(&mut stream, "400 Bad Request");
         };
@@ -6346,6 +6861,8 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 {
                     return reject(&mut stream, "409 Conflict");
                 }
+                // Export only reads history, so the State lock is not needed while it runs.
+                drop(state);
                 let id = match new_transfer_id() {
                     Ok(id) => id,
                     Err(_) => return reject(&mut stream, "500 Internal Server Error"),
@@ -6520,12 +7037,19 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 if !fields.is_empty()
                     || any_chat_active(&state)
                     || !state.active_history_deletions.is_empty()
+                    || state.history_import_active
                 {
                     return reject(&mut stream, "409 Conflict");
                 }
                 let Some(path) = get_transfer_path(&id) else {
                     return reject(&mut stream, "400 Bad Request");
                 };
+                // Reserve the import under the lock, then release it: a large import must
+                // not freeze every other request. The reservation keeps chats, other
+                // imports and deletions out until it ends (the guard also clears it on panic).
+                state.history_import_active = true;
+                drop(state);
+                let _import_guard = ImportGuard(Arc::clone(&state_handle));
                 let result = history::History::import_backup_file_with_policy(
                     identity,
                     &path,
@@ -6539,13 +7063,18 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                     (Ok(_), Err(error)) => return respond(&mut stream, "500 Internal Server Error", "text/plain; charset=utf-8", format!("backup import completed but temporary upload cleanup failed ({error})").as_bytes()),
                     (Err(error), Err(cleanup)) => return respond(&mut stream, "500 Internal Server Error", "text/plain; charset=utf-8", format!("backup import failed ({error}); temporary upload cleanup failed ({cleanup})").as_bytes()),
                 };
-                for (peer_id, message_count, _) in &restored {
-                    update_closed_chat_history(
-                        &state,
-                        &identity.public_id(),
-                        peer_id,
-                        *message_count as u64,
-                    );
+                {
+                    let state = state_handle
+                        .lock()
+                        .map_err(|_| io::Error::other("state unavailable"))?;
+                    for (peer_id, message_count, _) in &restored {
+                        update_closed_chat_history(
+                            &state,
+                            &identity.public_id(),
+                            peer_id,
+                            *message_count as u64,
+                        );
+                    }
                 }
                 let response = if restored.len() == 1 {
                     let (peer_id, count, linked) = &restored[0];
@@ -6572,6 +7101,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 let Some(path) = get_transfer_path(&id) else {
                     return reject(&mut stream, "400 Bad Request");
                 };
+                drop(state);
                 return match history::History::verify_backup_file(
                     identity,
                     &path,
@@ -6616,6 +7146,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 if !fields.is_empty() {
                     return reject(&mut stream, "400 Bad Request");
                 }
+                drop(state);
                 let Some(previous_identity) = Identity::from_code(&previous_code) else {
                     return reject(&mut stream, "400 Bad Request");
                 };
@@ -6796,6 +7327,7 @@ fn main() -> io::Result<()> {
         chats: HashMap::new(),
         history_deletions: HashMap::new(),
         active_history_deletions: HashSet::new(),
+        history_import_active: false,
         tor_socks,
         active_relays,
         settings,
@@ -6827,13 +7359,61 @@ fn main() -> io::Result<()> {
             }
         }
     });
+    serve(
+        listener,
+        address.to_string(),
+        state,
+        Arc::new(AtomicBool::new(false)),
+    );
+    Ok(())
+}
+
+/// Decrements the active-connection count when a request thread ends, even by panic.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Accepts connections until `stop` is set. Each request runs on its own thread, so a
+/// slow client cannot block the others, and at most `MAX_CONNECTIONS` run at once.
+fn serve(
+    listener: TcpListener,
+    expected_host: String,
+    state: Arc<Mutex<State>>,
+    stop: Arc<AtomicBool>,
+) {
+    let active = Arc::new(AtomicUsize::new(0));
     for connection in listener.incoming() {
-        match connection {
-            Ok(stream) => {
-                let _ = handle(stream, &address.to_string(), &state);
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let mut stream = match connection {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("로컬 연결 오류: {error}");
+                continue;
             }
-            Err(error) => eprintln!("로컬 연결 오류: {error}"),
+        };
+        if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            active.fetch_sub(1, Ordering::SeqCst);
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+            let _ = reject(&mut stream, "503 Service Unavailable");
+            continue;
+        }
+        let slot = ConnectionSlot(Arc::clone(&active));
+        let host = expected_host.clone();
+        let state = Arc::clone(&state);
+        if let Err(error) = thread::Builder::new()
+            .name("local-request".to_owned())
+            .spawn(move || {
+                let _slot = slot;
+                let _ = handle(stream, &host, &state);
+            })
+        {
+            eprintln!("요청 처리 스레드를 만들지 못했습니다: {error}");
         }
     }
-    Ok(())
 }

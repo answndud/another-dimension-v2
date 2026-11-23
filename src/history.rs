@@ -684,6 +684,47 @@ fn conversation_operation_lock(identity_id: &str, peer_id: &str) -> io::Result<A
     Ok(lock)
 }
 
+/// Keeps a conversation's in-process lock held until dropped, so a test can make an
+/// import wait at a known point without sleeping.
+#[cfg(test)]
+pub(crate) struct ConversationHold {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl Drop for ConversationHold {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn hold_conversation_for_test(
+    identity: &Identity,
+    peer_id: &str,
+) -> io::Result<ConversationHold> {
+    let lock = conversation_operation_lock(&identity.public_id(), peer_id)?;
+    let (locked_sender, locked_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let _guard = lock.lock().unwrap();
+        locked_sender.send(()).unwrap();
+        // Returns when the hold is dropped and the sender goes away.
+        let _ = release_receiver.recv();
+    });
+    locked_receiver
+        .recv()
+        .map_err(|_| io::Error::other("conversation hold failed"))?;
+    Ok(ConversationHold {
+        release: Some(release_sender),
+        thread: Some(thread),
+    })
+}
+
 fn acquire_conversation_file_lock(identity: &Identity, peer_id: &str) -> io::Result<File> {
     let identity_id = identity.public_id();
     let directory = data_directory()?.join(&identity_id);
