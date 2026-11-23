@@ -39,7 +39,40 @@ mod tests {
         let device = concat!("/dev/", "urandom");
         for (name, source) in [
             ("main.rs", include_str!("main.rs")),
-            ("history.rs", include_str!("history.rs")),
+            ("history/mod.rs", include_str!("history/mod.rs")),
+            ("history/log.rs", include_str!("history/log.rs")),
+            (
+                "history/conversations.rs",
+                include_str!("history/conversations.rs"),
+            ),
+            ("history/index.rs", include_str!("history/index.rs")),
+            ("history/staging.rs", include_str!("history/staging.rs")),
+            ("history/paths.rs", include_str!("history/paths.rs")),
+            ("history/wire.rs", include_str!("history/wire.rs")),
+            (
+                "history/linked_keys.rs",
+                include_str!("history/linked_keys.rs"),
+            ),
+            (
+                "history/transfer_workspace.rs",
+                include_str!("history/transfer_workspace.rs"),
+            ),
+            (
+                "history/backup/mod.rs",
+                include_str!("history/backup/mod.rs"),
+            ),
+            (
+                "history/backup/legacy.rs",
+                include_str!("history/backup/legacy.rs"),
+            ),
+            (
+                "history/backup/stream.rs",
+                include_str!("history/backup/stream.rs"),
+            ),
+            (
+                "history/backup/bundle.rs",
+                include_str!("history/backup/bundle.rs"),
+            ),
             ("relay.rs", include_str!("relay.rs")),
             ("channel.rs", include_str!("channel.rs")),
             ("identity.rs", include_str!("identity.rs")),
