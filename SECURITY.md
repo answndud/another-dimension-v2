@@ -39,13 +39,14 @@ Please do not open a public issue for a vulnerability. Use GitHub's private vuln
 - The local web server binds to loopback only, checks `Host` and `Origin`, requires a 256-bit bearer token, and sends no CORS headers. Every response, including rejections, carries a strict content security policy with no inline scripts or styles, `Referrer-Policy: no-referrer`, and cross-origin isolation headers. Error text shown to the page has absolute file paths reduced to the file name.
 - Requests are handled on separate threads (at most 16 at once). A client has 5 seconds to send the request head and 30 seconds for the body, so a client that sends bytes slowly cannot hold up the others. A running backup import does not block other requests; it only blocks work that would conflict with it.
 - Files and directories the application creates are owner-only from the moment they exist, and a rename is followed by a flush of the directory entry, so a crash does not bring back the old file after a write that was reported as successful. A newly created file's own directory entry is not flushed.
+- Chat messages are padded to one of four size classes before encryption, and an event carries no fixed marker and no session tag, so its length and contents do not identify this program or the exact message length. Subscription ids are random. Padding bytes must be zero and every other payload size is rejected.
 - Each direction of a chat derives a new key every 1,000 messages (Noise Rekey), so one key does not protect a long conversation. The key in force is determined by the message's sequence number, so lost messages cannot put the two sides out of step.
 - A session token expires after one hour without use and after twelve hours in any case. A new connection code, a logout, or an explicit disconnect ends sessions, so a copied token does not outlive the pairing it came from. At most four sessions exist at once.
 
 ## What it does not guarantee
 
 - **Real-world identity.** A matching code proves the two sides agree on the keys, not who is behind them. The comparison is only as safe as the channel the users use.
-- **Metadata privacy.** Relays see IP addresses (unless Tor is used), connection times, event sizes and timing. Message lengths are not padded.
+- **Metadata privacy.** Relays see IP addresses (unless Tor is used), connection times, event timing and how many events a session sends. Chat message lengths are hidden only up to four size classes (256, 1024, 4096 and 8176 bytes of payload), so an observer still learns roughly how long a message is. The sequence number of each event is sent in the clear, which shows how many messages one side has sent. Events are ephemeral, but anyone subscribed to the same kind can see them.
 - **Delivery.** A relay accepting an event does not mean the peer received or stored it. There are no read receipts and no offline queue.
 - **Deletion.** Local deletion does not remove the peer's copy or any backup, and it is not forensic erasure.
 - **Anonymity.** Tor mode covers only the relay connections. The external browser that opens message links is outside the application's control.

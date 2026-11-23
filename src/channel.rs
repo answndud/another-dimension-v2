@@ -23,8 +23,24 @@ const COMMIT_DOMAIN: &[u8] = b"another-dimension-v2/code-commitment/v3";
 const NONCE_SIZE: usize = 16;
 const MAX_HANDSHAKE_MESSAGE: usize = 128;
 const MAX_FRAME: usize = 8192;
+/// The largest relay envelope: the sequence header and a full frame.
+pub(crate) const MAX_ENVELOPE: usize = ENVELOPE_HEADER + MAX_FRAME;
 const FRAME_TAG: usize = 16;
-const ENVELOPE_HEADER: usize = 4 + 16 + 8;
+/// A relay envelope is the direction-local sequence number followed by the ciphertext.
+/// There is no fixed marker and no session tag: the event is already routed by its topic
+/// tag and signed by the peer's session key, and a frame from any other session fails to
+/// decrypt, so neither would add anything but a way to recognise this program's traffic.
+const ENVELOPE_HEADER: usize = 8;
+/// What kind of frame an encrypted payload carries. Only chat messages travel in a session.
+const FRAME_KIND_CHAT: u8 = 3;
+/// Chat payloads are padded with zeros to one of these sizes (before the 16 byte tag),
+/// so the length of an encrypted event tells an observer only which size class a message
+/// falls into. The last is the largest payload a frame can carry.
+const PADDING_BUCKETS: [usize; 4] = [256, 1024, 4096, MAX_FRAME - FRAME_TAG];
+/// Kind byte, sender role byte and the length of the message.
+const CHAT_PAYLOAD_HEADER: usize = 1 + 1 + 2;
+/// The smallest encrypted frame a padded payload produces.
+pub(crate) const SMALLEST_PADDED_FRAME: usize = PADDING_BUCKETS[0] + FRAME_TAG;
 const MAX_REORDER: u64 = 32;
 /// How long a hole in the sequence may stay open before the receiver gives up on the
 /// missing frames. Relay events are ephemeral and never retransmitted, so a frame that
@@ -33,7 +49,6 @@ pub(crate) const GAP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Messages sent between two key changes. After this many messages in a direction the
 /// sender derives a new key (Noise Rekey), so one key never protects a whole long chat.
 const REKEY_INTERVAL: u64 = 1000;
-const ENVELOPE_MAGIC: &[u8; 4] = b"ADV2";
 const ROUTE_DOMAIN: &[u8] = b"another-dimension-v2/relay-route/v2";
 const HASH_SIZE: usize = 32;
 const PROOF_SIZE: usize = 1 + 32 + 32 + HASH_SIZE + 64;
@@ -481,14 +496,25 @@ impl ActiveChannel {
         &self.peer_key
     }
 
+    /// The largest message one frame can carry once the header and padding are counted.
+    pub(crate) const MAX_MESSAGE: usize = MAX_FRAME - FRAME_TAG - CHAT_PAYLOAD_HEADER;
+
     pub fn write_message(&mut self, message: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-        if message.len() > MAX_FRAME - FRAME_TAG - 2 {
+        if message.len() > Self::MAX_MESSAGE {
             return Err(HandshakeError::InvalidMessage);
         }
-        let mut payload = Vec::with_capacity(message.len() + 2);
-        payload.push(3);
+        let needed = CHAT_PAYLOAD_HEADER + message.len();
+        let size = PADDING_BUCKETS
+            .iter()
+            .copied()
+            .find(|bucket| *bucket >= needed)
+            .ok_or(HandshakeError::InvalidMessage)?;
+        let mut payload = Zeroizing::new(Vec::with_capacity(size));
+        payload.push(FRAME_KIND_CHAT);
         payload.push(self.role.byte());
+        payload.extend_from_slice(&(message.len() as u16).to_be_bytes());
         payload.extend_from_slice(message);
+        payload.resize(size, 0);
         encrypt(&mut self.transport, &payload)
     }
 
@@ -514,13 +540,25 @@ impl ActiveChannel {
     }
 
     pub fn read_message(&mut self, frame: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-        let mut payload = decrypt(&mut self.transport, frame, MAX_FRAME - FRAME_TAG)?;
-        if payload.len() < 2 || payload[0] != 3 || payload[1] != self.role.peer().byte() {
+        let payload = decrypt(&mut self.transport, frame, MAX_FRAME - FRAME_TAG)?;
+        if payload.len() < CHAT_PAYLOAD_HEADER
+            || payload[0] != FRAME_KIND_CHAT
+            || payload[1] != self.role.peer().byte()
+            // Only the sizes we send are valid, so a frame cannot hide extra bytes.
+            || !PADDING_BUCKETS.contains(&payload.len())
+        {
             return Err(HandshakeError::InvalidMessage);
         }
-        let message = payload.split_off(2);
-        payload.fill(0);
-        Ok(message)
+        let length = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
+        let end = CHAT_PAYLOAD_HEADER + length;
+        if end > payload.len() {
+            return Err(HandshakeError::InvalidMessage);
+        }
+        // The padding is all zeros; anything else would be a hidden channel.
+        if payload[end..].iter().any(|byte| *byte != 0) {
+            return Err(HandshakeError::InvalidMessage);
+        }
+        Ok(payload[CHAT_PAYLOAD_HEADER..end].to_vec())
     }
 
     pub fn local_public_key(&self) -> &[u8; 32] {
@@ -588,8 +626,6 @@ impl SessionTransport {
             self.channel.rekey_outgoing();
         }
         let mut envelope = Vec::with_capacity(ENVELOPE_HEADER + ciphertext.len());
-        envelope.extend_from_slice(ENVELOPE_MAGIC);
-        envelope.extend_from_slice(&self.channel.session_tag);
         envelope.extend_from_slice(&sequence.to_be_bytes());
         envelope.extend_from_slice(&ciphertext);
         Ok(envelope)
@@ -605,11 +641,8 @@ impl SessionTransport {
         {
             return Err(HandshakeError::InvalidEnvelope);
         }
-        if &envelope[..4] != ENVELOPE_MAGIC || envelope[4..20] != self.channel.session_tag {
-            return Err(HandshakeError::InvalidEnvelope);
-        }
         let sequence = u64::from_be_bytes(
-            envelope[20..28]
+            envelope[..ENVELOPE_HEADER]
                 .try_into()
                 .map_err(|_| HandshakeError::InvalidEnvelope)?,
         );
@@ -1239,30 +1272,201 @@ mod tests {
         // the receiver has moved on, so it is treated as an old duplicate and ignored.
         let third = sender.send(b"three").unwrap();
         let mut forged = third.clone();
-        forged[20..28].copy_from_slice(&0_u64.to_be_bytes());
+        forged[..super::ENVELOPE_HEADER].copy_from_slice(&0_u64.to_be_bytes());
         assert!(receiver.receive(&forged).unwrap().is_empty());
         assert_eq!(receiver.receive(&third).unwrap(), vec![b"three".to_vec()]);
     }
 
     #[test]
-    fn wrong_session_and_out_of_window_frames_are_rejected() {
-        let (a, b) = exchange();
-        let (a, b) = confirm_pair(a, b);
-        let mut sender = super::SessionTransport::new(a);
-        let mut receiver = super::SessionTransport::new(b);
-        let mut wrong_tag = sender.send(b"hello").unwrap();
-        wrong_tag[4] ^= 1;
-        assert!(matches!(
-            receiver.receive(&wrong_tag),
-            Err(HandshakeError::InvalidEnvelope)
-        ));
+    fn messages_of_different_lengths_produce_envelopes_of_the_same_length() {
+        let (mut sender, mut receiver) = transport_pair();
+        let lengths: Vec<usize> = [0_usize, 1, 2, 100, 200, 251]
+            .iter()
+            .map(|size| {
+                let frame = sender.send(&vec![b'x'; *size]).unwrap();
+                let received = receiver.receive(&frame).unwrap();
+                assert_eq!(received, vec![vec![b'x'; *size]], "size {size} round trip");
+                frame.len()
+            })
+            .collect();
+        // Everything up to 252 bytes of message falls in the smallest class.
+        assert!(
+            lengths.iter().all(|length| *length == lengths[0]),
+            "{lengths:?}"
+        );
+        assert_eq!(lengths[0], super::ENVELOPE_HEADER + 256 + 16);
+    }
 
+    #[test]
+    fn padding_classes_are_the_documented_sizes_and_the_largest_message_fits() {
+        let (mut sender, _receiver) = transport_pair();
+        let class_of = |sender: &mut super::SessionTransport, size: usize| {
+            sender.send(&vec![b'y'; size]).unwrap().len() - super::ENVELOPE_HEADER - 16
+        };
+        // The payload header is 4 bytes, so a message of `size` needs `size + 4` bytes.
+        assert_eq!(class_of(&mut sender, 252), 256);
+        assert_eq!(class_of(&mut sender, 253), 1024);
+        assert_eq!(class_of(&mut sender, 1020), 1024);
+        assert_eq!(class_of(&mut sender, 1021), 4096);
+        assert_eq!(class_of(&mut sender, 4092), 4096);
+        assert_eq!(class_of(&mut sender, 4093), 8176);
+        // The largest message a frame can carry round trips and fills the envelope limit.
+        let largest = super::ActiveChannel::MAX_MESSAGE;
+        let (mut big_sender, mut big_receiver) = transport_pair();
+        let frame = big_sender.send(&vec![7; largest]).unwrap();
+        assert_eq!(frame.len(), super::MAX_ENVELOPE);
+        assert_eq!(
+            big_receiver.receive(&frame).unwrap(),
+            vec![vec![7; largest]]
+        );
+        // One byte more cannot be sent at all.
+        assert!(matches!(
+            big_sender.send(&vec![7; largest + 1]),
+            Err(HandshakeError::InvalidMessage)
+        ));
+    }
+
+    /// A chat frame whose payload the sender chose byte for byte, as a peer that does not
+    /// follow the padding rules would send. The receiver must decide what to accept.
+    fn raw_chat_frame(payload: &[u8]) -> (ActiveChannel, Vec<u8>) {
+        let (a, b) = exchange();
+        let (mut a, b) = confirm_pair(a, b);
+        let frame = super::encrypt(&mut a.transport, payload).unwrap();
+        (b, frame)
+    }
+
+    /// `exchange` makes the sender the initiator, so its frames carry the initiator byte;
+    /// the well-formed case below would fail if that were not so.
+    fn chat_payload(length_field: u16, message: &[u8], total: usize, filler: u8) -> Vec<u8> {
+        let mut payload = vec![super::FRAME_KIND_CHAT, Role::Initiator.byte()];
+        payload.extend_from_slice(&length_field.to_be_bytes());
+        payload.extend_from_slice(message);
+        payload.resize(total, filler);
+        payload
+    }
+
+    #[test]
+    fn a_well_formed_padded_frame_is_accepted() {
+        let (mut receiver, frame) = raw_chat_frame(&chat_payload(5, b"hello", 256, 0));
+        assert_eq!(receiver.read_message(&frame).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn padding_that_is_not_all_zeros_is_rejected() {
+        // Non-zero padding would let a peer smuggle bytes the length field does not show.
+        for filler in [1_u8, 0xff] {
+            let (mut receiver, frame) = raw_chat_frame(&chat_payload(5, b"hello", 256, filler));
+            assert!(matches!(
+                receiver.read_message(&frame),
+                Err(HandshakeError::InvalidMessage)
+            ));
+        }
+        // A single stray byte at the very end is enough to reject it.
+        let mut payload = chat_payload(5, b"hello", 256, 0);
+        *payload.last_mut().unwrap() = 1;
+        let (mut receiver, frame) = raw_chat_frame(&payload);
+        assert!(matches!(
+            receiver.read_message(&frame),
+            Err(HandshakeError::InvalidMessage)
+        ));
+    }
+
+    #[test]
+    fn a_payload_size_outside_the_padding_classes_is_rejected() {
+        for total in [8_usize, 255, 257, 1000, 4097, 8000] {
+            let (mut receiver, frame) = raw_chat_frame(&chat_payload(2, b"hi", total, 0));
+            assert!(
+                matches!(
+                    receiver.read_message(&frame),
+                    Err(HandshakeError::InvalidMessage)
+                ),
+                "payload of {total} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_length_field_that_overruns_the_payload_is_rejected() {
+        let (mut receiver, frame) = raw_chat_frame(&chat_payload(300, b"short", 256, 0));
+        assert!(matches!(
+            receiver.read_message(&frame),
+            Err(HandshakeError::InvalidMessage)
+        ));
+    }
+
+    #[test]
+    fn a_frame_with_the_wrong_kind_or_the_wrong_sender_role_is_rejected() {
+        let mut wrong_kind = chat_payload(2, b"hi", 256, 0);
+        wrong_kind[0] = 9;
+        let (mut receiver, frame) = raw_chat_frame(&wrong_kind);
+        assert!(matches!(
+            receiver.read_message(&frame),
+            Err(HandshakeError::InvalidMessage)
+        ));
+        // A frame that claims to come from the receiver's own role is a reflection.
+        let mut reflected = chat_payload(2, b"hi", 256, 0);
+        reflected[1] = Role::Responder.byte();
+        let (mut receiver, frame) = raw_chat_frame(&reflected);
+        assert!(matches!(
+            receiver.read_message(&frame),
+            Err(HandshakeError::InvalidMessage)
+        ));
+    }
+
+    #[test]
+    fn a_frame_from_another_session_does_not_decrypt_and_ends_the_session() {
+        // The envelope no longer names its session: a frame is attributed to a session by
+        // the topic tag and the signature of the event that carried it, and by being
+        // decryptable at all. A frame encrypted for some other session is not.
+        let (mut sender, mut receiver) = transport_pair();
+        let (mut stranger, _) = transport_pair();
+        let foreign = stranger.send(b"hello").unwrap();
+        assert!(matches!(
+            receiver.receive(&foreign),
+            Err(HandshakeError::Noise(_))
+        ));
+        assert!(
+            receiver.is_closed(),
+            "an undecryptable frame ends the session"
+        );
+        // The genuine frame can no longer be delivered once the session is closed.
+        let genuine = sender.send(b"hello").unwrap();
+        assert!(matches!(
+            receiver.receive(&genuine),
+            Err(HandshakeError::Closed)
+        ));
+    }
+
+    #[test]
+    fn out_of_window_frames_are_rejected_without_closing_the_session() {
+        let (mut sender, mut receiver) = transport_pair();
         let mut far_future = sender.send(b"next").unwrap();
-        far_future[20..28].copy_from_slice(&32_u64.to_be_bytes());
+        far_future[..super::ENVELOPE_HEADER].copy_from_slice(&32_u64.to_be_bytes());
         assert!(matches!(
             receiver.receive(&far_future),
             Err(HandshakeError::OutsideReorderWindow)
         ));
+        // The window check happens before any decryption, so nothing was consumed.
+        let in_order = sender.send(b"after").unwrap();
+        assert!(!receiver.is_closed());
+        // `in_order` has sequence 1 and the receiver still expects 0: held, not lost.
+        assert!(receiver.receive(&in_order).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_envelope_too_short_or_too_long_is_rejected() {
+        let (_sender, mut receiver) = transport_pair();
+        let header_only = vec![0_u8; super::ENVELOPE_HEADER];
+        assert!(matches!(
+            receiver.receive(&header_only),
+            Err(HandshakeError::InvalidEnvelope)
+        ));
+        let too_long = vec![0_u8; super::MAX_ENVELOPE + 1];
+        assert!(matches!(
+            receiver.receive(&too_long),
+            Err(HandshakeError::InvalidEnvelope)
+        ));
+        assert!(!receiver.is_closed());
     }
 
     #[test]

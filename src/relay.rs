@@ -4,6 +4,7 @@
 //! session tag, timing, size, and connection IP in direct mode. Callers select
 //! an optional loopback SOCKS5 proxy; proxy failures never fall back to direct.
 
+use crate::channel::MAX_ENVELOPE;
 use crate::channel::{
     Handshake, HandshakeError, PendingChannel, Role, SessionTransport, VerificationPending,
 };
@@ -29,16 +30,17 @@ use zeroize::Zeroizing;
 
 const EVENT_KIND: u16 = 20_000;
 pub const DEFAULT_RELAY: &str = "wss://relay.primal.net";
-const SUBSCRIPTION_ID: &str = "ad-v2-live";
 const INVITE_PREFIX: &str = "ADI3-";
 const INVITE_TOPIC_INFO: &[u8] = b"another-dimension-v2/invite-topic/v2";
 const INVITE_KEY_INFO: &[u8] = b"another-dimension-v2/invite-relay-key/v2";
 const INVITE_DOMAIN: &[u8] = b"another-dimension-v2/invite-code/v2";
 const READY_REQUEST_PREFIX: &[u8] = b"\0AD2-READY-1:";
 const READY_ACK_PREFIX: &[u8] = b"\0AD2-READY-ACK-1:";
-const MAX_BOOTSTRAP_FRAME: usize = 256;
+/// The largest frame exchanged while a session is being set up. These frames are padded
+/// like chat messages, so the smallest size class plus its tag is the usual size and the
+/// limit has to allow for it.
+const MAX_BOOTSTRAP_FRAME: usize = crate::channel::SMALLEST_PADDED_FRAME;
 const MAX_RELAY_MESSAGE: usize = 20 * 1024;
-const MAX_ENVELOPE: usize = 4 + 16 + 8 + 8192;
 const READ_TIMEOUT: Duration = Duration::from_millis(250);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -306,7 +308,7 @@ impl RelaySession {
         let link = RelayLink::new(
             0,
             Box::new(WebSocketIo(open_socket(endpoint, tor_socks)?)),
-            SubscriptionId::new(SUBSCRIPTION_ID),
+            new_subscription_id()?,
         );
         Self::from_links(vec![link], transport)
     }
@@ -1477,11 +1479,10 @@ fn random_hex(bytes_len: usize) -> io::Result<String> {
     Ok(hex(&bytes))
 }
 
+/// A subscription id is sent to the relay in the clear, so it must not identify this
+/// program: it is random hex with no fixed prefix.
 fn new_subscription_id() -> Result<SubscriptionId, RelayError> {
-    Ok(SubscriptionId::new(format!(
-        "{SUBSCRIPTION_ID}-{}",
-        random_hex(12)?
-    )))
+    Ok(SubscriptionId::new(random_hex(16)?))
 }
 
 /// Appends the hex form of secret bytes to a string that is wiped when dropped, without
@@ -2811,6 +2812,19 @@ mod tests {
             subscription_status(r#"["CLOSED","ad-v2-live","restricted"]"#, &expected).unwrap(),
             SubscriptionStatus::Closed("restricted".to_owned())
         );
+    }
+
+    #[test]
+    fn subscription_ids_are_random_and_carry_no_program_marker() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let id = super::new_subscription_id().unwrap().to_string();
+            // 16 random bytes in hex: nothing fixed for a relay operator to recognise.
+            assert_eq!(id.len(), 32, "{id}");
+            assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()), "{id}");
+            assert!(!id.contains("ad-v2") && !id.contains("live"), "{id}");
+            assert!(seen.insert(id), "a subscription id was repeated");
+        }
     }
 
     #[test]
