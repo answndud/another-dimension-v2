@@ -3803,3 +3803,134 @@ fn exports_enforce_the_final_file_size_limit_for_both_formats() {
         );
     }
 }
+
+mod mutated_backups {
+    use super::*;
+    use crate::history::LegacyBackupPolicy;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestRunner};
+
+    /// One change to a byte string: flip a bit, overwrite a byte, cut it short, or append.
+    fn mutation() -> impl Strategy<Value = (u8, usize, u8)> {
+        (0_u8..4, any::<usize>(), any::<u8>())
+    }
+
+    fn mutate(original: &[u8], (kind, at, byte): (u8, usize, u8)) -> Vec<u8> {
+        let mut bytes = original.to_vec();
+        let at = at % bytes.len();
+        match kind {
+            0 => bytes[at] ^= 1 << (byte % 8),
+            1 => bytes[at] = bytes[at].wrapping_add(byte | 1),
+            2 => bytes.truncate(at),
+            _ => bytes.push(byte),
+        }
+        bytes
+    }
+
+    fn sample_history(identity: &Identity, peer: &str) {
+        let (mut history, _, _) = History::open(identity, peer).unwrap();
+        for index in 0..3 {
+            history
+                .append(&message(index, &format!("sample message {index}")))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_changed_legacy_backup_is_always_rejected_and_never_panics() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "91".repeat(32);
+        sample_history(&identity, &peer);
+        // A password makes every attempt run Argon2id, so it gets far fewer cases.
+        for (password, cases) in [(None, 300), (Some("correct horse battery"), 12)] {
+            let backup = History::export_backup(&identity, &peer, password).unwrap();
+            assert!(History::verify_backup(&identity, &backup, password).is_ok());
+            TestRunner::new(Config::with_cases(cases))
+                .run(&mutation(), |change| {
+                    let changed = mutate(&backup, change);
+                    prop_assume!(changed != backup);
+                    prop_assert!(
+                        History::verify_backup(&identity, &changed, password).is_err(),
+                        "a changed backup was accepted"
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_changed_stream_backup_is_always_rejected_and_never_panics() {
+        let data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "92".repeat(32);
+        sample_history(&identity, &peer);
+        let mut stream = Vec::new();
+        History::export_backup_stream(&identity, &peer, None, &mut stream).unwrap();
+        let scratch = data.0.join("mutated-backup");
+        std::fs::write(&scratch, &stream).unwrap();
+        assert!(History::verify_backup_file(&identity, &scratch, None).is_ok());
+        TestRunner::new(Config::with_cases(200))
+            .run(&mutation(), |change| {
+                let changed = mutate(&stream, change);
+                prop_assume!(changed != stream);
+                std::fs::write(&scratch, &changed).unwrap();
+                prop_assert!(
+                    History::verify_backup_file(&identity, &scratch, None).is_err(),
+                    "a changed stream backup was accepted"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_changed_bundle_is_rejected_without_creating_any_conversation() {
+        let data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let (first, second) = ("93".repeat(32), "94".repeat(32));
+        sample_history(&identity, &first);
+        sample_history(&identity, &second);
+        let mut bundle = Vec::new();
+        History::export_backup_bundle_stream(
+            &identity,
+            &[first.clone(), second.clone()],
+            &mut bundle,
+        )
+        .unwrap();
+        History::delete_conversation(&identity, &first).unwrap();
+        History::delete_conversation(&identity, &second).unwrap();
+        let scratch = data.0.join("mutated-bundle");
+        TestRunner::new(Config::with_cases(120))
+            .run(&mutation(), |change| {
+                let changed = mutate(&bundle, change);
+                prop_assume!(changed != bundle);
+                std::fs::write(&scratch, &changed).unwrap();
+                let result = History::import_backup_file_with_policy(
+                    &identity,
+                    &scratch,
+                    None,
+                    LegacyBackupPolicy::Reject,
+                );
+                prop_assert!(result.is_err(), "a changed bundle was imported");
+                prop_assert!(
+                    History::known_peer_ids(&identity).unwrap().is_empty(),
+                    "a rejected bundle left a conversation behind"
+                );
+                Ok(())
+            })
+            .unwrap();
+        // The unchanged bundle still imports both, so the test would notice a bundle
+        // that was always refused.
+        std::fs::write(&scratch, &bundle).unwrap();
+        let restored = History::import_backup_file_with_policy(
+            &identity,
+            &scratch,
+            None,
+            LegacyBackupPolicy::Reject,
+        )
+        .unwrap();
+        assert_eq!(restored.len(), 2);
+    }
+}

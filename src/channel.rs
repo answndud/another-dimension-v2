@@ -1675,4 +1675,83 @@ mod tests {
         let length = previous.write_message(&[], &mut buffer).unwrap();
         assert!(current.read(&buffer[..length]).is_err());
     }
+
+    mod properties {
+        use super::{confirm_pair, exchange, transport_pair};
+        use crate::channel::ActiveChannel;
+        use proptest::prelude::*;
+
+        fn active_pair() -> (ActiveChannel, ActiveChannel) {
+            let (a, b) = exchange();
+            confirm_pair(a, b)
+        }
+
+        proptest! {
+            // Each case runs a real handshake, so keep the count modest.
+            #![proptest_config(ProptestConfig::with_cases(48))]
+
+            #[test]
+            fn any_message_round_trips_and_pads_to_a_documented_size(
+                message in proptest::collection::vec(any::<u8>(), 0..=ActiveChannel::MAX_MESSAGE),
+            ) {
+                let (mut a, mut b) = active_pair();
+                let frame = a.write_message(&message).unwrap();
+                // Every frame is one of the four size classes plus the AEAD tag.
+                let sizes = [256 + 16, 1024 + 16, 4096 + 16, 8192];
+                prop_assert!(sizes.contains(&frame.len()), "{}", frame.len());
+                prop_assert!(frame.len() >= message.len());
+                prop_assert_eq!(b.read_message(&frame).unwrap(), message);
+            }
+
+            #[test]
+            fn any_arrival_order_delivers_every_message_once_and_in_order(
+                order in (1_usize..=12).prop_flat_map(|count| {
+                    Just((0..count).collect::<Vec<_>>()).prop_shuffle()
+                }),
+            ) {
+                let (mut sender, mut receiver) = transport_pair();
+                let count = order.len();
+                let frames: Vec<_> = (0..count)
+                    .map(|index| sender.send(format!("message {index}").as_bytes()).unwrap())
+                    .collect();
+                let mut delivered = Vec::new();
+                for index in order {
+                    delivered.extend(receiver.receive(&frames[index]).unwrap());
+                }
+                let expected: Vec<Vec<u8>> = (0..count)
+                    .map(|index| format!("message {index}").into_bytes())
+                    .collect();
+                prop_assert_eq!(delivered, expected);
+            }
+
+            #[test]
+            fn a_flipped_bit_never_delivers_a_message(
+                bit in 0_usize..(8 * 64),
+                text in proptest::collection::vec(any::<u8>(), 1..40),
+            ) {
+                let (mut sender, mut receiver) = transport_pair();
+                let mut envelope = sender.send(&text).unwrap();
+                let bit = bit % (envelope.len() * 8);
+                envelope[bit / 8] ^= 1 << (bit % 8);
+                // The frame is rejected, held back as out of order, or ignored. It is
+                // never delivered, because the sequence and the ciphertext are both
+                // covered by the authentication.
+                let outcome = receiver.receive(&envelope);
+                prop_assert!(!matches!(outcome, Ok(ref messages) if !messages.is_empty()));
+            }
+
+            #[test]
+            fn arbitrary_bytes_are_never_accepted_as_a_frame_or_an_envelope(
+                bytes in proptest::collection::vec(any::<u8>(), 0..9000),
+            ) {
+                let (mut a, mut b) = active_pair();
+                prop_assert!(b.read_message(&bytes).is_err());
+                let (_sender, mut receiver) = transport_pair();
+                prop_assert!(!matches!(receiver.receive(&bytes), Ok(ref m) if !m.is_empty()));
+                // The channel that did nothing wrong still works afterwards.
+                let frame = a.write_message(b"still fine").unwrap();
+                prop_assert_eq!(b.read_message(&frame).unwrap(), b"still fine".to_vec());
+            }
+        }
+    }
 }

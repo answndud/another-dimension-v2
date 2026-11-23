@@ -89,4 +89,32 @@ mod tests {
         push_encoded(&mut target, &[0x01, 0xfe]);
         assert_eq!(target, "ab01fe");
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn any_bytes_survive_an_encode_decode_round_trip(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let text = encode(&bytes);
+            prop_assert_eq!(text.len(), bytes.len() * 2);
+            prop_assert!(text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            prop_assert_eq!(decode(&text), Some(bytes));
+        }
+
+        #[test]
+        fn decoding_arbitrary_text_never_panics_and_only_accepts_canonical_hex(text in ".{0,64}") {
+            if let Some(bytes) = decode(&text) {
+                prop_assert_eq!(encode(&bytes), text);
+            }
+        }
+
+        #[test]
+        fn a_fixed_size_decode_agrees_with_the_general_one(text in "[0-9a-fA-F]{0,40}") {
+            let general = decode(&text);
+            match decode_array::<8>(&text) {
+                Some(array) => prop_assert_eq!(general, Some(array.to_vec())),
+                None => prop_assert!(general.is_none_or(|bytes| bytes.len() != 8)),
+            }
+        }
+    }
 }

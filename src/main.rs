@@ -143,6 +143,8 @@ mod api;
 mod chat_worker;
 mod history_sync;
 mod http;
+#[cfg(test)]
+mod parser_tests;
 mod restore;
 #[cfg(test)]
 mod send_tests;
