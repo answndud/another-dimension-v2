@@ -15,22 +15,7 @@ fn backup_transfer_api_uses_small_authenticated_chunks_for_export_and_import() {
             proof: None,
         })
         .unwrap();
-    let state = Arc::new(Mutex::new(State {
-        code: String::new(),
-        issued: Instant::now(),
-        attempts: 0,
-        sessions: SessionStore::with_token("test-session"),
-        identity: Some(Arc::new(identity)),
-        chats: HashMap::new(),
-        history_deletions: HashMap::new(),
-        active_history_deletions: HashSet::new(),
-        history_import_active: false,
-        tor_socks: None,
-        active_relays: vec![DEFAULT_RELAY.to_owned()],
-        settings: AppSettings::default(),
-        notifications_enabled: Arc::new(AtomicBool::new(false)),
-        last_notification: Arc::new(Mutex::new(None)),
-    }));
+    let state = test_state(Some(Arc::new(identity)), HashMap::new());
     let exported = call_test_api(
         &state,
         "/api/history/backup-transfer",
@@ -111,22 +96,7 @@ fn backup_transfer_api_uses_small_authenticated_chunks_for_export_and_import() {
 }
 
 fn test_state_for(identity: Identity) -> Arc<Mutex<State>> {
-    Arc::new(Mutex::new(State {
-        code: String::new(),
-        issued: Instant::now(),
-        attempts: 0,
-        sessions: SessionStore::with_token("test-session"),
-        identity: Some(Arc::new(identity)),
-        chats: HashMap::new(),
-        history_deletions: HashMap::new(),
-        active_history_deletions: HashSet::new(),
-        history_import_active: false,
-        tor_socks: None,
-        active_relays: vec![DEFAULT_RELAY.to_owned()],
-        settings: AppSettings::default(),
-        notifications_enabled: Arc::new(AtomicBool::new(false)),
-        last_notification: Arc::new(Mutex::new(None)),
-    }))
+    test_state(Some(Arc::new(identity)), HashMap::new())
 }
 
 fn upload_backup_bytes(state: &Arc<Mutex<State>>, bytes: &[u8]) -> String {
@@ -901,22 +871,7 @@ fn settings_reject_invalid_relay_lists_without_changing_saved_state() {
 #[test]
 fn settings_api_reports_saved_and_active_relays_and_restart_gating() {
     let _data = TestDataDirectory::new();
-    let state = Arc::new(Mutex::new(State {
-        code: String::new(),
-        issued: Instant::now(),
-        attempts: 0,
-        sessions: SessionStore::with_token("test-session"),
-        identity: None,
-        chats: HashMap::new(),
-        history_deletions: HashMap::new(),
-        active_history_deletions: HashSet::new(),
-        history_import_active: false,
-        tor_socks: None,
-        active_relays: vec![DEFAULT_RELAY.to_owned()],
-        settings: AppSettings::default(),
-        notifications_enabled: Arc::new(AtomicBool::new(false)),
-        last_notification: Arc::new(Mutex::new(None)),
-    }));
+    let state = test_state(None, HashMap::new());
     let read_settings = || call_test_api(&state, "/api/settings/get", "", "test-session");
     let initial = read_settings();
     assert!(initial.contains("\"savedRelays\":[\"wss://relay.primal.net\"]"));
@@ -1046,14 +1001,19 @@ fn call_test_request_line(state: &Arc<Mutex<State>>, request_line: &str, token: 
     response
 }
 
-fn routing_test_state() -> Arc<Mutex<State>> {
+/// A state with one live session ("test-session"), the given identity and chats, and
+/// everything else at its default.
+fn test_state(
+    identity: Option<Arc<Identity>>,
+    chats: HashMap<String, Arc<ChatOperation>>,
+) -> Arc<Mutex<State>> {
     Arc::new(Mutex::new(State {
         code: String::new(),
         issued: Instant::now(),
         attempts: 0,
         sessions: SessionStore::with_token("test-session"),
-        identity: None,
-        chats: HashMap::new(),
+        identity,
+        chats,
         history_deletions: HashMap::new(),
         active_history_deletions: HashSet::new(),
         history_import_active: false,
@@ -1067,7 +1027,7 @@ fn routing_test_state() -> Arc<Mutex<State>> {
 
 #[test]
 fn an_unknown_path_is_404_and_a_known_path_with_the_wrong_method_is_405() {
-    let state = routing_test_state();
+    let state = test_state(None, HashMap::new());
     for line in [
         "GET /nothing HTTP/1.1",
         "POST /api/nothing HTTP/1.1",
@@ -1099,7 +1059,7 @@ fn an_unknown_path_is_404_and_a_known_path_with_the_wrong_method_is_405() {
 
 #[test]
 fn assets_are_served_without_a_session_and_every_api_route_needs_one() {
-    let state = routing_test_state();
+    let state = test_state(None, HashMap::new());
     for line in [
         "GET / HTTP/1.1",
         "GET /app.css HTTP/1.1",
@@ -1742,22 +1702,7 @@ fn restore_merge_api_returns_202_without_waiting_and_status_reports_completion()
     });
     let mut chats = HashMap::new();
     chats.insert("restore-operation".to_owned(), Arc::clone(&operation));
-    let state = Arc::new(Mutex::new(State {
-        code: String::new(),
-        issued: Instant::now(),
-        attempts: 0,
-        sessions: SessionStore::with_token("test-session"),
-        identity: Some(Arc::new(test_identity)),
-        chats,
-        history_deletions: HashMap::new(),
-        active_history_deletions: HashSet::new(),
-        history_import_active: false,
-        tor_socks: None,
-        active_relays: vec![DEFAULT_RELAY.to_owned()],
-        settings: AppSettings::default(),
-        notifications_enabled: Arc::new(AtomicBool::new(false)),
-        last_notification: Arc::new(Mutex::new(None)),
-    }));
+    let state = test_state(Some(Arc::new(test_identity)), chats);
     let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let worker_gate = Arc::clone(&gate);
     let worker_operation = Arc::clone(&operation);
@@ -1888,22 +1833,7 @@ fn chat_operation_apis_are_scoped_to_the_creating_identity() {
     });
     let mut chats = HashMap::new();
     chats.insert("owned-operation".to_owned(), Arc::clone(&operation));
-    let state = Arc::new(Mutex::new(State {
-        code: String::new(),
-        issued: Instant::now(),
-        attempts: 0,
-        sessions: SessionStore::with_token("test-session"),
-        identity: Some(Arc::new(identity_b)),
-        chats,
-        history_deletions: HashMap::new(),
-        active_history_deletions: HashSet::new(),
-        history_import_active: false,
-        tor_socks: None,
-        active_relays: vec![DEFAULT_RELAY.to_owned()],
-        settings: AppSettings::default(),
-        notifications_enabled: Arc::new(AtomicBool::new(false)),
-        last_notification: Arc::new(Mutex::new(None)),
-    }));
+    let state = test_state(Some(Arc::new(identity_b)), chats);
     let requests = [
         ("/api/chat/status", "owned-operation".to_owned()),
         ("/api/chat/messages", "owned-operation\n0".to_owned()),
@@ -2172,22 +2102,10 @@ fn restore_merge_serializes_snapshot_count_with_pre_and_post_replace_appends() {
     assert_eq!(snapshot.message_epoch, 12);
     drop(snapshot);
     let restored_identity = Identity::from_code(&code).unwrap();
-    let state = Arc::new(Mutex::new(State {
-        code: String::new(),
-        issued: Instant::now(),
-        attempts: 0,
-        sessions: SessionStore::with_token("test-session"),
-        identity: Some(Arc::new(restored_identity)),
-        chats: HashMap::from([("count-operation".to_owned(), Arc::clone(&operation))]),
-        history_deletions: HashMap::new(),
-        active_history_deletions: HashSet::new(),
-        history_import_active: false,
-        tor_socks: None,
-        active_relays: vec![DEFAULT_RELAY.to_owned()],
-        settings: AppSettings::default(),
-        notifications_enabled: Arc::new(AtomicBool::new(false)),
-        last_notification: Arc::new(Mutex::new(None)),
-    }));
+    let state = test_state(
+        Some(Arc::new(restored_identity)),
+        HashMap::from([("count-operation".to_owned(), Arc::clone(&operation))]),
+    );
     let response = call_test_api(
         &state,
         "/api/chat/messages",
@@ -2561,25 +2479,13 @@ fn history_delete_runs_without_global_state_lock_and_remains_queryable_after_ide
     let operation_a = closed_test_operation(identity_a.public_id().as_str(), &peer_id, 1, 9);
     let operation_b = closed_test_operation(identity_b.public_id().as_str(), &peer_id, 7, 12);
     operation_a.message_reader.lock().unwrap().take();
-    let state = Arc::new(Mutex::new(State {
-        code: String::new(),
-        issued: Instant::now(),
-        attempts: 0,
-        sessions: SessionStore::with_token("test-session"),
-        identity: Some(Arc::new(Identity::from_code(&code_a).unwrap())),
-        chats: HashMap::from([
+    let state = test_state(
+        Some(Arc::new(Identity::from_code(&code_a).unwrap())),
+        HashMap::from([
             ("closed-a".to_owned(), Arc::clone(&operation_a)),
             ("closed-b".to_owned(), Arc::clone(&operation_b)),
         ]),
-        history_deletions: HashMap::new(),
-        active_history_deletions: HashSet::new(),
-        history_import_active: false,
-        tor_socks: None,
-        active_relays: vec![DEFAULT_RELAY.to_owned()],
-        settings: AppSettings::default(),
-        notifications_enabled: Arc::new(AtomicBool::new(false)),
-        last_notification: Arc::new(Mutex::new(None)),
-    }));
+    );
     let gate = Arc::new((Mutex::new((false, false)), std::sync::Condvar::new()));
     history::set_history_delete_test_gate(Some(Arc::clone(&gate)));
     let request_body = serde_json::json!({
