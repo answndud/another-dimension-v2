@@ -14,12 +14,12 @@ Apple Silicon Mac에서 실행하는 로컬 1:1 텍스트 채팅 앱입니다. R
 - **로컬 API 방어** ([src/http.rs](src/http.rs), [src/api/mod.rs](src/api/mod.rs)): 루프백 임의 포트에만 바인딩하고, 모든 요청의 `Host`와 POST의 `Origin`·`Content-Type`을 정확히 비교합니다. 256비트 일회용 연결 코드(TTL 5분, 시도 5회, 상수 시간 비교)로 세션 토큰을 받고, 토큰은 쿠키가 아닌 `sessionStorage`에 두고, 1시간 유휴·12시간 절대 만료이며 새 연결 코드 발급이나 로그아웃 때 모두 폐기합니다. 엄격한 CSP(인라인 스크립트·스타일 없음)와 `Referrer-Policy`·COOP·CORP·`Permissions-Policy`를 모든 응답에 붙이고 CORS 헤더는 보내지 않으며 `Transfer-Encoding`과 중복 헤더는 거부합니다.
 - **신원과 통신 키 분리** ([src/channel.rs](src/channel.rs)): Noise의 static 키는 연결마다 새로 만들고, 장기 신원은 별도의 Ed25519 키입니다. 핸드셰이크 해시에 대한 서명을 암호화된 전송 안에서 교환하므로 relay가 신원을 볼 수 없습니다. 양쪽의 증명과 사용자 확인 전에는 채팅 API를 호출할 수 없도록 typestate로 설계했습니다.
 - **프레임 순번과 재정렬 창** ([src/channel.rs](src/channel.rs)): 프레임마다 순번이 있고 32개 범위 안의 재정렬을 허용하며 중복은 무시합니다. 인증 실패는 세션을 닫습니다.
-- **인증 암호화 저장** ([src/history.rs](src/history.rs)): 대화 로그, 인덱스, 확인된 상대 기록을 ChaCha20-Poly1305로 보호합니다. 파일명은 상대 ID의 HMAC이고, 중간 레코드의 인증 실패는 오류로 처리하며 꼬리의 불완전한 레코드만 복구합니다.
-- **스트리밍 백업 결속** ([src/history.rs](src/history.rs)): ADBACK7은 파일별 무작위 ID, 프레임 인덱스, 종료 프레임을 인증 데이터에 묶어 잘라내기·재정렬·파일 간 바꿔치기를 탐지합니다. ADPACK3는 적용 전에 묶음 전체를 HMAC으로 검증합니다. 백업 비밀번호는 Argon2id로 유도합니다.
-- **서명된 메시지와 복원 동의** ([src/history.rs](src/history.rs)): 새 메시지는 Ed25519 서명을 가지며, 상대 기록 복원은 전송 동의와 최종 병합 동의를 각각 거칩니다.
+- **인증 암호화 저장** ([src/history/](src/history/)): 대화 로그, 인덱스, 확인된 상대 기록을 ChaCha20-Poly1305로 보호합니다. 파일명은 상대 ID의 HMAC이고, 중간 레코드의 인증 실패는 오류로 처리하며 꼬리의 불완전한 레코드만 복구합니다.
+- **스트리밍 백업 결속** ([src/history/](src/history/)): ADBACK7은 파일별 무작위 ID, 프레임 인덱스, 종료 프레임을 인증 데이터에 묶어 잘라내기·재정렬·파일 간 바꿔치기를 탐지합니다. ADPACK3는 적용 전에 묶음 전체를 HMAC으로 검증합니다. 백업 비밀번호는 Argon2id로 유도합니다.
+- **서명된 메시지와 복원 동의** ([src/history/](src/history/)): 새 메시지는 Ed25519 서명을 가지며, 상대 기록 복원은 전송 동의와 최종 병합 동의를 각각 거칩니다.
 - **Tor 모드의 우회 금지** ([src/relay.rs](src/relay.rs)): 모든 relay 연결이 지정한 SOCKS 프록시를 통하고 호스트 이름 해석도 프록시가 처리하며, 프록시가 실패해도 직접 연결로 전환하지 않습니다. 프록시 주소는 루프백만 허용합니다.
 - **입력 크기 상한**: HTTP 헤더·본문, 핸드셰이크 메시지, 프레임, relay 이벤트에 상한이 있고 할당 전에 검사합니다.
-- **작은 `unsafe` 범위**: `unsafe`는 파일 잠금(`flock`)과 `geteuid` 호출 6곳뿐이며 모두 [src/history.rs](src/history.rs)에 있습니다. 프런트엔드에는 `innerHTML`과 `eval`이 없습니다.
+- **작은 `unsafe` 범위**: `unsafe`는 파일 잠금(`flock`)과 `geteuid` 호출 7곳뿐이며 모두 [src/history/](src/history/) 아래에 있습니다(테스트 전용 `umask` 2곳은 `src/fsutil.rs`). 프런트엔드에는 `innerHTML`과 `eval`이 없습니다.
 - **재현 가능한 의존성**: 모든 의존성을 정확한 버전으로 고정하고 `Cargo.lock`을 커밋하며, CI에서 `cargo audit`을 실행합니다.
 
 한계도 공개합니다. 알려진 약점 목록은 [SECURITY.md](SECURITY.md#known-weaknesses)에 있고, 고친 문제는 [docs/security-fixes.md](docs/security-fixes.md)에 기록합니다.
@@ -85,10 +85,11 @@ Tor 모드는 앱의 relay 연결에만 적용됩니다. 메시지 링크를 열
 |---|---|
 | [SECURITY.md](SECURITY.md) | 위협 모델, 보장하는 것과 하지 않는 것, 알려진 약점, 취약점 제보 |
 | [docs/architecture.md](docs/architecture.md) | 구성요소, 연결 흐름, 저장 키 구조 (다이어그램 포함) |
-| [docs/adr/](docs/adr/) | 설계 결정 기록 (로컬 웹 UI, Noise XX와 Nostr, 접속 코드, 백업 형식 정책) |
+| [docs/adr/](docs/adr/) | 설계 결정 기록 (로컬 웹 UI, Noise XX와 Nostr, 접속 코드, 백업 형식 정책, 유실 프레임과 rekey, 키 분리와 로그 세대, 데이터 위치) |
 | [docs/security-fixes.md](docs/security-fixes.md) | 발견한 문제와 수정, 회귀 테스트 기록 |
 | [docs/backup-formats.md](docs/backup-formats.md) | 백업 형식별 보호 범위와 가져오기 동작 |
 | [docs/frontend.md](docs/frontend.md) | 프런트엔드 구조와 접근성 원칙 |
+| [docs/testing.md](docs/testing.md) | 테스트 종류, 속성 테스트가 확인하는 것, 퍼징을 하지 않은 이유 |
 
 ## 개발
 
