@@ -81,7 +81,7 @@ impl History {
                 .map_err(|_| invalid_data("backup bundle authentication key unavailable"))?;
             mac.update(&header);
             for peer_id in peer_ids {
-                let suffix = hex_encode(&random_nonce()?);
+                let suffix = crate::hex::encode(&random_nonce()?);
                 let child_name = format!("bundle-child-{suffix}.tmp");
                 let child_path = directory.join(&child_name);
                 let (_, mut child) = Self::create_backup_transfer_file(identity, &child_name)?;

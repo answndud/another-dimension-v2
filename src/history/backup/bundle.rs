@@ -99,7 +99,10 @@ pub(crate) fn import_backup_bundle_stream<R: Read>(
             if length < 8 + 1 + 16 + 1 + NONCE_BYTES as u64 + 4 + 8 + 32 + 16 {
                 return Err(invalid_data("truncated backup bundle child"));
             }
-            let child_name = format!("bundle-import-child-{}.tmp", hex_encode(&random_nonce()?));
+            let child_name = format!(
+                "bundle-import-child-{}.tmp",
+                crate::hex::encode(&random_nonce()?)
+            );
             let child_path = directory.join(&child_name);
             let child_result = (|| {
                 let (_, mut child_file) =

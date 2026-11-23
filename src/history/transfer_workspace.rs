@@ -32,7 +32,7 @@ pub(crate) fn create_backup_transfer_workspace(
     root: &std::path::Path,
 ) -> io::Result<BackupTransferWorkspace> {
     for _ in 0..8 {
-        let owner_id = hex_encode(&random_nonce()?);
+        let owner_id = crate::hex::encode(&random_nonce()?);
         let path = root.join(format!(".process-{owner_id}"));
         match std::fs::create_dir(&path) {
             Ok(()) => {}

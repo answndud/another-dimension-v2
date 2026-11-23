@@ -5,6 +5,7 @@ pub mod channel;
 mod contacts;
 
 mod fsutil;
+mod hex;
 
 pub mod history;
 

@@ -79,6 +79,7 @@ mod tests {
             ("contacts.rs", include_str!("contacts.rs")),
             ("session.rs", include_str!("session.rs")),
             ("anchor.rs", include_str!("anchor.rs")),
+            ("hex.rs", include_str!("hex.rs")),
             ("http.rs", include_str!("http.rs")),
             ("state.rs", include_str!("state.rs")),
             ("settings.rs", include_str!("settings.rs")),

@@ -46,7 +46,7 @@ impl Identity {
         }
         if let Some(hex) = code.strip_prefix(LEGACY_PREFIX) {
             let mut seed = Zeroizing::new([0; 32]);
-            seed.copy_from_slice(&decode_hex::<32>(hex)?);
+            seed.copy_from_slice(&crate::hex::decode_array::<32>(hex)?);
             return Some(Self::from_seed(seed));
         }
 
@@ -54,9 +54,9 @@ impl Identity {
         if parts.next()? != "AD2" {
             return None;
         }
-        let wrap_key = Zeroizing::new(decode_hex::<CODE_KEY_BYTES>(parts.next()?)?);
-        let nonce = decode_hex::<NONCE_BYTES>(parts.next()?)?;
-        let ciphertext = decode_hex::<WRAPPED_SEED_BYTES>(parts.next()?)?;
+        let wrap_key = Zeroizing::new(crate::hex::decode_array::<CODE_KEY_BYTES>(parts.next()?)?);
+        let nonce = crate::hex::decode_array::<NONCE_BYTES>(parts.next()?)?;
+        let ciphertext = crate::hex::decode_array::<WRAPPED_SEED_BYTES>(parts.next()?)?;
         if parts.next().is_some() {
             return None;
         }
@@ -106,11 +106,11 @@ impl Identity {
             PREFIX.len() + (CODE_KEY_BYTES + NONCE_BYTES + ciphertext.len() + 2) * 2,
         ));
         code.push_str(PREFIX);
-        append_hex(&mut code, wrap_key.as_ref());
+        crate::hex::push_encoded(&mut code, wrap_key.as_ref());
         code.push('-');
-        append_hex(&mut code, &nonce);
+        crate::hex::push_encoded(&mut code, &nonce);
         code.push('-');
-        append_hex(&mut code, &ciphertext);
+        crate::hex::push_encoded(&mut code, &ciphertext);
         Ok(code)
     }
 
@@ -343,35 +343,6 @@ fn derive_code_key(wrap_key: &[u8; CODE_KEY_BYTES]) -> Zeroizing<[u8; 32]> {
         .expand(CODE_KEY_CONTEXT, key.as_mut())
         .expect("32 bytes is a valid HKDF output length");
     key
-}
-
-fn append_hex(output: &mut String, bytes: &[u8]) {
-    use std::fmt::Write;
-    for byte in bytes {
-        write!(output, "{byte:02x}").expect("writing to a string cannot fail");
-    }
-}
-
-fn decode_hex<const N: usize>(hex: &str) -> Option<[u8; N]> {
-    if hex.len() != N * 2
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return None;
-    }
-    let mut output = [0; N];
-    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
-        let digit = |byte: u8| {
-            if byte <= b'9' {
-                byte - b'0'
-            } else {
-                byte - b'a' + 10
-            }
-        };
-        output[index] = digit(pair[0]) << 4 | digit(pair[1]);
-    }
-    Some(output)
 }
 
 #[cfg(test)]

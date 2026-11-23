@@ -37,20 +37,10 @@ pub(crate) const MAX_CONNECTIONS: usize = if cfg!(test) { 4 } else { 16 };
 /// expired session is a plain 401 instead, so the page can tell the two apart.
 pub(crate) const IDENTITY_REQUIRED: &str = "412 Precondition Failed";
 
-pub(crate) fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut result = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        result.push(HEX[(byte >> 4) as usize] as char);
-        result.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    result
-}
-
 pub(crate) fn random_token() -> io::Result<String> {
     let mut bytes = [0_u8; 32];
     crate::random::fill(&mut bytes)?;
-    Ok(encode_hex(&bytes))
+    Ok(crate::hex::encode(&bytes))
 }
 
 pub(crate) fn equal_token(left: &str, right: &str) -> bool {

@@ -304,7 +304,7 @@ pub(crate) fn migrate_history_streaming(
         identity_id.to_owned(),
         peer_id.to_owned(),
     )?;
-    let suffix = hex_encode(&random_nonce()?);
+    let suffix = crate::hex::encode(&random_nonce()?);
     let temporary = path.with_file_name(format!(".history-migrate-{suffix}.tmp"));
     let result = (|| {
         let mut output = crate::fsutil::private_options()
@@ -1046,7 +1046,7 @@ impl History {
         if test_failure_once(FAIL_HISTORY_REPLACE_ONCE) {
             return Err(io::Error::other("injected conversation replace failure"));
         }
-        let suffix = hex_encode(&random_nonce()?);
+        let suffix = crate::hex::encode(&random_nonce()?);
         let temporary = self.path.with_extension(format!("{suffix}.tmp"));
         let result = (|| {
             let mut file = crate::fsutil::private_options()
@@ -1092,7 +1092,7 @@ impl History {
     ) -> io::Result<HistoryDeleteSummary> {
         #[cfg(test)]
         wait_history_delete_test_gate();
-        let suffix = hex_encode(&random_nonce()?);
+        let suffix = crate::hex::encode(&random_nonce()?);
         let filename = self
             .path
             .file_name()

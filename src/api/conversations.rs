@@ -19,7 +19,7 @@ pub(crate) fn history_list(
     let verified: HashSet<_> = match contacts::list_known(&directory, &identity) {
         Ok(contacts) => contacts
             .into_iter()
-            .map(|contact| encode_hex(&contact.peer_key))
+            .map(|contact| crate::hex::encode(&contact.peer_key))
             .collect(),
         Err(_) => return reject(stream, "500 Internal Server Error"),
     };

@@ -302,6 +302,7 @@ mod tests {
             ("identity.rs", include_str!("identity.rs")),
             ("main.rs", include_str!("main.rs")),
             ("anchor.rs", include_str!("anchor.rs")),
+            ("hex.rs", include_str!("hex.rs")),
             ("http.rs", include_str!("http.rs")),
             ("state.rs", include_str!("state.rs")),
             ("settings.rs", include_str!("settings.rs")),

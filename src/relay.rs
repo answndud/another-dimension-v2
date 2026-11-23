@@ -56,6 +56,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(15);
 const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a rendezvous waits for the peer to appear on the topic before giving up.
+/// Cancelling ends it sooner. It only bounds the resources an abandoned invite holds.
+const PEER_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// How long a person may take to compare the confirmation code and press confirm,
 /// and how long to wait for the other person to do the same. The protocol timeout
 /// above is far too short for people reading digits to each other.
@@ -182,9 +185,14 @@ pub enum RelayError {
     InvalidEndpoint,
     Io(io::Error),
     InvalidEvent,
+    /// Deriving a key failed: an internal error, not something a peer or relay sent.
+    KeyDerivation,
     TimedOut(&'static str),
     SubscriptionClosed(String),
-    RelayRejected { event_id: String, reason: String },
+    RelayRejected {
+        event_id: String,
+        reason: String,
+    },
     PendingPublishLimit,
     NoRelayAvailable,
     Disconnected,
@@ -291,6 +299,47 @@ impl RelayLink {
     }
 }
 
+/// What one round of reading the links produced.
+struct LinkRead {
+    /// The link that had a message, and the message.
+    message: Option<(usize, Message)>,
+    /// The ids of links that failed and were dropped, for the caller's own bookkeeping.
+    dropped: Vec<usize>,
+}
+
+/// Reads one message from the next link that has one, trying each link at most once and
+/// dropping a link whose read fails. `next_relay` keeps the round robin fair.
+fn read_next_message(relays: &mut Vec<RelayLink>, next_relay: &mut usize) -> LinkRead {
+    let mut dropped = Vec::new();
+    let mut attempts = relays.len();
+    while attempts > 0 && !relays.is_empty() {
+        let index = *next_relay % relays.len();
+        *next_relay = (index + 1) % relays.len();
+        attempts -= 1;
+        match relays[index].read() {
+            Ok(Some(message)) => {
+                return LinkRead {
+                    message: Some((index, message)),
+                    dropped,
+                };
+            }
+            Ok(None) => {}
+            Err(_) => {
+                dropped.push(relays.remove(index).id);
+                *next_relay = if relays.is_empty() {
+                    0
+                } else {
+                    index % relays.len()
+                };
+            }
+        }
+    }
+    LinkRead {
+        message: None,
+        dropped,
+    }
+}
+
 pub struct RelaySession {
     relays: Vec<RelayLink>,
     next_relay: usize,
@@ -329,7 +378,7 @@ impl RelaySession {
     ) -> Result<Self, RelayError> {
         let (keys, peer_author, session_tag) = transport.relay_credentials();
         let keys = keys.clone();
-        let topic = hex(session_tag);
+        let topic = crate::hex::encode(session_tag);
         let subscription = new_subscription_id()?;
         let filter = Filter::new()
             .kind(Kind::Custom(EVENT_KIND))
@@ -395,7 +444,7 @@ impl RelaySession {
             return Err(RelayError::PendingPublishLimit);
         }
         let envelope = self.transport.send(message)?;
-        let event = EventBuilder::new(Kind::Custom(EVENT_KIND), hex(&envelope))
+        let event = EventBuilder::new(Kind::Custom(EVENT_KIND), crate::hex::encode(&envelope))
             .tag(Tag::custom("t", [self.topic.as_str()]))
             .finalize(&self.keys)?;
         let event_id = event.id.to_string();
@@ -443,28 +492,14 @@ impl RelaySession {
         if self.relays.is_empty() {
             return Err(RelayError::Disconnected);
         }
-        let mut message = None;
-        let mut attempts = self.relays.len();
-        while attempts > 0 && !self.relays.is_empty() {
-            let index = self.next_relay % self.relays.len();
-            self.next_relay = (index + 1) % self.relays.len();
-            attempts -= 1;
-            match self.relays[index].read() {
-                Ok(Some(incoming)) => {
-                    message = Some((index, incoming));
-                    break;
-                }
-                Ok(None) => {}
-                Err(_) => {
-                    self.remove_relay(index);
-                    if self.relays.is_empty() {
-                        return Err(RelayError::Disconnected);
-                    }
-                    self.next_relay = index % self.relays.len();
-                }
-            }
+        let read = read_next_message(&mut self.relays, &mut self.next_relay);
+        for id in read.dropped {
+            self.remove_pending_relay(id);
         }
-        let Some((link_index, message)) = message else {
+        if self.relays.is_empty() {
+            return Err(RelayError::Disconnected);
+        }
+        let Some((link_index, message)) = read.message else {
             return Ok(None);
         };
         match message {
@@ -847,7 +882,7 @@ impl InviteCode {
         let mut topic_info = INVITE_TOPIC_INFO.to_vec();
         topic_info.extend_from_slice(&suffix);
         hkdf.expand(&topic_info, &mut topic)
-            .map_err(|_| RelayError::InvalidEvent)?;
+            .map_err(|_| RelayError::KeyDerivation)?;
         for counter in 0_u8..=u8::MAX {
             let mut info = Vec::with_capacity(INVITE_KEY_INFO.len() + suffix.len() + 1);
             info.extend_from_slice(INVITE_KEY_INFO);
@@ -855,12 +890,12 @@ impl InviteCode {
             info.push(counter);
             let mut bytes = Zeroizing::new([0_u8; 32]);
             hkdf.expand(&info, bytes.as_mut())
-                .map_err(|_| RelayError::InvalidEvent)?;
+                .map_err(|_| RelayError::KeyDerivation)?;
             if let Ok(secret) = SecretKey::from_slice(bytes.as_ref()) {
-                return Ok((hex(&topic), Keys::new(secret)));
+                return Ok((crate::hex::encode(&topic), Keys::new(secret)));
             }
         }
-        Err(RelayError::InvalidEvent)
+        Err(RelayError::KeyDerivation)
     }
 
     /// The epoch a given Unix time falls in.
@@ -928,6 +963,8 @@ pub struct RelayRendezvous {
     attempt_tag: Option<String>,
     cancelled: Option<Arc<AtomicBool>>,
     timeout: Duration,
+    /// How long to wait for the peer to appear on the topic.
+    peer_wait: Duration,
     /// How long to wait for the other person to confirm. Separate from `timeout`
     /// because a person needs far longer than a network round trip.
     confirmation_timeout: Duration,
@@ -1025,6 +1062,7 @@ impl RelayRendezvous {
             attempt_tag,
             cancelled: None,
             timeout: RENDEZVOUS_TIMEOUT,
+            peer_wait: PEER_WAIT_TIMEOUT,
             confirmation_timeout: CONFIRMATION_TIMEOUT,
             stashed: VecDeque::new(),
         })
@@ -1060,6 +1098,7 @@ impl RelayRendezvous {
     fn wait_for_peer_subscription(&mut self) -> Result<(), RelayError> {
         let mut last_request = None;
         let mut pending_nonces = BTreeSet::new();
+        let deadline = Instant::now() + self.peer_wait;
         loop {
             if self
                 .cancelled
@@ -1067,6 +1106,9 @@ impl RelayRendezvous {
                 .is_some_and(|token| token.load(Ordering::SeqCst))
             {
                 return Err(RelayError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(RelayError::TimedOut("peer subscription"));
             }
 
             if self.role == Role::Initiator
@@ -1209,7 +1251,7 @@ impl RelayRendezvous {
         let role = role_tag(self.role);
         // The time is stamped here, from the same clock the receiver's freshness check
         // uses, so the two cannot drift apart or depend on a library default.
-        let event = EventBuilder::new(Kind::Custom(EVENT_KIND), hex(frame))
+        let event = EventBuilder::new(Kind::Custom(EVENT_KIND), crate::hex::encode(frame))
             .custom_created_at(Timestamp::from_secs((self.clock)()))
             .tag(Tag::custom("t", [self.listen[self.publish].0.as_str()]))
             .tag(Tag::custom("r", [role]))
@@ -1288,29 +1330,9 @@ impl RelayRendezvous {
         if self.relays.is_empty() {
             return Err(RelayError::NoRelayAvailable);
         }
-        let mut attempts = self.relays.len();
-        let mut received = None;
-        while attempts > 0 && !self.relays.is_empty() {
-            let index = self.next_relay % self.relays.len();
-            self.next_relay = (index + 1) % self.relays.len();
-            attempts -= 1;
-            match self.relays[index].read() {
-                Ok(Some(message)) => {
-                    received = Some((index, message));
-                    break;
-                }
-                Ok(None) => {}
-                Err(_) => {
-                    self.relays.remove(index);
-                    self.next_relay = if self.relays.is_empty() {
-                        0
-                    } else {
-                        index % self.relays.len()
-                    };
-                }
-            }
-        }
-        let Some((link_index, incoming)) = received else {
+        let Some((link_index, incoming)) =
+            read_next_message(&mut self.relays, &mut self.next_relay).message
+        else {
             return if self.relays.is_empty() {
                 Err(RelayError::NoRelayAvailable)
             } else {
@@ -1577,7 +1599,7 @@ fn is_attempt_tag(tag: &str) -> bool {
 fn random_hex(bytes_len: usize) -> io::Result<String> {
     let mut bytes = Zeroizing::new(vec![0; bytes_len]);
     crate::random::fill(&mut bytes)?;
-    Ok(hex(&bytes))
+    Ok(crate::hex::encode(&bytes))
 }
 
 /// A subscription id is sent to the relay in the clear, so it must not identify this
@@ -1589,38 +1611,14 @@ fn new_subscription_id() -> Result<SubscriptionId, RelayError> {
 /// Appends the hex form of secret bytes to a string that is wiped when dropped, without
 /// building an intermediate `String` that would be freed with the secret still in it.
 fn push_secret_hex(target: &mut Zeroizing<String>, bytes: &[u8]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    target.reserve(bytes.len() * 2);
-    for byte in bytes {
-        target.push(HEX[(byte >> 4) as usize] as char);
-        target.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut result = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        result.push(HEX[(byte >> 4) as usize] as char);
-        result.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    result
+    crate::hex::push_encoded(target, bytes);
 }
 
 fn decode_hex(input: &str) -> Option<Vec<u8>> {
-    if !input.len().is_multiple_of(2) || input.len() > MAX_ENVELOPE * 2 {
+    if input.len() > MAX_ENVELOPE * 2 {
         return None;
     }
-    let digit = |byte| match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    };
-    input
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?))
-        .collect()
+    crate::hex::decode(input)
 }
 
 #[cfg(test)]
@@ -2300,7 +2298,7 @@ mod tests {
         ] {
             let mut secret = zeroize::Zeroizing::new(String::new());
             super::push_secret_hex(&mut secret, bytes);
-            assert_eq!(secret.as_str(), super::hex(bytes));
+            assert_eq!(secret.as_str(), crate::hex::encode(bytes));
         }
         // Appending keeps what is already there, as the invite code display relies on.
         let mut prefixed = zeroize::Zeroizing::new(String::from("ADI3-"));
@@ -2798,6 +2796,27 @@ mod tests {
     }
 
     #[test]
+    fn waiting_for_a_peer_that_never_comes_ends_at_the_deadline() {
+        let network = FakeRelayNetwork::default();
+        let invite = InviteCode::generate().unwrap();
+        let mut rendezvous = RelayRendezvous::connect_with(
+            &["wss://alone.test".to_owned()],
+            &invite,
+            Role::Initiator,
+            |endpoint| network.open(endpoint),
+        )
+        .unwrap();
+        rendezvous.peer_wait = Duration::from_millis(400);
+        let started = Instant::now();
+        assert!(matches!(
+            rendezvous.complete_handshake().map(|_| ()),
+            Err(RelayError::TimedOut("peer subscription"))
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(400));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
     fn rendezvous_waits_for_peer_subscription_until_cancelled() {
         let network = FakeRelayNetwork::default();
         let invite = InviteCode::generate().unwrap();
@@ -2891,6 +2910,58 @@ mod tests {
         ])
         .is_err());
         assert!(super::validate_relay_endpoint("wss://no-such-host.invalid").is_ok());
+    }
+
+    #[test]
+    fn relay_validation_handles_ip_literals_dots_and_length_limits() {
+        // Equivalent spellings of one endpoint compare equal, which is what lets the
+        // duplicate check work.
+        let normalized = |endpoint| super::validate_relay_endpoint(endpoint).unwrap();
+        assert_eq!(
+            normalized("wss://relay.example./"),
+            normalized("wss://relay.example")
+        );
+        assert_eq!(
+            normalized("wss://[::1]"),
+            normalized("wss://[0:0:0:0:0:0:0:1]:443/")
+        );
+        assert_eq!(
+            normalized("wss://127.0.0.1"),
+            normalized("wss://127.0.0.1:443")
+        );
+        assert_ne!(
+            normalized("wss://relay.example"),
+            normalized("wss://relay.example:8443")
+        );
+        assert_ne!(
+            normalized("wss://relay.example/a"),
+            normalized("wss://relay.example/b")
+        );
+        let long_label = "a".repeat(64);
+        let long_host = format!("{}.example", "a".repeat(250));
+        for endpoint in [
+            "wss://:443",
+            "wss://relay.example:",
+            "wss://[::1",
+            "wss://[::1]x",
+            "wss://relay..example",
+            "wss://relay.example-",
+            "wss://relay-.example",
+            "wss://relay.example:80:90",
+            "wss://relay.example:-1",
+            "wss://relay.example:+443",
+            "wss://relay.example/\u{7f}",
+            "wss://\u{e9}.example",
+            &format!("wss://{long_label}.example"),
+            &long_host,
+        ] {
+            assert!(
+                super::validate_relay_endpoint(endpoint).is_err(),
+                "accepted invalid endpoint: {endpoint}"
+            );
+        }
+        let longest_label = "a".repeat(63);
+        assert!(super::validate_relay_endpoint(&format!("wss://{longest_label}.example")).is_ok());
     }
 
     #[test]

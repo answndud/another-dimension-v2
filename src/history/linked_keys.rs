@@ -197,7 +197,7 @@ pub(crate) fn read_linked_keys(identity: &Identity, peer_id: &str) -> io::Result
     let mut locals = HashSet::new();
     let mut peers = HashSet::new();
     for (index, chunk) in plaintext[2..].chunks_exact(32).enumerate() {
-        let id = hex_encode(chunk);
+        let id = crate::hex::encode(chunk);
         if index < local_count {
             locals.insert(id);
         } else {
@@ -257,7 +257,7 @@ pub(crate) fn write_linked_keys(
     let mut contents = LINKED_KEYS_MAGIC_V2.to_vec();
     contents.extend_from_slice(&nonce);
     contents.extend_from_slice(&encrypted);
-    let temporary = path.with_extension(format!("{}.tmp", hex_encode(&random_nonce()?)));
+    let temporary = path.with_extension(format!("{}.tmp", crate::hex::encode(&random_nonce()?)));
     let mut options = crate::fsutil::private_options();
     options.write(true).create_new(true);
     #[cfg(unix)]

@@ -24,11 +24,8 @@ pub(crate) fn validate_peer_id(peer_id: &str) -> io::Result<()> {
 
 pub(crate) fn decode_peer_id(peer_id: &str) -> io::Result<[u8; 32]> {
     validate_peer_id(peer_id)?;
-    let mut bytes = [0; 32];
-    for (index, pair) in peer_id.as_bytes().chunks_exact(2).enumerate() {
-        bytes[index] = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
-    }
-    Ok(bytes)
+    crate::hex::decode_array::<32>(peer_id)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid peer id"))
 }
 
 pub(crate) fn sign_message(

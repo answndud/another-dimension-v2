@@ -69,7 +69,7 @@ pub(crate) fn decode_backup_links(
     let mut links = BackupLinks::default();
     let mut cursor = 11;
     for index in 0..records {
-        let id = hex_encode(&encoded[cursor..cursor + 32]);
+        let id = crate::hex::encode(&encoded[cursor..cursor + 32]);
         cursor += 32;
         if index < local_count {
             links.local.insert(id);
@@ -359,7 +359,7 @@ pub(crate) fn decode_backup_with_links(
     if payload.len() < 36 {
         return Err(invalid_data("invalid backup payload"));
     }
-    let peer_id = hex_encode(&payload[..32]);
+    let peer_id = crate::hex::encode(&payload[..32]);
     let count = u32::from_be_bytes(payload[32..36].try_into().expect("fixed slice")) as usize;
     if count > 1_000_000 || count > (payload.len() - 36) / 13 {
         return Err(invalid_data("too many backup messages"));
@@ -462,7 +462,7 @@ pub(crate) fn decode_backup_with_links(
         }
         let mut links = BackupLinks::default();
         for index in 0..local_count + peer_count + origin_count {
-            let id = hex_encode(&payload[cursor..cursor + 32]);
+            let id = crate::hex::encode(&payload[cursor..cursor + 32]);
             cursor += 32;
             if index < local_count {
                 links.local.insert(id);

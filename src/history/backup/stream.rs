@@ -83,7 +83,7 @@ impl<'a, W: Write> BackupStreamWriter<'a, W> {
         if expected_count != self.count {
             return Err(invalid_data("backup snapshot count changed"));
         }
-        let peer_id = hex_encode(&self.peer);
+        let peer_id = crate::hex::encode(&self.peer);
         validate_backup_links(&peer_id, links)?;
         let trailer = encode_backup_links(links)?;
         let trailer_index = self
@@ -157,7 +157,7 @@ pub(crate) fn decode_backup_stream_v6<R: Read>(
     }
     let mut peer = [0; 32];
     input.read_exact(&mut peer)?;
-    let peer_id = hex_encode(&peer);
+    let peer_id = crate::hex::encode(&peer);
     let key = match (password, salt.as_ref()) {
         (Some(password), Some(salt)) => {
             let password_key = derive_password_backup_key(password, salt)?;
@@ -246,7 +246,7 @@ pub(crate) fn decode_backup_stream<R: Read>(
     {
         return Err(invalid_data("invalid encrypted backup metadata"));
     }
-    let peer_id = hex_encode(&metadata[BACKUP_PEER_METADATA.len()..]);
+    let peer_id = crate::hex::encode(&metadata[BACKUP_PEER_METADATA.len()..]);
     read_stream_frames(input, identity, peer_id, &cipher, &base_aad, 1)
 }
 
@@ -316,7 +316,7 @@ fn read_stream_frames<R: Read>(
 pub(crate) fn new_restore_request_id() -> io::Result<String> {
     let mut id = String::with_capacity(72);
     for _ in 0..3 {
-        id.push_str(&hex_encode(&random_nonce()?));
+        id.push_str(&crate::hex::encode(&random_nonce()?));
     }
     id.truncate(64);
     Ok(id)

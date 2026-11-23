@@ -57,7 +57,7 @@ pub(crate) fn contacts_import_backup(
         }
         Err(_) => return reject(stream, "400 Bad Request"),
     };
-    let peer_id = encode_hex(&peer);
+    let peer_id = crate::hex::encode(&peer);
     if history::History::open(identity, &peer_id).is_err() {
         return reject(stream, "500 Internal Server Error");
     }

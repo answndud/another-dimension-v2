@@ -457,10 +457,10 @@ pub(crate) fn spawn_chat_worker(
             let verification = rendezvous
                 .authenticate(channel, &identity, expected_peer)
                 .map_err(|error| relay_failure_message(&error, "identity", tor_socks.is_some()))?;
-            let fingerprint = encode_hex(verification.fingerprint());
+            let fingerprint = crate::hex::encode(verification.fingerprint());
             let confirmation_code = verification.confirmation_code();
             let peer_key = *verification.peer_public_key();
-            let peer_id = encode_hex(verification.peer_public_key());
+            let peer_id = crate::hex::encode(verification.peer_public_key());
             {
                 let state = state_handle
                     .lock()

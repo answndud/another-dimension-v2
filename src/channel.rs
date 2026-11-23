@@ -361,22 +361,25 @@ impl RevealPending {
             (&self.peer_key, &peer_nonce),
         );
         Ok(VerificationPending {
-            hash: self.hash,
-            session_tag: session_tag(&self.hash),
-            role: self.role,
-            local_key: self.local_key,
-            peer_key: self.peer_key,
-            local_relay_keys: self.local_relay_keys,
-            peer_relay_key: self.peer_relay_key,
-            fingerprint,
+            session: PeerSession {
+                hash: self.hash,
+                session_tag: session_tag(&self.hash),
+                role: self.role,
+                local_key: self.local_key,
+                peer_key: self.peer_key,
+                local_relay_keys: self.local_relay_keys,
+                peer_relay_key: self.peer_relay_key,
+                fingerprint,
+            },
             transport: self.transport,
         })
     }
 }
 
-/// Both identities are cryptographically bound to the same Noise transcript.
-/// The fingerprint must be compared out of band by the users.
-pub struct VerificationPending {
+/// What the two sides know about each other once both identity proofs have been
+/// checked and the confirmation code exists. The states from there to the active
+/// channel carry the same facts, so they share this instead of repeating the fields.
+struct PeerSession {
     hash: [u8; HASH_SIZE],
     session_tag: [u8; 16],
     role: Role,
@@ -385,26 +388,32 @@ pub struct VerificationPending {
     local_relay_keys: Keys,
     peer_relay_key: PublicKey,
     fingerprint: [u8; HASH_SIZE],
+}
+
+/// Both identities are cryptographically bound to the same Noise transcript.
+/// The fingerprint must be compared out of band by the users.
+pub struct VerificationPending {
+    session: PeerSession,
     transport: snow::TransportState,
 }
 
 impl VerificationPending {
     pub(crate) fn role(&self) -> Role {
-        self.role
+        self.session.role
     }
 
     pub fn peer_public_key(&self) -> &[u8; 32] {
-        &self.peer_key
+        &self.session.peer_key
     }
 
     /// Full SHA-256 fingerprint, kept for anyone who wants to compare all of it.
     pub fn fingerprint(&self) -> &[u8; HASH_SIZE] {
-        &self.fingerprint
+        &self.session.fingerprint
     }
 
     /// The short code the two users compare out of band.
     pub fn confirmation_code(&self) -> String {
-        confirmation_code(&self.fingerprint)
+        confirmation_code(&self.session.fingerprint)
     }
 
     /// Call only after the local user has compared the fingerprint.
@@ -413,20 +422,13 @@ impl VerificationPending {
         mut self,
     ) -> Result<(ConfirmationPending, Vec<u8>), HandshakeError> {
         let mut confirmation = Vec::with_capacity(CONFIRM_SIZE);
-        confirmation.push(self.role.byte());
-        confirmation.extend_from_slice(&self.fingerprint);
-        confirmation.extend_from_slice(&self.hash);
+        confirmation.push(self.session.role.byte());
+        confirmation.extend_from_slice(&self.session.fingerprint);
+        confirmation.extend_from_slice(&self.session.hash);
         let frame = encrypt(&mut self.transport, &confirmation)?;
         Ok((
             ConfirmationPending {
-                role: self.role,
-                hash: self.hash,
-                session_tag: self.session_tag,
-                local_key: self.local_key,
-                peer_key: self.peer_key,
-                local_relay_keys: self.local_relay_keys,
-                peer_relay_key: self.peer_relay_key,
-                fingerprint: self.fingerprint,
+                session: self.session,
                 transport: self.transport,
             },
             frame,
@@ -436,14 +438,7 @@ impl VerificationPending {
 
 /// Local user has confirmed; activation still requires a matching peer frame.
 pub struct ConfirmationPending {
-    role: Role,
-    hash: [u8; HASH_SIZE],
-    session_tag: [u8; 16],
-    local_key: [u8; 32],
-    peer_key: [u8; 32],
-    local_relay_keys: Keys,
-    peer_relay_key: PublicKey,
-    fingerprint: [u8; HASH_SIZE],
+    session: PeerSession,
     transport: snow::TransportState,
 }
 
@@ -454,20 +449,20 @@ impl ConfirmationPending {
     ) -> Result<ActiveChannel, HandshakeError> {
         let confirmation = decrypt(&mut self.transport, frame, CONFIRM_SIZE)?;
         if confirmation.len() != CONFIRM_SIZE
-            || confirmation[0] != self.role.peer().byte()
-            || confirmation[1..33] != self.fingerprint
-            || confirmation[33..] != self.hash
+            || confirmation[0] != self.session.role.peer().byte()
+            || confirmation[1..33] != self.session.fingerprint
+            || confirmation[33..] != self.session.hash
         {
             return Err(HandshakeError::PeerNotConfirmed);
         }
         Ok(ActiveChannel {
-            role: self.role,
-            local_key: self.local_key,
-            peer_key: self.peer_key,
-            local_relay_keys: self.local_relay_keys,
-            peer_relay_key: self.peer_relay_key,
-            fingerprint: self.fingerprint,
-            session_tag: self.session_tag,
+            role: self.session.role,
+            local_key: self.session.local_key,
+            peer_key: self.session.peer_key,
+            local_relay_keys: self.session.local_relay_keys,
+            peer_relay_key: self.session.peer_relay_key,
+            fingerprint: self.session.fingerprint,
+            session_tag: self.session.session_tag,
             transport: self.transport,
         })
     }

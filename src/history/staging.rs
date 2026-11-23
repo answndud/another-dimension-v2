@@ -30,7 +30,7 @@ impl RestoreStaging {
         crate::fsutil::create_private_dir_all(&root)?;
         set_private_directory(&root)?;
         cleanup_stale_restore_staging(&root)?;
-        let directory = root.join(hex_encode(&random_nonce()?));
+        let directory = root.join(crate::hex::encode(&random_nonce()?));
         std::fs::create_dir(&directory)?;
         set_private_directory(&directory)?;
         let result = (|| {
@@ -868,7 +868,7 @@ impl History {
                 }
                 runs = reduced;
             }
-            let suffix = hex_encode(&random_nonce()?);
+            let suffix = crate::hex::encode(&random_nonce()?);
             let filename = self
                 .path
                 .file_name()

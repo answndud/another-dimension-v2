@@ -273,7 +273,10 @@ impl History {
         if !peers.iter().any(|existing| existing == &peer_id) {
             return Ok(());
         }
-        let tombstone = directory.join(format!(".deleted-{}.tmp", hex_encode(&random_nonce()?)));
+        let tombstone = directory.join(format!(
+            ".deleted-{}.tmp",
+            crate::hex::encode(&random_nonce()?)
+        ));
         if path.exists() {
             crate::fsutil::rename_durable(&path, &tombstone)?;
         }

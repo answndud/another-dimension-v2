@@ -207,9 +207,9 @@ pub(crate) fn write_index(
     let mut payload = Vec::with_capacity(4 + peers.len() * 32);
     payload.extend_from_slice(&count.to_be_bytes());
     for peer in peers {
-        for chunk in peer.as_bytes().chunks_exact(2) {
-            payload.push((hex_digit(chunk[0])? << 4) | hex_digit(chunk[1])?);
-        }
+        let bytes = crate::hex::decode_array::<32>(peer)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid peer id"))?;
+        payload.extend_from_slice(&bytes);
     }
     let nonce = random_nonce()?;
     let storage_key = identity.storage_key();
@@ -229,7 +229,7 @@ pub(crate) fn write_index(
         .map_err(|_| io::Error::other("history index encryption failed"))?;
     let temporary = directory.join(format!(
         ".index-{}.tmp",
-        opaque_conversation_name(&filename_key, &hex_encode(&nonce))
+        opaque_conversation_name(&filename_key, &crate::hex::encode(&nonce))
     ));
     let path = directory.join("conversations.idx");
     let mut file = crate::fsutil::private_options()
@@ -244,21 +244,6 @@ pub(crate) fn write_index(
     drop(file);
     crate::fsutil::rename_durable(temporary, path)?;
     Ok(())
-}
-
-pub(crate) fn hex_digit(byte: u8) -> io::Result<u8> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid peer id",
-        )),
-    }
-}
-
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 pub(crate) fn derive_index_key(key: &[u8; 32]) -> Zeroizing<[u8; 32]> {

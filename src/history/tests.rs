@@ -959,8 +959,8 @@ fn restores_only_verified_missing_messages_and_rejects_tampering_and_id_collisio
     let _data = IsolatedData::new();
     let (alice, _) = Identity::create().unwrap();
     let (bob, _) = Identity::create().unwrap();
-    let peer_id = super::hex_encode(&bob.public_key());
-    let local_peer_id = super::hex_encode(&alice.public_key());
+    let peer_id = crate::hex::encode(&bob.public_key());
+    let local_peer_id = crate::hex::encode(&alice.public_key());
     let signed = super::sign_message(&alice, &peer_id, 123, "signed record".into()).unwrap();
     let frame = super::encode_transfer(&signed).unwrap();
     let received =
@@ -1002,8 +1002,8 @@ fn new_message_decoder_requires_remote_sender_and_valid_proof() {
     let _data = IsolatedData::new();
     let (alice, _) = Identity::create().unwrap();
     let (bob, _) = Identity::create().unwrap();
-    let bob_id = super::hex_encode(&bob.public_key());
-    let alice_id = super::hex_encode(&alice.public_key());
+    let bob_id = crate::hex::encode(&bob.public_key());
+    let alice_id = crate::hex::encode(&alice.public_key());
     let outgoing = super::sign_message(&alice, &bob_id, 500, "authentic".into()).unwrap();
     let frame = super::encode_signed_message(&outgoing).unwrap();
     let received =

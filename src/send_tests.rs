@@ -2346,7 +2346,7 @@ fn history_sync_streams_large_offers_through_chunks_staging_and_final_merge() {
         .enumerate()
     {
         let (receiver_identity, _) = Identity::create().unwrap();
-        let peer_id = encode_hex(&sender_key);
+        let peer_id = crate::hex::encode(&sender_key);
         let request_id = format!("{:064x}", 0x600 + case);
         let mut sender =
             HistorySyncSender::for_generated_test(request_id.clone(), count, text_bytes);

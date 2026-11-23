@@ -83,7 +83,7 @@ pub(crate) fn chat_start(
             phase: "connecting",
             fingerprint: None,
             confirmation_code: None,
-            peer_id: expected_peer.as_ref().map(|peer| encode_hex(peer)),
+            peer_id: expected_peer.as_ref().map(|peer| crate::hex::encode(peer)),
             error: None,
             storage_error: None,
             messages: Vec::new(),

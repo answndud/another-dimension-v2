@@ -84,16 +84,8 @@ pub(crate) fn verify(
 }
 
 fn peer_bytes(peer_id: &str) -> io::Result<[u8; 32]> {
-    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid peer id");
-    if peer_id.len() != 64 {
-        return Err(invalid());
-    }
-    let mut bytes = [0; 32];
-    for (index, pair) in peer_id.as_bytes().chunks_exact(2).enumerate() {
-        let text = std::str::from_utf8(pair).map_err(|_| invalid())?;
-        bytes[index] = u8::from_str_radix(text, 16).map_err(|_| invalid())?;
-    }
-    Ok(bytes)
+    crate::hex::decode_array::<32>(peer_id)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid peer id"))
 }
 
 type Entries = Vec<([u8; 32], Anchor)>;
