@@ -950,6 +950,120 @@ mod send_tests {
         assert!(cleaned.starts_with("HTTP/1.1 200 OK"));
     }
 
+    fn test_state_for(identity: Identity) -> Arc<Mutex<State>> {
+        Arc::new(Mutex::new(State {
+            code: String::new(),
+            issued: Instant::now(),
+            attempts: 0,
+            sessions: vec!["test-session".to_owned()],
+            identity: Some(Arc::new(identity)),
+            chats: HashMap::new(),
+            history_deletions: HashMap::new(),
+            active_history_deletions: HashSet::new(),
+            tor_socks: None,
+            active_relays: vec![DEFAULT_RELAY.to_owned()],
+            settings: AppSettings::default(),
+            notifications_enabled: Arc::new(AtomicBool::new(false)),
+            last_notification: Arc::new(Mutex::new(None)),
+        }))
+    }
+
+    fn upload_backup_bytes(state: &Arc<Mutex<State>>, bytes: &[u8]) -> String {
+        let started = call_test_api(
+            state,
+            "/api/history/backup-transfer",
+            r#"{"action":"upload-start"}"#,
+            "test-session",
+        );
+        let started: serde_json::Value =
+            serde_json::from_str(started.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let id = started["transferId"].as_str().unwrap().to_owned();
+        let written = call_test_api(
+            state,
+            "/api/history/backup-transfer",
+            &serde_json::json!({
+                "action": "upload-chunk", "transferId": id,
+                "offset": 0, "data": BASE64.encode(bytes)
+            })
+            .to_string(),
+            "test-session",
+        );
+        assert!(written.starts_with("HTTP/1.1 200 OK"), "{written}");
+        id
+    }
+
+    #[test]
+    fn backup_transfer_api_enforces_the_legacy_format_opt_in_on_the_server() {
+        let _data = TestDataDirectory::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "cd".repeat(32);
+        // An attacker needs only the victim's public id and a password to build this.
+        let forged = history::tests::legacy_password_backup(
+            &identity,
+            &peer,
+            &[history::StoredMessage {
+                unix_time: 1_700_000_000,
+                sender: history::MessageSender::Other,
+                text: "I agree to the payment".to_owned(),
+                proof: None,
+            }],
+            "attacker chosen password",
+        );
+        let state = test_state_for(identity);
+        let import = |extra: serde_json::Value| -> String {
+            let id = upload_backup_bytes(&state, &forged);
+            let mut body = serde_json::json!({
+                "action": "import", "transferId": id, "password": "attacker chosen password"
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            call_test_api(
+                &state,
+                "/api/history/backup-transfer",
+                &body.to_string(),
+                "test-session",
+            )
+        };
+        // A rejected import must not even create the conversation file.
+        let stored = || match history::History::read_for_identity_copy(
+            state.lock().unwrap().identity.as_ref().unwrap(),
+            &peer,
+        ) {
+            Ok((messages, _)) => messages,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("unexpected history read error: {error}"),
+        };
+
+        // The server refuses on its own, whatever the page did or did not ask.
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({ "allowLegacy": false }),
+        ] {
+            let response = import(extra);
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+            assert!(response.contains("ADBACK2"), "{response}");
+            assert!(
+                stored().is_empty(),
+                "a rejected import must not write history"
+            );
+        }
+        // Only a literal boolean true counts; other types are malformed requests.
+        let response = import(serde_json::json!({ "allowLegacy": "yes" }));
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(stored().is_empty());
+
+        let response = import(serde_json::json!({ "allowLegacy": true }));
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let messages = stored();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].sender, history::MessageSender::Other);
+        assert!(
+            messages[0].proof.is_none(),
+            "a password-only backup can never produce a signed message"
+        );
+    }
+
     #[test]
     fn settings_relay_defaults_and_legacy_fields_are_preserved() {
         assert_eq!(
@@ -4689,6 +4803,19 @@ fn equal_token(left: &str, right: &str) -> bool {
             == 0
 }
 
+/// Reads the optional `allowLegacy` request field. Only a literal `true` lets a
+/// weak-format backup through; a missing field means "reject", and any other
+/// type is a malformed request (`None`).
+fn take_legacy_policy(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+) -> Option<history::LegacyBackupPolicy> {
+    match fields.remove("allowLegacy") {
+        None | Some(serde_json::Value::Bool(false)) => Some(history::LegacyBackupPolicy::Reject),
+        Some(serde_json::Value::Bool(true)) => Some(history::LegacyBackupPolicy::Allow),
+        Some(_) => None,
+    }
+}
+
 fn issue_code(state: &mut State) -> io::Result<()> {
     state.code = random_token()?;
     state.issued = Instant::now();
@@ -5822,11 +5949,13 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             })),
             "messages": page.entries.into_iter().map(|entry| {
                 let item = entry.message;
+                let signed = item.proof.is_some();
                 serde_json::json!({
                     "index": entry.index,
                     "time": item.unix_time,
                     "sender": chat_entry(item.clone()).sender,
-                    "text": chat_entry(item).text
+                    "text": chat_entry(item).text,
+                    "signed": signed
                 })
             }).collect::<Vec<_>>(),
         });
@@ -6277,6 +6406,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                     .remove("password")
                     .and_then(|v| v.as_str().map(|s| Zeroizing::new(s.to_owned())))
                     .filter(|v| !v.is_empty());
+                let Some(policy) = take_legacy_policy(fields) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
                 if !fields.is_empty()
                     || any_chat_active(&state)
                     || !state.active_history_deletions.is_empty()
@@ -6286,10 +6418,11 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 let Some(path) = get_transfer_path(&id) else {
                     return reject(&mut stream, "400 Bad Request");
                 };
-                let result = history::History::import_backup_file(
+                let result = history::History::import_backup_file_with_policy(
                     identity,
                     &path,
                     password.as_deref().map(String::as_str),
+                    policy,
                 );
                 let cleanup = std::fs::remove_file(&path);
                 let restored = match (result, cleanup) {
@@ -6369,6 +6502,9 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                     .remove("replacementPassword")
                     .and_then(|v| v.as_str().map(|s| Zeroizing::new(s.to_owned())))
                     .filter(|v| !v.is_empty());
+                let Some(policy) = take_legacy_policy(fields) else {
+                    return reject(&mut stream, "400 Bad Request");
+                };
                 if !fields.is_empty() {
                     return reject(&mut stream, "400 Bad Request");
                 }
@@ -6392,13 +6528,14 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                     Ok(file) => file,
                     Err(_) => return reject(&mut stream, "500 Internal Server Error"),
                 };
-                let result = history::History::reprotect_backup_file(
+                let result = history::History::reprotect_backup_file_with_policy(
                     &previous_identity,
                     identity,
                     &source_path,
                     &mut output,
                     previous_password.as_deref().map(String::as_str),
                     replacement_password.as_deref().map(String::as_str),
+                    policy,
                 );
                 let result = result.and_then(|count| {
                     output.flush()?;

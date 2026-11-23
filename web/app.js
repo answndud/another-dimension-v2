@@ -379,6 +379,33 @@ async function backupTransferRequest(payload, session = token) {
   return response;
 }
 
+// Backup formats with weaker guarantees than ADBACK7/ADPACK3. The server enforces this
+// list and refuses these formats unless `allowLegacy` is sent; this table only decides
+// when to ask the user first.
+const legacyBackupFormats = {
+  'ADBACK2\0': {
+    kind: 'ADBACK2 백업',
+    risk: 'ADBACK2는 암호화 키가 백업 비밀번호에서만 유도되고 메시지에 서명이 없습니다. 비밀번호를 아는 사람은 상대가 보낸 것처럼 보이는 기록을 만들어 넣을 수 있습니다. 직접 만든 백업이 확실할 때만 가져오세요.',
+  },
+  'ADBACK6\0': {
+    kind: 'ADBACK6 백업',
+    risk: 'ADBACK6은 상대 공개 ID가 평문이며 비밀번호가 없는 경우 서로 다른 파일의 동일 순번 프레임을 구분하지 못할 수 있습니다.',
+  },
+  'ADPACK1\0': {
+    kind: 'ADPACK1 묶음',
+    risk: 'ADPACK1은 대화 순서·구성에 대한 묶음 인증이 없고, 안에 ADBACK2 같은 이전 형식 백업이 들어 있을 수 있습니다.',
+  },
+  'ADPACK2\0': {
+    kind: 'ADPACK2 묶음',
+    risk: 'ADPACK2는 대화 순서·구성에 대한 묶음 인증이 없습니다.',
+  },
+};
+
+async function legacyBackupFormatOf(file) {
+  const header = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+  return legacyBackupFormats[new TextDecoder().decode(header)] || null;
+}
+
 async function uploadBackupFile(file, isCurrent = () => true, session = token) {
   const begin = await backupTransferRequest({ action: 'upload-start' }, session);
   const { transferId } = await begin.json();
@@ -780,7 +807,14 @@ function renderHistoryMessages() {
     time.textContent = `${formatTime(item.time)} [${item.sender}]`;
     const body = document.createElement('div');
     appendMessageBody(body, item.text);
-    card.append(selection, time, body);
+    card.append(selection, time);
+    if (item.signed === false && item.sender !== '신원 변경') {
+      const unsigned = document.createElement('small');
+      unsigned.className = 'unsigned-note';
+      unsigned.textContent = '서명 없음 · 미검증';
+      card.append(unsigned);
+    }
+    card.append(body);
     historyMessages.append(card);
   }
   if (!historyMessages.childElementCount) {
@@ -2000,16 +2034,15 @@ document.querySelector('#history-backup-import').addEventListener('click', async
     const hasLinkedIdentityData = backupMagic === 'ADBACK5\0' || backupMagic === 'ADBACK7\0'
       || backupMagic === 'ADBACK6\0' || backupMagic === 'ADPACK1\0'
       || backupMagic === 'ADPACK2\0' || backupMagic === 'ADPACK3\0';
-    if (backupMagic === 'ADBACK6\0' || backupMagic === 'ADPACK2\0') {
-      const kind = backupMagic === 'ADBACK6\0' ? 'ADBACK6 백업' : 'ADPACK2 묶음';
-      if (!window.confirm(`${kind}은 이전 형식입니다. ADBACK6은 상대 공개 ID가 평문이며 비밀번호가 없는 경우 서로 다른 파일의 동일 순번 프레임을 구분하지 못할 수 있습니다. ADPACK2는 대화 순서·구성에 대한 묶음 인증이 없습니다. 새 형식보다 변조 탐지 범위가 제한됩니다. 이 한계를 이해하고 가져오시겠습니까?`)) return;
-    }
+    const legacyFormat = legacyBackupFormats[backupMagic] || null;
+    if (legacyFormat
+      && !window.confirm(`${legacyFormat.kind}은 이전 형식입니다. ${legacyFormat.risk} 새 형식보다 변조 탐지 범위가 제한됩니다. 가져온 메시지에는 '서명 없음 · 미검증' 표시가 붙습니다. 이 한계를 이해하고 가져오시겠습니까?`)) return;
     if (hasLinkedIdentityData
       && !window.confirm('이 백업에는 이전 신원 연결 정보가 포함될 수 있습니다. 파일 인증에 성공한 경우에만 해당 관계를 이 기기에 복원합니다. 계속할까요?')) return;
     transferId = await uploadBackupFile(file, isCurrentImport, importSession);
     if (!isCurrentImport()) return;
     importRequestStarted = true;
-    const response = await request('/api/history/backup-transfer', JSON.stringify({ action: 'import', transferId, password }), importSession);
+    const response = await request('/api/history/backup-transfer', JSON.stringify({ action: 'import', transferId, password, ...(legacyFormat ? { allowLegacy: true } : {}) }), importSession);
     transferId = null;
     if (!isCurrentImport()) return;
     if (response.status === 409) {
@@ -2154,6 +2187,13 @@ document.querySelector('#history-reprotect').addEventListener('click', async () 
   try {
     const file = await sourceHandle.getFile();
     if (!reprotectWork.isCurrent(generation)) return;
+    const legacyFormat = await legacyBackupFormatOf(file);
+    if (!reprotectWork.isCurrent(generation)) return;
+    if (legacyFormat
+      && !window.confirm(`${legacyFormat.kind}은 이전 형식입니다. ${legacyFormat.risk} 새 백업으로 옮겨도 서명이 없던 메시지는 서명 없이 유지되며 '서명 없음 · 미검증'으로 표시됩니다. 계속 재보호하시겠습니까?`)) {
+      message.textContent = '이전 형식 백업의 재보호를 취소했습니다. 원본 파일은 변경하지 않았습니다.';
+      return;
+    }
     const transferId = await uploadBackupFile(file, () => reprotectWork.isCurrent(generation));
     if (!reprotectWork.isCurrent(generation)) {
       await request('/api/history/backup-transfer', JSON.stringify({ action: 'cleanup', transferId })).catch(() => {});
@@ -2164,6 +2204,7 @@ document.querySelector('#history-reprotect').addEventListener('click', async () 
       previousCode,
       previousPassword,
       replacementPassword,
+      ...(legacyFormat ? { allowLegacy: true } : {}),
     }));
     if (!response.ok) throw new Error('reprotect failed');
     const output = await response.json();

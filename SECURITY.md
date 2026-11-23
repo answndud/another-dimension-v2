@@ -51,7 +51,7 @@ Please do not open a public issue for a vulnerability. Use GitHub's private vuln
 
 These are known and documented, not hidden. Items are removed from this list only when the fix is recorded in [docs/security-fixes.md](docs/security-fixes.md).
 
-1. **Legacy backup formats** (ADBACK1–6, ADPACK1–2) can still be imported with weaker guarantees. ADBACK2 derives its key from the password alone and its messages are unsigned, so someone who knows the password can forge history that an import would merge.
+1. **Legacy backup formats can still be imported after confirmation.** ADBACK2, ADBACK6, ADPACK1 and ADPACK2 are rejected by default and are accepted only when the user confirms a format-specific warning (see SF-002). ADBACK2 derives its key from the password alone and its messages are unsigned, so a user who confirms it for a file from an untrusted source can still be given forged history. Those messages are marked "서명 없음 · 미검증" (unsigned, unverified) in the history manager and the restore preview, but not yet in the live chat view.
 2. **The access code is not protected by a secret.** The AD2 code contains its own wrapping key, so it is a per-code encoding of the seed, not encryption. Treat the code itself as the secret.
 3. **Session tokens do not expire** and are not revoked on logout or when a new pairing code is issued.
 4. **The HTTP server handles one connection at a time** and has no overall request deadline, so a local client that sends bytes slowly can block the UI.

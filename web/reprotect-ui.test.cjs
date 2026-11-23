@@ -3076,3 +3076,112 @@ test('actual UI: staging cleanup failure remains visible after disconnect', () =
   assert.equal(h.element('#history-restore-panel').hidden, false);
   assert.match(h.element('#history-restore-status').textContent, /복구 임시 파일 제거 실패/);
 });
+
+const backupTransferActions = (harness) => harness.requests
+  .filter((item) => item.path === '/api/history/backup-transfer')
+  .map((item) => JSON.parse(item.init.body));
+
+test('importing a forgeable or unauthenticated legacy format asks first and cancelling sends nothing', async () => {
+  const expectations = [
+    ['ADBACK2\0', /ADBACK2 백업은 이전 형식/, /비밀번호를 아는 사람은 상대가 보낸 것처럼 보이는 기록을 만들어 넣을 수 있습니다/],
+    ['ADPACK1\0', /ADPACK1 묶음은 이전 형식/, /묶음 인증이 없고/],
+  ];
+  for (const [magic, kind, risk] of expectations) {
+    const h = createHarness();
+    h.element('#history-backup-file').files = [file('legacy.adbak', `${magic}payload`)];
+    let warning = '';
+    h.window.confirm = (text) => { warning = text; return false; };
+    await h.click('#history-backup-import');
+    assert.match(warning, kind);
+    assert.match(warning, risk);
+    assert.match(warning, /서명 없음 · 미검증/);
+    assert.deepEqual(backupTransferActions(h), [], 'nothing is uploaded or imported after cancelling');
+  }
+});
+
+test('the legacy opt-in flag is sent only after the user confirmed a legacy format', async () => {
+  for (const magic of ['ADBACK2\0', 'ADBACK6\0', 'ADPACK1\0', 'ADPACK2\0']) {
+    const h = createHarness({ importFailure: 'stop after the import request' });
+    h.element('#history-backup-file').files = [file('legacy.adbak', `${magic}payload`)];
+    h.window.confirm = () => true;
+    const task = h.click('#history-backup-import');
+    await new Promise((resolve) => setImmediate(resolve));
+    await task;
+    const imports = backupTransferActions(h).filter((item) => item.action === 'import');
+    assert.equal(imports.length, 1, magic);
+    assert.equal(imports[0].allowLegacy, true, magic);
+  }
+});
+
+test('current formats import without a legacy prompt or opt-in flag', async () => {
+  for (const magic of ['ADBACK7\0', 'ADPACK3\0']) {
+    const h = createHarness({ importFailure: 'stop after the import request' });
+    h.element('#history-backup-file').files = [file('current.adbak', `${magic}payload`)];
+    const prompts = [];
+    h.window.confirm = (text) => { prompts.push(text); return true; };
+    const task = h.click('#history-backup-import');
+    await new Promise((resolve) => setImmediate(resolve));
+    await task;
+    const imports = backupTransferActions(h).filter((item) => item.action === 'import');
+    assert.equal(imports.length, 1, magic);
+    assert.equal('allowLegacy' in imports[0], false, magic);
+    assert.equal(prompts.some((text) => /이전 형식/.test(text)), false, magic);
+  }
+});
+
+test('re-protecting a legacy backup needs the same confirmation and opt-in flag', async () => {
+  const cancelled = createHarness();
+  await chooseSource(cancelled, sourceHandle('legacy.adbak', 'ADBACK2\0payload'));
+  enterSecrets(cancelled, 'A');
+  let warning = '';
+  cancelled.window.confirm = (text) => { warning = text; return false; };
+  await cancelled.click('#history-reprotect');
+  assert.match(warning, /ADBACK2 백업은 이전 형식/);
+  assert.match(warning, /서명 없음 · 미검증/);
+  assert.deepEqual(backupTransferActions(cancelled), []);
+  assert.match(cancelled.element('#message').textContent, /재보호를 취소했습니다/);
+
+  const accepted = createHarness();
+  await chooseSource(accepted, sourceHandle('legacy.adbak', 'ADBACK2\0payload'));
+  enterSecrets(accepted, 'B');
+  accepted.window.confirm = () => true;
+  const task = accepted.click('#history-reprotect');
+  await new Promise((resolve) => setImmediate(resolve));
+  const request = accepted.requestForAction('reprotect');
+  assert.equal(JSON.parse(request.init.body).allowLegacy, true);
+  request.resolve(reprotectResponse(accepted, 'QmFja3VwQg==', 'result-legacy'));
+  await task;
+
+  const current = createHarness();
+  await chooseSource(current, sourceHandle('current.adbak', 'ADBACK7\0payload'));
+  enterSecrets(current, 'C');
+  current.window.confirm = () => { throw new Error('current formats must not prompt'); };
+  const currentTask = current.click('#history-reprotect');
+  await new Promise((resolve) => setImmediate(resolve));
+  const currentRequest = current.requestForAction('reprotect');
+  assert.equal('allowLegacy' in JSON.parse(currentRequest.init.body), false);
+  currentRequest.resolve(reprotectResponse(current, 'QmFja3VwQw==', 'result-current'));
+  await currentTask;
+});
+
+test('history list marks messages without a signature as unverified, in text', () => {
+  const h = createHarness();
+  h.evaluate(`selectedHistoryMessages = [
+    {index: 0, time: 1, sender: '상대', text: 'signed message', signed: true},
+    {index: 1, time: 2, sender: '상대', text: 'unsigned message', signed: false},
+    {index: 2, time: 3, sender: '신원 변경', text: 'identity changed', signed: false},
+    {index: 3, time: 4, sender: '상대', text: 'no flag from an older server'},
+  ]; renderHistoryMessages()`);
+  // The fake DOM has no childElementCount, so it also appends the empty-list
+  // paragraph; only the four message cards matter here.
+  const cards = h.element('#history-messages').children.slice(0, 4);
+  const notes = cards.map((card) => card.children
+    .filter((child) => child.className === 'unsigned-note')
+    .map((child) => child.textContent));
+  assert.deepEqual(notes, [[], ['서명 없음 · 미검증'], [], []]);
+  // Order: selection, time, marker, body. The marker sits between the time and the text.
+  const [, time, marker, body] = cards[1].children;
+  assert.match(time.textContent, /\[상대\]/);
+  assert.equal(marker.textContent, '서명 없음 · 미검증');
+  assert.equal(body.children.map((child) => child.textContent).join(''), 'unsigned message');
+});

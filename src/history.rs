@@ -1978,15 +1978,28 @@ impl History {
         backup_transfer_workspace(identity).map(|workspace| workspace.owner_id.clone())
     }
 
+    /// Imports a backup file. Formats with weaker guarantees are rejected; use
+    /// [`Self::import_backup_file_with_policy`] after the user has confirmed them.
+    #[cfg(test)]
     pub(crate) fn import_backup_file(
         identity: &Identity,
         path: &std::path::Path,
         password: Option<&str>,
     ) -> io::Result<Vec<(String, usize, bool)>> {
+        Self::import_backup_file_with_policy(identity, path, password, LegacyBackupPolicy::Reject)
+    }
+
+    pub(crate) fn import_backup_file_with_policy(
+        identity: &Identity,
+        path: &std::path::Path,
+        password: Option<&str>,
+        policy: LegacyBackupPolicy,
+    ) -> io::Result<Vec<(String, usize, bool)>> {
         let mut file = File::open(path)?;
         let mut magic = [0; 8];
         file.read_exact(&mut magic)?;
         file.seek(SeekFrom::Start(0))?;
+        require_legacy_opt_in(&magic, policy)?;
         if &magic == BACKUP_STREAM_MAGIC || &magic == BACKUP_STREAM_V6_MAGIC {
             let (peer_id, mut staging, links) = if &magic == BACKUP_STREAM_MAGIC {
                 decode_backup_stream(identity, &mut file, password)?
@@ -2057,6 +2070,10 @@ impl History {
         Ok((peer_id, count as u64))
     }
 
+    /// Re-encrypts a backup under a new identity. Re-protecting would carry the
+    /// content of a weak-format backup into a stronger container, so the same
+    /// legacy confirmation applies as for importing.
+    #[cfg(test)]
     pub(crate) fn reprotect_backup_file(
         previous_identity: &Identity,
         replacement_identity: &Identity,
@@ -2065,10 +2082,32 @@ impl History {
         previous_password: Option<&str>,
         replacement_password: Option<&str>,
     ) -> io::Result<u64> {
+        Self::reprotect_backup_file_with_policy(
+            previous_identity,
+            replacement_identity,
+            source,
+            output,
+            previous_password,
+            replacement_password,
+            LegacyBackupPolicy::Reject,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reprotect_backup_file_with_policy(
+        previous_identity: &Identity,
+        replacement_identity: &Identity,
+        source: &std::path::Path,
+        output: &mut File,
+        previous_password: Option<&str>,
+        replacement_password: Option<&str>,
+        policy: LegacyBackupPolicy,
+    ) -> io::Result<u64> {
         let mut input = File::open(source)?;
         let mut magic = [0; 8];
         input.read_exact(&mut magic)?;
         input.seek(SeekFrom::Start(0))?;
+        require_legacy_opt_in(&magic, policy)?;
         if &magic != BACKUP_STREAM_MAGIC && &magic != BACKUP_STREAM_V6_MAGIC {
             let length = input.metadata()?.len();
             if length > MAX_LEGACY_BACKUP_BYTES as u64 {
@@ -4050,6 +4089,55 @@ fn validate_peer_id(peer_id: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether a backup in a format with weaker guarantees may be processed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LegacyBackupPolicy {
+    /// Refuse formats that need an explicit decision from the user.
+    Reject,
+    /// The user has been shown the risk and confirmed it.
+    Allow,
+}
+
+/// Returns the format name and the risk for backup formats that must not be
+/// processed without the user's explicit confirmation. Formats that are
+/// authenticated as a whole with the identity key (ADBACK1, ADBACK3-5, ADBACK7,
+/// ADPACK3) need no confirmation.
+pub(crate) fn legacy_backup_risk(magic: &[u8; 8]) -> Option<(&'static str, &'static str)> {
+    if magic == BACKUP_PASSWORD_MAGIC {
+        Some((
+            "ADBACK2",
+            "its key comes only from the password and its messages are unsigned, so anyone who knows the password can forge history",
+        ))
+    } else if magic == BACKUP_STREAM_V6_MAGIC {
+        Some((
+            "ADBACK6",
+            "the peer id is stored in plaintext and, without a password, frames from different files cannot be told apart",
+        ))
+    } else if magic == BACKUP_BUNDLE_MAGIC {
+        Some((
+            "ADPACK1",
+            "the bundle does not authenticate its conversation count or order",
+        ))
+    } else if magic == BACKUP_STREAM_BUNDLE_V2_MAGIC {
+        Some((
+            "ADPACK2",
+            "the bundle does not authenticate its conversation count or order",
+        ))
+    } else {
+        None
+    }
+}
+
+fn require_legacy_opt_in(magic: &[u8; 8], policy: LegacyBackupPolicy) -> io::Result<()> {
+    match legacy_backup_risk(magic) {
+        Some((name, risk)) if policy == LegacyBackupPolicy::Reject => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("legacy backup format {name} requires explicit confirmation: {risk}"),
+        )),
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn decode_peer_id(peer_id: &str) -> io::Result<[u8; 32]> {
     validate_peer_id(peer_id)?;
     let mut bytes = [0; 32];
@@ -5620,7 +5708,7 @@ fn invalid_data(message: &str) -> io::Error {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         backup_transfer_file_identity, cleanup_stale_transfer_workspace,
         cleanup_stale_transfer_workspaces, decode_peer_id, lock_transfer_owner,
@@ -7550,7 +7638,7 @@ mod tests {
         assert!(!data.0.join(replacement.public_id()).exists());
     }
 
-    fn legacy_password_backup(
+    pub(crate) fn legacy_password_backup(
         identity: &Identity,
         peer: &str,
         messages: &[StoredMessage],
@@ -7588,6 +7676,171 @@ mod tests {
         backup.extend_from_slice(&nonce);
         backup.extend_from_slice(&encrypted);
         backup
+    }
+
+    /// Writes `bytes` to a fresh file inside the isolated data directory.
+    fn write_backup_fixture(data: &IsolatedData, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = data.0.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn forged_other_message(text: &str) -> StoredMessage {
+        StoredMessage {
+            unix_time: 1_700_000_000,
+            sender: MessageSender::Other,
+            text: text.to_owned(),
+            proof: None,
+        }
+    }
+
+    #[test]
+    fn forged_password_only_backup_is_not_imported_by_default() {
+        let data = IsolatedData::new();
+        let (victim, _) = Identity::create().unwrap();
+        let peer = "ab".repeat(32);
+        // ADBACK2 derives its key from the password alone and authenticates only the
+        // victim's *public* id, so an attacker needs nothing secret to build one.
+        let forged = legacy_password_backup(
+            &victim,
+            &peer,
+            &[forged_other_message("I agree to the payment")],
+            "attacker chosen password",
+        );
+        let path = write_backup_fixture(&data, "forged.backup", &forged);
+
+        let error = History::import_backup_file(&victim, &path, Some("attacker chosen password"))
+            .expect_err("a password-only backup must not import without explicit opt-in");
+        assert!(
+            error.to_string().contains("ADBACK2"),
+            "the error should name the rejected format: {error}"
+        );
+        let (_, messages, _) = History::open(&victim, &peer).unwrap();
+        assert!(
+            messages.is_empty(),
+            "forged messages must not reach history"
+        );
+    }
+
+    #[test]
+    fn only_formats_with_weaker_guarantees_need_confirmation() {
+        let needs_confirmation = [
+            super::BACKUP_PASSWORD_MAGIC,
+            super::BACKUP_STREAM_V6_MAGIC,
+            super::BACKUP_BUNDLE_MAGIC,
+            super::BACKUP_STREAM_BUNDLE_V2_MAGIC,
+        ];
+        let authenticated_as_a_whole = [
+            super::BACKUP_MAGIC,
+            super::BACKUP_COMBINED_MAGIC,
+            super::BACKUP_SIGNED_MAGIC,
+            super::BACKUP_LINKED_MAGIC,
+            super::BACKUP_STREAM_MAGIC,
+            super::BACKUP_STREAM_BUNDLE_MAGIC,
+        ];
+        for magic in needs_confirmation {
+            let (name, risk) = super::legacy_backup_risk(magic)
+                .unwrap_or_else(|| panic!("{magic:?} must require confirmation"));
+            assert!(name.starts_with("AD"), "{name}");
+            assert!(!risk.is_empty());
+        }
+        for magic in authenticated_as_a_whole {
+            assert!(
+                super::legacy_backup_risk(magic).is_none(),
+                "{magic:?} must not require confirmation"
+            );
+        }
+        assert!(super::legacy_backup_risk(b"UNKNOWN\0").is_none());
+    }
+
+    #[test]
+    fn legacy_bundle_is_rejected_by_default_and_imports_after_opt_in() {
+        let data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "e1".repeat(32);
+        History::open(&identity, &peer)
+            .unwrap()
+            .0
+            .append(&message(5, "bundled message"))
+            .unwrap();
+        let bundle = History::export_backup_bundle(&identity, std::slice::from_ref(&peer)).unwrap();
+        assert!(bundle.starts_with(super::BACKUP_BUNDLE_MAGIC));
+        let path = write_backup_fixture(&data, "legacy-bundle.backup", &bundle);
+
+        // A fresh identity directory models importing on another device.
+        let target = data.0.join("bundle-target");
+        std::fs::create_dir_all(&target).unwrap();
+        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target));
+        let error = History::import_backup_file(&identity, &path, None)
+            .expect_err("ADPACK1 must not import without confirmation");
+        assert!(error.to_string().contains("ADPACK1"), "{error}");
+        assert!(History::read_for_identity_copy(&identity, &peer).is_err());
+
+        let imported = History::import_backup_file_with_policy(
+            &identity,
+            &path,
+            None,
+            super::LegacyBackupPolicy::Allow,
+        )
+        .unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].0, peer);
+    }
+
+    #[test]
+    fn current_format_round_trip_keeps_unsigned_messages_unsigned() {
+        let data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "f2".repeat(32);
+        // A local record from before messages were signed.
+        History::open(&identity, &peer)
+            .unwrap()
+            .0
+            .append(&message(9, "written before signing existed"))
+            .unwrap();
+        let mut exported = Vec::new();
+        History::export_backup_stream(&identity, &peer, None, &mut exported).unwrap();
+        assert!(exported.starts_with(super::BACKUP_STREAM_MAGIC));
+        let path = write_backup_fixture(&data, "current.backup", &exported);
+
+        let target = data.0.join("current-target");
+        std::fs::create_dir_all(&target).unwrap();
+        super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(target));
+        // ADBACK7 needs no confirmation, so the unsigned record arrives silently;
+        // the UI therefore has to mark it from `proof` alone.
+        History::import_backup_file(&identity, &path, None).unwrap();
+        let (_, messages, _) = History::open(&identity, &peer).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].proof.is_none());
+    }
+
+    #[test]
+    fn forged_password_only_backup_imports_unsigned_only_after_opt_in() {
+        let data = IsolatedData::new();
+        let (victim, _) = Identity::create().unwrap();
+        let peer = "ac".repeat(32);
+        let forged = legacy_password_backup(
+            &victim,
+            &peer,
+            &[forged_other_message("I agree to the payment")],
+            "attacker chosen password",
+        );
+        let path = write_backup_fixture(&data, "forged-allowed.backup", &forged);
+
+        History::import_backup_file_with_policy(
+            &victim,
+            &path,
+            Some("attacker chosen password"),
+            super::LegacyBackupPolicy::Allow,
+        )
+        .unwrap();
+        let (_, messages, _) = History::open(&victim, &peer).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].sender, MessageSender::Other);
+        assert!(
+            messages[0].proof.is_none(),
+            "the imported message must stay unsigned so the UI can mark it unverified"
+        );
     }
 
     fn legacy_identity_backup(
@@ -8176,7 +8429,7 @@ mod tests {
     }
 
     #[test]
-    fn v6_backup_and_v2_bundle_remain_importable() {
+    fn v6_backup_and_v2_bundle_need_confirmation_but_remain_importable() {
         let data = IsolatedData::new();
         let (identity, code) = Identity::create().unwrap();
         let peer = "d2".repeat(32);
@@ -8199,8 +8452,18 @@ mod tests {
             History::verify_backup_file(&Identity::create().unwrap().0, &backup_path, None)
                 .is_err()
         );
+        let error = History::import_backup_file(&target_identity, &backup_path, None)
+            .expect_err("ADBACK6 must not import without confirmation");
+        assert!(error.to_string().contains("ADBACK6"), "{error}");
+        assert!(History::open(&target_identity, &peer).unwrap().1.is_empty());
         assert_eq!(
-            History::import_backup_file(&target_identity, &backup_path, None).unwrap(),
+            History::import_backup_file_with_policy(
+                &target_identity,
+                &backup_path,
+                None,
+                super::LegacyBackupPolicy::Allow,
+            )
+            .unwrap(),
             vec![(peer.clone(), 1, false)]
         );
 
@@ -8214,13 +8477,25 @@ mod tests {
             .write(true)
             .open(&reprotected_path)
             .unwrap();
-        History::reprotect_backup_file(
+        let error = History::reprotect_backup_file(
             &target_identity,
             &replacement,
             &backup_path,
             &mut reprotected,
             None,
             None,
+        )
+        .expect_err("re-protecting ADBACK6 must need the same confirmation");
+        assert!(error.to_string().contains("ADBACK6"), "{error}");
+        assert_eq!(reprotected.metadata().unwrap().len(), 0);
+        History::reprotect_backup_file_with_policy(
+            &target_identity,
+            &replacement,
+            &backup_path,
+            &mut reprotected,
+            None,
+            None,
+            super::LegacyBackupPolicy::Allow,
         )
         .unwrap();
         reprotected.flush().unwrap();
@@ -8241,8 +8516,17 @@ mod tests {
         std::fs::create_dir_all(&bundle_target).unwrap();
         super::TEST_DATA_DIRECTORY.with(|directory| *directory.borrow_mut() = Some(bundle_target));
         let bundle_identity = Identity::from_code(&code).unwrap();
+        let error = History::import_backup_file(&bundle_identity, &bundle_path, None)
+            .expect_err("ADPACK2 must not import without confirmation");
+        assert!(error.to_string().contains("ADPACK2"), "{error}");
         assert_eq!(
-            History::import_backup_file(&bundle_identity, &bundle_path, None).unwrap(),
+            History::import_backup_file_with_policy(
+                &bundle_identity,
+                &bundle_path,
+                None,
+                super::LegacyBackupPolicy::Allow,
+            )
+            .unwrap(),
             vec![(peer.clone(), 1, false)]
         );
         let mut reader = History::reader_for_identity_copy(&bundle_identity, &peer).unwrap();
