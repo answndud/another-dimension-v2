@@ -11,9 +11,15 @@ use zeroize::Zeroizing;
 use crate::identity::Identity;
 
 const PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
-const PROLOGUE: &[u8] = b"another-dimension-v2/noise-handshake/v2";
-const SIGN_DOMAIN: &[u8] = b"another-dimension-v2/identity-proof/v2";
-const CONFIRM_DOMAIN: &[u8] = b"another-dimension-v2/user-confirmation/v2";
+// Protocol version 3 adds a commitment to a random value in the identity proof and a
+// reveal step, so both users compare a short code that neither side could steer. A
+// peer running version 2 fails the Noise handshake because the prologue differs.
+const PROLOGUE: &[u8] = b"another-dimension-v2/noise-handshake/v3";
+const SIGN_DOMAIN: &[u8] = b"another-dimension-v2/identity-proof/v3";
+const CONFIRM_DOMAIN: &[u8] = b"another-dimension-v2/user-confirmation/v3";
+const COMMIT_DOMAIN: &[u8] = b"another-dimension-v2/code-commitment/v3";
+/// Random value each side contributes to the confirmation code.
+const NONCE_SIZE: usize = 16;
 const MAX_HANDSHAKE_MESSAGE: usize = 128;
 const MAX_FRAME: usize = 8192;
 const FRAME_TAG: usize = 16;
@@ -22,7 +28,8 @@ const MAX_REORDER: u64 = 32;
 const ENVELOPE_MAGIC: &[u8; 4] = b"ADV2";
 const ROUTE_DOMAIN: &[u8] = b"another-dimension-v2/relay-route/v2";
 const HASH_SIZE: usize = 32;
-const PROOF_SIZE: usize = 1 + 32 + 32 + 64;
+const PROOF_SIZE: usize = 1 + 32 + 32 + HASH_SIZE + 64;
+const REVEAL_SIZE: usize = 1 + NONCE_SIZE;
 const CONFIRM_SIZE: usize = 1 + 32 + HASH_SIZE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +71,8 @@ pub enum HandshakeError {
     Closed,
     InvalidRelayKey,
     RoleMismatch,
+    /// The revealed value does not match the commitment the peer sent earlier.
+    CommitmentMismatch,
 }
 
 impl From<snow::Error> for HandshakeError {
@@ -178,12 +187,24 @@ impl PendingChannel {
         let public_key = identity.public_key();
         let relay_keys = generate_relay_keys()?;
         let relay_public_key = relay_keys.public_key().to_bytes();
-        let signed = identity_proof_input(&self.hash, self.role, &public_key, &relay_public_key);
+        // Commit to a random value now and reveal it only after the peer's commitment
+        // has arrived, so neither side can choose its value after seeing the other's.
+        let mut nonce = Zeroizing::new([0_u8; NONCE_SIZE]);
+        crate::random::fill(nonce.as_mut()).map_err(|_| HandshakeError::InvalidMessage)?;
+        let commitment = commitment(self.role, &nonce);
+        let signed = identity_proof_input(
+            &self.hash,
+            self.role,
+            &public_key,
+            &relay_public_key,
+            &commitment,
+        );
         let signature = identity.sign(&signed);
         let mut proof = Vec::with_capacity(PROOF_SIZE);
         proof.push(self.role.byte());
         proof.extend_from_slice(&public_key);
         proof.extend_from_slice(&relay_public_key);
+        proof.extend_from_slice(&commitment);
         proof.extend_from_slice(&signature);
         let frame = encrypt(&mut self.transport, &proof)?;
         Ok((
@@ -192,6 +213,7 @@ impl PendingChannel {
                 role: self.role,
                 local_key: public_key,
                 relay_keys,
+                nonce,
                 transport: self.transport,
             },
             frame,
@@ -205,17 +227,22 @@ pub struct IdentityPending {
     role: Role,
     local_key: [u8; 32],
     relay_keys: Keys,
+    nonce: Zeroizing<[u8; NONCE_SIZE]>,
     transport: snow::TransportState,
 }
 
 impl IdentityPending {
     /// `expected_peer` pins a previously verified key when one is known.
-    /// Passing `None` requires the user to verify the displayed fingerprint.
+    /// Passing `None` requires the user to verify the displayed code.
+    ///
+    /// The peer's commitment has arrived, so the frame returned with the next state
+    /// reveals our own random value. Send it, then pass the peer's reveal to
+    /// `RevealPending::receive_peer_reveal`.
     pub fn receive_peer_proof(
         mut self,
         frame: &[u8],
         expected_peer: Option<[u8; 32]>,
-    ) -> Result<VerificationPending, HandshakeError> {
+    ) -> Result<(RevealPending, Vec<u8>), HandshakeError> {
         let mut proof = decrypt(&mut self.transport, frame, PROOF_SIZE)?;
         if proof.len() != PROOF_SIZE || proof[0] != self.role.peer().byte() {
             return Err(HandshakeError::InvalidProof);
@@ -233,25 +260,92 @@ impl IdentityPending {
             PublicKey::from_slice(&proof[33..65]).map_err(|_| HandshakeError::InvalidRelayKey)?;
         let verifying_key =
             VerifyingKey::from_bytes(&peer_key).map_err(|_| HandshakeError::InvalidIdentity)?;
-        let signature =
-            Signature::from_slice(&proof[65..]).map_err(|_| HandshakeError::InvalidProof)?;
+        let signature = Signature::from_slice(&proof[65 + HASH_SIZE..])
+            .map_err(|_| HandshakeError::InvalidProof)?;
         let relay_key_bytes = peer_relay_key.to_bytes();
-        let signed =
-            identity_proof_input(&self.hash, self.role.peer(), &peer_key, &relay_key_bytes);
+        let peer_commitment: [u8; HASH_SIZE] = proof[65..65 + HASH_SIZE]
+            .try_into()
+            .map_err(|_| HandshakeError::InvalidProof)?;
+        let signed = identity_proof_input(
+            &self.hash,
+            self.role.peer(),
+            &peer_key,
+            &relay_key_bytes,
+            &peer_commitment,
+        );
         verifying_key
             .verify_strict(&signed, &signature)
             .map_err(|_| HandshakeError::InvalidProof)?;
         proof.fill(0);
 
-        let fingerprint = fingerprint(&self.hash, self.role, &self.local_key, &peer_key);
+        let mut reveal = Vec::with_capacity(REVEAL_SIZE);
+        reveal.push(self.role.byte());
+        reveal.extend_from_slice(self.nonce.as_ref());
+        let reveal_frame = encrypt(&mut self.transport, &reveal)?;
+        reveal.fill(0);
+        Ok((
+            RevealPending {
+                hash: self.hash,
+                role: self.role,
+                local_key: self.local_key,
+                peer_key,
+                local_relay_keys: self.relay_keys,
+                peer_relay_key,
+                local_nonce: self.nonce,
+                peer_commitment,
+                transport: self.transport,
+            },
+            reveal_frame,
+        ))
+    }
+}
+
+/// Both identities are proven and both commitments are in; the peer's random value is
+/// still hidden. The confirmation code exists only after it has been revealed and
+/// checked against the commitment.
+pub struct RevealPending {
+    hash: [u8; HASH_SIZE],
+    role: Role,
+    local_key: [u8; 32],
+    peer_key: [u8; 32],
+    local_relay_keys: Keys,
+    peer_relay_key: PublicKey,
+    local_nonce: Zeroizing<[u8; NONCE_SIZE]>,
+    peer_commitment: [u8; HASH_SIZE],
+    transport: snow::TransportState,
+}
+
+impl RevealPending {
+    pub fn receive_peer_reveal(
+        mut self,
+        frame: &[u8],
+    ) -> Result<VerificationPending, HandshakeError> {
+        let reveal = decrypt(&mut self.transport, frame, REVEAL_SIZE)?;
+        if reveal.len() != REVEAL_SIZE || reveal[0] != self.role.peer().byte() {
+            return Err(HandshakeError::InvalidProof);
+        }
+        let peer_nonce: [u8; NONCE_SIZE] = reveal[1..]
+            .try_into()
+            .map_err(|_| HandshakeError::InvalidProof)?;
+        // A value that does not open the commitment sent earlier is a steered value.
+        let expected = commitment(self.role.peer(), &peer_nonce);
+        if !constant_time_equal(&expected, &self.peer_commitment) {
+            return Err(HandshakeError::CommitmentMismatch);
+        }
+        let fingerprint = fingerprint(
+            &self.hash,
+            self.role,
+            (&self.local_key, &self.local_nonce),
+            (&self.peer_key, &peer_nonce),
+        );
         Ok(VerificationPending {
             hash: self.hash,
             session_tag: session_tag(&self.hash),
             role: self.role,
             local_key: self.local_key,
-            peer_key,
-            local_relay_keys: self.relay_keys,
-            peer_relay_key,
+            peer_key: self.peer_key,
+            local_relay_keys: self.local_relay_keys,
+            peer_relay_key: self.peer_relay_key,
             fingerprint,
             transport: self.transport,
         })
@@ -281,9 +375,14 @@ impl VerificationPending {
         &self.peer_key
     }
 
-    /// Stable, full SHA-256 channel fingerprint for out-of-band comparison.
+    /// Full SHA-256 fingerprint, kept for anyone who wants to compare all of it.
     pub fn fingerprint(&self) -> &[u8; HASH_SIZE] {
         &self.fingerprint
+    }
+
+    /// The short code the two users compare out of band.
+    pub fn confirmation_code(&self) -> String {
+        confirmation_code(&self.fingerprint)
     }
 
     /// Call only after the local user has compared the fingerprint.
@@ -526,13 +625,15 @@ fn identity_proof_input(
     role: Role,
     key: &[u8; 32],
     relay_key: &[u8; 32],
+    commitment: &[u8; HASH_SIZE],
 ) -> Vec<u8> {
-    let mut input = Vec::with_capacity(SIGN_DOMAIN.len() + 1 + HASH_SIZE + 64);
+    let mut input = Vec::with_capacity(SIGN_DOMAIN.len() + 1 + HASH_SIZE + 64 + HASH_SIZE);
     input.extend_from_slice(SIGN_DOMAIN);
     input.push(role.byte());
     input.extend_from_slice(hash);
     input.extend_from_slice(key);
     input.extend_from_slice(relay_key);
+    input.extend_from_slice(commitment);
     input
 }
 
@@ -547,11 +648,30 @@ fn generate_relay_keys() -> Result<Keys, HandshakeError> {
     Err(HandshakeError::InvalidRelayKey)
 }
 
+fn commitment(role: Role, nonce: &[u8; NONCE_SIZE]) -> [u8; HASH_SIZE] {
+    let mut digest = Sha256::new();
+    digest.update(COMMIT_DOMAIN);
+    digest.update([role.byte()]);
+    digest.update(nonce);
+    digest.finalize().into()
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
+}
+
+/// Binds the transcript, both identities and both revealed random values. Each
+/// argument is (identity key, random value) for one side.
 fn fingerprint(
     hash: &[u8; HASH_SIZE],
     role: Role,
-    local: &[u8; 32],
-    peer: &[u8; 32],
+    local: (&[u8; 32], &[u8; NONCE_SIZE]),
+    peer: (&[u8; 32], &[u8; NONCE_SIZE]),
 ) -> [u8; HASH_SIZE] {
     let (initiator, responder) = match role {
         Role::Initiator => (local, peer),
@@ -560,9 +680,21 @@ fn fingerprint(
     let mut digest = Sha256::new();
     digest.update(CONFIRM_DOMAIN);
     digest.update(hash);
-    digest.update(initiator);
-    digest.update(responder);
+    digest.update(initiator.0);
+    digest.update(responder.0);
+    digest.update(initiator.1);
+    digest.update(responder.1);
     digest.finalize().into()
+}
+
+/// The short code users compare: twelve decimal digits (about 40 bits) in two groups,
+/// derived from the fingerprint. Because both random values are committed before
+/// either is revealed, a man in the middle cannot pick values that make the codes on
+/// his two connections agree; he can only guess, once per attempt.
+pub fn confirmation_code(fingerprint: &[u8; HASH_SIZE]) -> String {
+    let value = u64::from_be_bytes(fingerprint[..8].try_into().expect("fixed digest prefix"))
+        % 1_000_000_000_000;
+    format!("{:06} {:06}", value / 1_000_000, value % 1_000_000)
 }
 
 fn session_tag(hash: &[u8; HASH_SIZE]) -> [u8; 16] {
@@ -619,9 +751,25 @@ mod tests {
         b.read(&a.write().unwrap()).unwrap();
         let (a_pending, a_proof) = a.finish().unwrap().prove_identity(&alice).unwrap();
         let (b_pending, b_proof) = b.finish().unwrap().prove_identity(&bob).unwrap();
-        let a_verified = a_pending.receive_peer_proof(&b_proof, None).unwrap();
-        let b_verified = b_pending.receive_peer_proof(&a_proof, None).unwrap();
+        // Each side reveals only after it has the other's commitment.
+        let (a_reveal_state, a_reveal) = a_pending.receive_peer_proof(&b_proof, None).unwrap();
+        let (b_reveal_state, b_reveal) = b_pending.receive_peer_proof(&a_proof, None).unwrap();
+        let a_verified = a_reveal_state.receive_peer_reveal(&b_reveal).unwrap();
+        let b_verified = b_reveal_state.receive_peer_reveal(&a_reveal).unwrap();
         (a_verified, b_verified)
+    }
+
+    /// A completed handshake with identity proofs sent but nothing received yet.
+    fn proofs_sent() -> (
+        super::IdentityPending,
+        Vec<u8>,
+        super::IdentityPending,
+        Vec<u8>,
+    ) {
+        let (a, b) = handshake_pair();
+        let (a_pending, a_proof) = a.finish().unwrap().prove_identity(&identity()).unwrap();
+        let (b_pending, b_proof) = b.finish().unwrap().prove_identity(&identity()).unwrap();
+        (a_pending, a_proof, b_pending, b_proof)
     }
 
     fn confirm_pair(
@@ -810,5 +958,201 @@ mod tests {
             receiver.receive(&tampered),
             Err(HandshakeError::Closed)
         ));
+    }
+
+    #[test]
+    fn both_users_see_the_same_short_code_in_two_groups_of_six_digits() {
+        let (a, b) = exchange();
+        let code = a.confirmation_code();
+        assert_eq!(code, b.confirmation_code());
+        let groups: Vec<_> = code.split(' ').collect();
+        assert_eq!(groups.len(), 2, "{code}");
+        for group in groups {
+            assert_eq!(group.len(), 6, "{code}");
+            assert!(group.bytes().all(|byte| byte.is_ascii_digit()), "{code}");
+        }
+        // A new session gives a different code.
+        let (other, _) = exchange();
+        assert_ne!(code, other.confirmation_code());
+    }
+
+    #[test]
+    fn the_code_uses_the_whole_twelve_digit_range_not_a_smaller_one() {
+        // The code is only worth its length if both groups really vary. Derive codes from
+        // many different fingerprints and require that each group takes many values and
+        // that high digits appear, which a code squeezed into a smaller range would not.
+        let mut first_groups = std::collections::HashSet::new();
+        let mut second_groups = std::collections::HashSet::new();
+        let mut leading_digits = std::collections::HashSet::new();
+        for index in 0_u32..2000 {
+            let mut fingerprint = [0_u8; 32];
+            let digest = <sha2::Sha256 as sha2::Digest>::digest(index.to_be_bytes());
+            fingerprint.copy_from_slice(&digest);
+            let code = super::confirmation_code(&fingerprint);
+            let (first, second) = code.split_once(' ').unwrap();
+            first_groups.insert(first.to_owned());
+            second_groups.insert(second.to_owned());
+            leading_digits.insert(first.as_bytes()[0]);
+        }
+        // With 2000 samples from 10^6 values, nearly all are distinct per group.
+        assert!(
+            first_groups.len() > 1900,
+            "first group varies: {}",
+            first_groups.len()
+        );
+        assert!(
+            second_groups.len() > 1900,
+            "second group varies: {}",
+            second_groups.len()
+        );
+        assert_eq!(leading_digits.len(), 10, "every leading digit 0-9 occurs");
+    }
+
+    #[test]
+    fn the_code_depends_on_both_random_values_and_on_the_transcript() {
+        let hash = [7; 32];
+        let (alice, bob) = ([1; 32], [2; 32]);
+        let (first, second) = ([3; 16], [4; 16]);
+        let base = super::fingerprint(&hash, Role::Initiator, (&alice, &first), (&bob, &second));
+        // Both sides compute the same value from their own point of view.
+        assert_eq!(
+            base,
+            super::fingerprint(&hash, Role::Responder, (&bob, &second), (&alice, &first))
+        );
+        let changed_initiator_nonce =
+            super::fingerprint(&hash, Role::Initiator, (&alice, &[9; 16]), (&bob, &second));
+        let changed_responder_nonce =
+            super::fingerprint(&hash, Role::Initiator, (&alice, &first), (&bob, &[9; 16]));
+        let changed_transcript =
+            super::fingerprint(&[8; 32], Role::Initiator, (&alice, &first), (&bob, &second));
+        let changed_identity =
+            super::fingerprint(&hash, Role::Initiator, (&[5; 32], &first), (&bob, &second));
+        for other in [
+            changed_initiator_nonce,
+            changed_responder_nonce,
+            changed_transcript,
+            changed_identity,
+        ] {
+            assert_ne!(base, other);
+            assert_ne!(
+                super::confirmation_code(&base),
+                super::confirmation_code(&other)
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_does_not_open_the_commitment_is_rejected() {
+        let (a_pending, _a_proof, b_pending, b_proof) = proofs_sent();
+        // `a` has b's commitment. A reveal from anyone who did not make that commitment
+        // must not be accepted, even though it is a well-formed frame from `b`'s transport.
+        let (a_reveal_state, _a_reveal) = a_pending.receive_peer_proof(&b_proof, None).unwrap();
+        let mut forged = b_pending;
+        let mut reveal = vec![Role::Responder.byte()];
+        reveal.extend_from_slice(&[0xAA; super::NONCE_SIZE]);
+        let frame = super::encrypt(&mut forged.transport, &reveal).unwrap();
+        // The proof was already consumed by the peer, so the transport counter lines up.
+        assert!(matches!(
+            a_reveal_state.receive_peer_reveal(&frame),
+            Err(HandshakeError::CommitmentMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_reveal_from_the_wrong_role_or_of_the_wrong_size_is_rejected() {
+        for (role_byte, nonce_length) in [
+            (Role::Initiator.byte(), 16),
+            (Role::Responder.byte(), 15),
+            (Role::Responder.byte(), 17),
+        ] {
+            let (a_pending, _a_proof, mut b_pending, b_proof) = proofs_sent();
+            let (a_reveal_state, _) = a_pending.receive_peer_proof(&b_proof, None).unwrap();
+            let mut reveal = vec![role_byte];
+            reveal.extend(std::iter::repeat_n(1_u8, nonce_length));
+            let frame = super::encrypt(&mut b_pending.transport, &reveal).unwrap();
+            assert!(
+                matches!(
+                    a_reveal_state.receive_peer_reveal(&frame),
+                    Err(HandshakeError::InvalidProof | HandshakeError::InvalidMessage)
+                ),
+                "role {role_byte}, nonce length {nonce_length}"
+            );
+        }
+    }
+
+    /// A proof frame from a responder that signs `signed_commitment` but puts
+    /// `sent_commitment` in the frame. It is that responder's first frame, so the
+    /// receiver's transport counter lines up.
+    fn responder_proof_for(
+        signed_commitment: &[u8; 32],
+        sent_commitment: &[u8; 32],
+    ) -> (super::IdentityPending, Vec<u8>) {
+        let (a, b) = handshake_pair();
+        let (receiver, _) = a.finish().unwrap().prove_identity(&identity()).unwrap();
+        let mut sender = b.finish().unwrap();
+        let signer = identity();
+        let key = signer.public_key();
+        let relay_key = super::generate_relay_keys()
+            .unwrap()
+            .public_key()
+            .to_bytes();
+        let signature = signer.sign(&super::identity_proof_input(
+            &sender.hash,
+            Role::Responder,
+            &key,
+            &relay_key,
+            signed_commitment,
+        ));
+        let mut proof = vec![Role::Responder.byte()];
+        proof.extend_from_slice(&key);
+        proof.extend_from_slice(&relay_key);
+        proof.extend_from_slice(sent_commitment);
+        proof.extend_from_slice(&signature);
+        assert_eq!(proof.len(), super::PROOF_SIZE);
+        (
+            receiver,
+            super::encrypt(&mut sender.transport, &proof).unwrap(),
+        )
+    }
+
+    #[test]
+    fn the_commitment_is_signed_with_the_identity_so_it_cannot_be_swapped() {
+        let signed = super::commitment(Role::Responder, &[1; super::NONCE_SIZE]);
+        let other = super::commitment(Role::Responder, &[2; super::NONCE_SIZE]);
+        // The commitment the signature covers is accepted.
+        let (receiver, frame) = responder_proof_for(&signed, &signed);
+        assert!(receiver.receive_peer_proof(&frame, None).is_ok());
+        // The same proof carrying a different commitment is not, so a commitment cannot
+        // be replaced in transit without the identity key.
+        let (receiver, frame) = responder_proof_for(&signed, &other);
+        assert!(matches!(
+            receiver.receive_peer_proof(&frame, None),
+            Err(HandshakeError::InvalidProof)
+        ));
+    }
+
+    #[test]
+    fn a_peer_on_protocol_version_two_cannot_complete_the_handshake() {
+        // The prologue differs between versions, so the Noise transcript does not match.
+        let mut current = Handshake::new(Role::Initiator).unwrap();
+        let params = super::PATTERN.parse().unwrap();
+        let keypair = snow::Builder::new(super::PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let mut previous = snow::Builder::new(params)
+            .prologue(b"another-dimension-v2/noise-handshake/v2")
+            .unwrap()
+            .local_private_key(&keypair.private)
+            .unwrap()
+            .build_responder()
+            .unwrap();
+        let mut buffer = [0; 128];
+        let mut payload = [0; 128];
+        let first = current.write().unwrap();
+        // XX's first message carries no authenticated data, so the responder reads it
+        // and the mismatch shows from the second message on.
+        previous.read_message(&first, &mut payload).unwrap();
+        let length = previous.write_message(&[], &mut buffer).unwrap();
+        assert!(current.read(&buffer[..length]).is_err());
     }
 }

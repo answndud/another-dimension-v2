@@ -188,6 +188,8 @@ struct MessagePageReader {
 struct ChatSnapshot {
     phase: &'static str,
     fingerprint: Option<String>,
+    /// Short code the two users compare. The full fingerprint stays available.
+    confirmation_code: Option<String>,
     peer_id: Option<String>,
     error: Option<String>,
     storage_error: Option<String>,
@@ -1910,6 +1912,7 @@ mod send_tests {
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "closed",
                 fingerprint: None,
+                confirmation_code: None,
                 peer_id: Some(peer.to_owned()),
                 error: None,
                 storage_error: None,
@@ -1957,6 +1960,7 @@ mod send_tests {
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connected",
                 fingerprint: None,
+                confirmation_code: None,
                 peer_id: Some(peer.to_owned()),
                 error: None,
                 storage_error: None,
@@ -2261,6 +2265,7 @@ mod send_tests {
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connected",
                 fingerprint: None,
+                confirmation_code: None,
                 peer_id: Some(peer_id.clone()),
                 error: None,
                 storage_error: None,
@@ -2396,6 +2401,7 @@ mod send_tests {
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connected",
                 fingerprint: None,
+                confirmation_code: None,
                 peer_id: None,
                 error: None,
                 storage_error: None,
@@ -2471,6 +2477,7 @@ mod send_tests {
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connected",
                 fingerprint: None,
+                confirmation_code: None,
                 peer_id: None,
                 error: None,
                 storage_error: None,
@@ -2607,6 +2614,7 @@ mod send_tests {
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connected",
                 fingerprint: None,
+                confirmation_code: None,
                 peer_id: Some(peer_id.clone()),
                 error: None,
                 storage_error: None,
@@ -2732,6 +2740,7 @@ mod send_tests {
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connected",
                 fingerprint: None,
+                confirmation_code: None,
                 peer_id: Some(peer_id.clone()),
                 error: None,
                 storage_error: None,
@@ -3724,6 +3733,7 @@ fn spawn_chat_worker(
                 .authenticate(channel, &identity, expected_peer)
                 .map_err(|error| relay_failure_message(&error, "identity", tor_socks.is_some()))?;
             let fingerprint = encode_hex(verification.fingerprint());
+            let confirmation_code = verification.confirmation_code();
             let peer_key = *verification.peer_public_key();
             let peer_id = encode_hex(verification.peer_public_key());
             {
@@ -3744,15 +3754,29 @@ fn spawn_chat_worker(
                 if expected_peer.is_none() {
                     snapshot.phase = "verification";
                     snapshot.fingerprint = Some(fingerprint);
+                    snapshot.confirmation_code = Some(confirmation_code);
                 }
             }
             let verification = if expected_peer.is_some() {
                 verification
             } else {
+                // The person compares the code with the other person, which takes a while.
+                // Keep answering the relays meanwhile, and give up after a limit instead of
+                // holding the connection open for good.
+                let waiting_since = Instant::now();
                 loop {
                     if operation.cancelled.load(Ordering::SeqCst) {
                         return Err("취소되었습니다.".to_owned());
                     }
+                    if waiting_since.elapsed() >= relay::CONFIRMATION_TIMEOUT {
+                        return Err(
+                            "확인 코드를 비교하는 시간이 지났습니다. 새 초대 코드로 다시 시작하세요."
+                                .to_owned(),
+                        );
+                    }
+                    rendezvous.keep_alive().map_err(|error| {
+                        relay_failure_message(&error, "confirmation", tor_socks.is_some())
+                    })?;
                     match commands.recv_timeout(Duration::from_millis(250)) {
                         Ok(ChatCommand::Confirm) => break verification,
                         Ok(ChatCommand::Cancel) => return Err("취소되었습니다.".to_owned()),
@@ -6193,6 +6217,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             snapshot: Mutex::new(ChatSnapshot {
                 phase: "connecting",
                 fingerprint: None,
+                confirmation_code: None,
                 peer_id: expected_peer.as_ref().map(|peer| encode_hex(peer)),
                 error: None,
                 storage_error: None,
@@ -6262,6 +6287,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         let payload = serde_json::json!({
             "phase": snapshot.phase,
             "fingerprint": snapshot.fingerprint,
+            "confirmationCode": snapshot.confirmation_code,
             "peerId": snapshot.peer_id,
             "error": snapshot.error,
             "storageError": snapshot.storage_error,

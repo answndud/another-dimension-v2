@@ -44,6 +44,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(15);
 const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a person may take to compare the confirmation code and press confirm,
+/// and how long to wait for the other person to do the same. The protocol timeout
+/// above is far too short for people reading digits to each other.
+pub(crate) const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const READY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Validate a relay URL without resolving its host or making a network request.
@@ -773,6 +777,12 @@ pub struct RelayRendezvous {
     attempt_tag: Option<String>,
     cancelled: Option<Arc<AtomicBool>>,
     timeout: Duration,
+    /// How long to wait for the other person to confirm. Separate from `timeout`
+    /// because a person needs far longer than a network round trip.
+    confirmation_timeout: Duration,
+    /// Frames that arrived while `keep_alive` was only servicing the connections, in
+    /// arrival order. `receive_frame` hands them out before reading anything new.
+    stashed: VecDeque<Vec<u8>>,
 }
 
 impl RelayRendezvous {
@@ -860,7 +870,13 @@ impl RelayRendezvous {
             attempt_tag,
             cancelled: None,
             timeout: RENDEZVOUS_TIMEOUT,
+            confirmation_timeout: CONFIRMATION_TIMEOUT,
+            stashed: VecDeque::new(),
         })
+    }
+
+    fn confirmation_wait(&self) -> Duration {
+        self.confirmation_timeout
     }
 
     pub fn set_cancellation_token(&mut self, token: Arc<AtomicBool>) {
@@ -936,8 +952,9 @@ impl RelayRendezvous {
         }
     }
 
-    /// Exchanges the transcript-bound identity proof through the encrypted
-    /// Noise transport. The returned fingerprint still needs human comparison.
+    /// Exchanges the transcript-bound identity proof, then the committed random values
+    /// behind the confirmation code, through the encrypted Noise transport. The code in
+    /// the returned state still needs human comparison.
     pub fn authenticate(
         &mut self,
         channel: PendingChannel,
@@ -949,7 +966,24 @@ impl RelayRendezvous {
         }
         let (pending, proof) = channel.prove_identity(identity)?;
         self.publish_frame(&proof)?;
-        Ok(pending.receive_peer_proof(&self.receive_frame("identity proof")?, expected_peer)?)
+        // Our value is revealed only once the peer's commitment has arrived.
+        let (pending, reveal) =
+            pending.receive_peer_proof(&self.receive_frame("identity proof")?, expected_peer)?;
+        self.publish_frame(&reveal)?;
+        Ok(pending.receive_peer_reveal(&self.receive_frame("confirmation code")?)?)
+    }
+
+    /// Services the relay connections while a person decides. Without reads, a relay's
+    /// pings go unanswered and it can drop an idle connection long before the user has
+    /// finished comparing the code. A frame that arrives meanwhile, such as the peer's
+    /// confirmation, is kept for `receive_frame` and not lost.
+    pub fn keep_alive(&mut self) -> Result<(), RelayError> {
+        if let Some(frame) = self.poll_frame()? {
+            if !(frame.starts_with(READY_REQUEST_PREFIX) || frame.starts_with(READY_ACK_PREFIX)) {
+                self.stashed.push_back(frame);
+            }
+        }
+        Ok(())
     }
 
     /// Call only after the user has compared the out-of-band fingerprint.
@@ -963,7 +997,8 @@ impl RelayRendezvous {
         }
         let (pending, frame) = verification.confirm_after_user_check()?;
         self.publish_frame(&frame)?;
-        let peer_frame = self.receive_frame("peer confirmation")?;
+        let peer_frame =
+            self.receive_frame_within("peer confirmation", self.confirmation_wait())?;
         let active = pending.receive_peer_confirmation(&peer_frame)?;
         RelaySession::from_links(self.relays, SessionTransport::new(active))
     }
@@ -979,7 +1014,8 @@ impl RelayRendezvous {
         }
         let (pending, frame) = verification.confirm_after_user_check()?;
         self.publish_frame(&frame)?;
-        let peer_frame = self.receive_frame("peer confirmation")?;
+        let peer_frame =
+            self.receive_frame_within("peer confirmation", self.confirmation_wait())?;
         let mut active = pending.receive_peer_confirmation(&peer_frame)?;
         let mut secret = Zeroizing::new([0; 32]);
         const OFFER: &[u8] = b"AD-CONTACT-OFFER-1";
@@ -1050,7 +1086,18 @@ impl RelayRendezvous {
     }
 
     fn receive_frame(&mut self, stage: &'static str) -> Result<Vec<u8>, RelayError> {
-        let deadline = Instant::now() + self.timeout;
+        self.receive_frame_within(stage, self.timeout)
+    }
+
+    fn receive_frame_within(
+        &mut self,
+        stage: &'static str,
+        allowed: Duration,
+    ) -> Result<Vec<u8>, RelayError> {
+        if let Some(frame) = self.stashed.pop_front() {
+            return Ok(frame);
+        }
+        let deadline = Instant::now() + allowed;
         loop {
             if self
                 .cancelled
@@ -1804,17 +1851,49 @@ mod tests {
         expected_peer: Option<[u8; 32]>,
         subscription_barrier: Option<Arc<Barrier>>,
     ) -> Result<(super::RelaySession, zeroize::Zeroizing<[u8; 32]>), RelayError> {
+        fake_connected_party_after(
+            network,
+            endpoints,
+            invite_code,
+            role,
+            identity,
+            expected_peer,
+            subscription_barrier,
+            Duration::ZERO,
+        )
+    }
+
+    /// Like `fake_connected_party`, but the user takes `thinking_time` to compare the
+    /// code and press confirm, as a person reading digits over the phone would.
+    #[allow(clippy::too_many_arguments)]
+    fn fake_connected_party_after(
+        network: FakeRelayNetwork,
+        endpoints: Vec<String>,
+        invite_code: String,
+        role: Role,
+        identity: Identity,
+        expected_peer: Option<[u8; 32]>,
+        subscription_barrier: Option<Arc<Barrier>>,
+        thinking_time: Duration,
+    ) -> Result<(super::RelaySession, zeroize::Zeroizing<[u8; 32]>), RelayError> {
         let invite = InviteCode::parse(&invite_code).ok_or(RelayError::InvalidEvent)?;
         let mut rendezvous =
             RelayRendezvous::connect_with(&endpoints, &invite, role, |endpoint| {
                 network.open(endpoint)
             })?;
         rendezvous.timeout = Duration::from_secs(4);
+        rendezvous.confirmation_timeout = Duration::from_secs(12);
         if let Some(barrier) = subscription_barrier {
             barrier.wait();
         }
         let channel = rendezvous.complete_handshake()?;
         let verification = rendezvous.authenticate(channel, &identity, expected_peer)?;
+        // The person compares the code. The connection must stay usable meanwhile.
+        let waited = Instant::now();
+        while waited.elapsed() < thinking_time {
+            rendezvous.keep_alive()?;
+            thread::sleep(Duration::from_millis(50));
+        }
         if expected_peer.is_some() {
             rendezvous
                 .confirm(verification)
@@ -1875,6 +1954,154 @@ mod tests {
             task_a.join().unwrap().unwrap().0,
             task_b.join().unwrap().unwrap().0,
         )
+    }
+
+    /// What one user's side of a fake connection returns: the session and the secret
+    /// the two users agreed on, or why it failed.
+    type PartyResult = Result<(super::RelaySession, zeroize::Zeroizing<[u8; 32]>), RelayError>;
+
+    /// Two users where one confirms at once and the other takes `late` to do so.
+    fn confirm_with_delays(early: Duration, late: Duration) -> (PartyResult, PartyResult) {
+        let network = FakeRelayNetwork::default();
+        let endpoint = vec!["wss://relay.test".to_owned()];
+        let invite = InviteCode::generate().unwrap();
+        let invite_code = invite.code().to_owned();
+        let (first, second) = (Identity::create().unwrap().0, Identity::create().unwrap().0);
+        let first_is_responder = first.public_key() < second.public_key();
+        let (first_role, second_role) = if first_is_responder {
+            (Role::Responder, Role::Initiator)
+        } else {
+            (Role::Initiator, Role::Responder)
+        };
+        let barrier = Arc::new(Barrier::new(2));
+        let (n1, e1, c1, b1) = (
+            network.clone(),
+            endpoint.clone(),
+            invite_code.clone(),
+            Arc::clone(&barrier),
+        );
+        let one = thread::spawn(move || {
+            fake_connected_party_after(n1, e1, c1, first_role, first, None, Some(b1), early)
+        });
+        let two = thread::spawn(move || {
+            fake_connected_party_after(
+                network,
+                endpoint,
+                invite_code,
+                second_role,
+                second,
+                None,
+                Some(barrier),
+                late,
+            )
+        });
+        (one.join().unwrap(), two.join().unwrap())
+    }
+
+    #[test]
+    fn a_user_who_confirms_much_later_than_the_peer_does_not_make_the_peer_time_out() {
+        // The protocol timeout in these tests is 4 seconds. The slower person takes 6,
+        // as someone reading twelve digits over the phone easily can.
+        let (early, late) = confirm_with_delays(Duration::ZERO, Duration::from_secs(6));
+        assert!(
+            early.is_ok(),
+            "the person who confirmed first must be able to wait for the other: {:?}",
+            early.err()
+        );
+        assert!(late.is_ok(), "{:?}", late.err());
+    }
+
+    #[test]
+    fn both_users_taking_a_long_time_to_confirm_still_connect() {
+        // Both people read the code aloud and press confirm well after the protocol
+        // timeout, at different moments.
+        let (first, second) = confirm_with_delays(Duration::from_secs(5), Duration::from_secs(7));
+        assert!(first.is_ok(), "{:?}", first.err());
+        assert!(second.is_ok(), "{:?}", second.err());
+    }
+
+    #[test]
+    fn waiting_for_the_other_person_ends_at_the_confirmation_limit() {
+        // The wait is long but bounded: a peer who never confirms must not hold the
+        // connection open forever. The limit is shortened here so the test is quick.
+        let network = FakeRelayNetwork::default();
+        let endpoint = vec!["wss://relay.test".to_owned()];
+        let invite = InviteCode::generate().unwrap();
+        let code = invite.code().to_owned();
+        let (a, b) = (Identity::create().unwrap().0, Identity::create().unwrap().0);
+        let a_is_responder = a.public_key() < b.public_key();
+        let (a_role, b_role) = if a_is_responder {
+            (Role::Responder, Role::Initiator)
+        } else {
+            (Role::Initiator, Role::Responder)
+        };
+        let barrier = Arc::new(Barrier::new(2));
+        let impatient = {
+            let (network, endpoint, code, barrier) = (
+                network.clone(),
+                endpoint.clone(),
+                code.clone(),
+                Arc::clone(&barrier),
+            );
+            thread::spawn(move || {
+                let invite = InviteCode::parse(&code).unwrap();
+                let mut rendezvous =
+                    RelayRendezvous::connect_with(&endpoint, &invite, a_role, |e| network.open(e))
+                        .unwrap();
+                rendezvous.timeout = Duration::from_secs(4);
+                rendezvous.confirmation_timeout = Duration::from_secs(2);
+                barrier.wait();
+                let channel = rendezvous.complete_handshake().unwrap();
+                let verification = rendezvous.authenticate(channel, &a, None).unwrap();
+                let started = Instant::now();
+                let result = rendezvous.confirm(verification);
+                (result.err(), started.elapsed())
+            })
+        };
+        // The other person looks at the code and never presses confirm.
+        let silent = thread::spawn(move || {
+            let invite = InviteCode::parse(&code).unwrap();
+            let mut rendezvous =
+                RelayRendezvous::connect_with(&endpoint, &invite, b_role, |e| network.open(e))
+                    .unwrap();
+            rendezvous.timeout = Duration::from_secs(4);
+            barrier.wait();
+            let channel = rendezvous.complete_handshake().unwrap();
+            let verification = rendezvous.authenticate(channel, &b, None).unwrap();
+            thread::sleep(Duration::from_secs(4));
+            drop(verification);
+        });
+        let (error, waited) = impatient.join().unwrap();
+        silent.join().unwrap();
+        assert!(
+            matches!(error, Some(RelayError::TimedOut("peer confirmation"))),
+            "{error:?}"
+        );
+        assert!(
+            waited >= Duration::from_secs(2) && waited < Duration::from_secs(4),
+            "waited {waited:?}: it must use the confirmation limit, not the protocol one"
+        );
+    }
+
+    #[test]
+    fn frames_that_arrive_while_a_person_decides_are_kept_in_order() {
+        let network = FakeRelayNetwork::default();
+        let endpoint = vec!["wss://relay.test".to_owned()];
+        let invite = InviteCode::generate().unwrap();
+        let mut rendezvous =
+            RelayRendezvous::connect_with(&endpoint, &invite, Role::Initiator, |e| network.open(e))
+                .unwrap();
+        // Frames the peer sent while keep_alive was servicing the connection.
+        rendezvous.stashed.push_back(vec![1]);
+        rendezvous.stashed.push_back(vec![2]);
+        rendezvous.timeout = Duration::from_millis(50);
+        assert_eq!(rendezvous.receive_frame("first").unwrap(), vec![1]);
+        assert_eq!(rendezvous.receive_frame("second").unwrap(), vec![2]);
+        // With the stash empty it waits for the network and times out as before.
+        assert!(matches!(
+            rendezvous.receive_frame("third"),
+            Err(RelayError::TimedOut("third"))
+        ));
     }
 
     #[test]
@@ -2541,6 +2768,18 @@ mod tests {
         let channel = rendezvous.complete_handshake().unwrap();
         let identity = Identity::create().unwrap().0;
         let verification = rendezvous.authenticate(channel, &identity, None).unwrap();
+        // A person takes a while to compare the code. Run this against a real relay with
+        // a long pause to check that `keep_alive` is enough to hold the connection open;
+        // the in-memory relay in the other tests never sends pings, so it cannot show it.
+        let pause = std::env::var("AD_LIVE_CONFIRM_PAUSE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let paused = Instant::now();
+        while paused.elapsed() < Duration::from_secs(pause) {
+            rendezvous.keep_alive().unwrap();
+            thread::sleep(Duration::from_millis(250));
+        }
         let fingerprint = verification.fingerprint().to_vec();
         fingerprint_tx.send(fingerprint.clone()).unwrap();
         assert_eq!(

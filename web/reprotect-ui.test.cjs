@@ -2589,8 +2589,8 @@ test('actual UI: chat phases show only the actions available at each step', asyn
   assert.equal(h.element('#history-restore-request').hidden, true);
   assert.equal(h.element('#confirm-peer').disabled, false);
   const html = pageSource();
-  assert.match(html, /<p class="verification-warning">하나라도 다르면 확인하지 마세요\.<\/p>\s*<button id="confirm-peer"/);
-  assert.match(html, /id="confirm-peer"[^>]*>두 값을 비교했고 일치함을 확인했습니다</);
+  assert.match(html, /<p class="verification-warning">코드가 한 자리라도 다르면 확인하지 마세요\.<\/p>\s*<button id="confirm-peer"/);
+  assert.match(html, /id="confirm-peer"[^>]*>코드를 비교했고 일치함을 확인했습니다</);
   assert.match(html, /#chat-view\[data-phase="verification"\] \.chat-workflows\s*\{[^}]*max-height:\s*none;[^}]*overflow:\s*visible;/);
   assert.match(html, /#chat-view\[data-phase="connecting"\].*#chat-view\[data-phase="closed"\]\s*\{[^}]*align-content:\s*start;[^}]*flex:\s*0 0 auto;/);
   assert.match(html, /#chat-view\[data-phase="disconnected"\]\[data-chat-body="messages"\].*#chat-view\[data-phase="closed"\]\[data-chat-body="messages"\]\s*\{[^}]*align-content:\s*stretch;[^}]*flex:\s*1 1 auto;[^}]*min-height:\s*0;/);
@@ -3272,4 +3272,37 @@ test('the page keeps its styling in app.css so the content security policy needs
   assert.doesNotMatch(script, /setAttribute\(\s*['"]style['"]/);
   assert.doesNotMatch(script, /\.cssText\s*=/);
   assert.doesNotMatch(script, /insertAdjacentHTML|\.innerHTML\s*=/);
+});
+
+test('the confirmation code is the prominent value and the long identifiers are folded away', () => {
+  const html = fs.readFileSync(`${__dirname}/index.html`, 'utf8');
+  const panel = html.slice(html.indexOf('<div id="verification"'), html.indexOf('<div id="identity-transition-panel"'));
+  // The short code comes first and is not inside the collapsed details.
+  const code = panel.indexOf('id="confirmation-code"');
+  const details = panel.indexOf('<details');
+  assert.ok(code > 0 && details > code, 'the code is shown before the folded details');
+  const folded = panel.slice(details, panel.indexOf('</details>'));
+  assert.match(folded, /id="peer-id"/);
+  assert.match(folded, /id="fingerprint"/);
+  assert.doesNotMatch(folded, /id="confirmation-code"/);
+  // Users are told to compare all twelve digits, not a prefix.
+  assert.match(panel, /12자리를 .*처음부터 끝까지 비교/);
+  assert.match(panel, /앞부분만 맞춰 보고 확인하지 마세요/);
+});
+
+test('entering the verification phase shows the code from the server and the full fingerprint', () => {
+  const h = createHarness();
+  h.evaluate(`updateChatView({ phase: 'verification', peerId: 'ab'.repeat(32), fingerprint: 'cd'.repeat(32), confirmationCode: '123456 789012', messageCount: 0, messageEpoch: 1, identityTransition: [] })`);
+  assert.equal(h.element('#verification').hidden, false);
+  assert.equal(h.element('#confirmation-code').textContent, '123456 789012');
+  assert.equal(h.element('#fingerprint').textContent, 'cd'.repeat(32));
+  assert.equal(h.element('#peer-id').textContent, 'ab'.repeat(32));
+  assert.equal(h.element('#confirm-peer').disabled, false);
+});
+
+test('a snapshot without a confirmation code shows an empty code, never the old fingerprint as the code', () => {
+  const h = createHarness();
+  h.evaluate(`updateChatView({ phase: 'verification', peerId: 'ab'.repeat(32), fingerprint: 'cd'.repeat(32), messageCount: 0, messageEpoch: 1, identityTransition: [] })`);
+  assert.equal(h.element('#confirmation-code').textContent, '');
+  assert.notEqual(h.element('#confirmation-code').textContent, 'cd'.repeat(32));
 });

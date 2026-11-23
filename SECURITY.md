@@ -31,7 +31,7 @@ Please do not open a public issue for a vulnerability. Use GitHub's private vuln
 ## What the application tries to guarantee
 
 - Messages are protected in transit by a Noise XX session. Each side signs the handshake hash with its Ed25519 identity key inside the encrypted channel, so the relay cannot see or swap identities.
-- Chat frames are accepted only after both users have confirmed the peer's fingerprint through a separate channel.
+- Chat frames are accepted only after both users have compared a short code through a separate channel and confirmed it. The code is derived from the handshake, both identities and a random value from each side. Each side commits to its value inside its signed identity proof and reveals it only after receiving the other's commitment, so a man in the middle cannot choose values that make the codes on his two connections match; he can only guess. The code has twelve decimal digits (about 40 bits). The protocol version is 3, and a peer on version 2 cannot connect.
 - New messages carry an Ed25519 signature over their id, time and text, which is verified when history is restored from a peer.
 - History, contact records and current-format backups are authenticated and encrypted. A modified file is rejected instead of being silently accepted.
 - In Tor mode, every relay connection goes through the configured SOCKS proxy with remote name resolution, and the application never falls back to a direct connection.
@@ -42,7 +42,7 @@ Please do not open a public issue for a vulnerability. Use GitHub's private vuln
 
 ## What it does not guarantee
 
-- **Real-world identity.** A fingerprint match proves the two keys agree, not who is behind them. The comparison is only as safe as the channel the users use.
+- **Real-world identity.** A matching code proves the two sides agree on the keys, not who is behind them. The comparison is only as safe as the channel the users use.
 - **Metadata privacy.** Relays see IP addresses (unless Tor is used), connection times, event sizes and timing. Message lengths are not padded.
 - **Delivery.** A relay accepting an event does not mean the peer received or stored it. There are no read receipts and no offline queue.
 - **Deletion.** Local deletion does not remove the peer's copy or any backup, and it is not forensic erasure.
@@ -56,13 +56,15 @@ These are known and documented, not hidden. Items are removed from this list onl
 
 1. **Legacy backup formats can still be imported after confirmation.** ADBACK2, ADBACK6, ADPACK1 and ADPACK2 are rejected by default and are accepted only when the user confirms a format-specific warning (see SF-002). ADBACK2 derives its key from the password alone and its messages are unsigned, so a user who confirms it for a file from an untrusted source can still be given forged history. Those messages are marked "서명 없음 · 미검증" (unsigned, unverified) in the history manager and the restore preview, but not yet in the live chat view.
 2. **The access code is not protected by a secret.** The AD2 code contains its own wrapping key, so it is a per-code encoding of the seed, not encryption. Treat the code itself as the secret.
-3. **The fingerprint is shown as 64 hex characters** with no commitment step. Users who compare only a prefix are exposed to a partial-collision search by an attacker who also holds the invite code.
-4. **A single lost relay event stalls the chat.** Ephemeral events are not retransmitted, so a sequence gap eventually ends the session.
-5. **Reconnects reuse the same relay topic and key**, which lets a relay link the sessions of one pair over time.
-6. **The local history log has no generation id or end marker**, so a rolled-back or truncated file at a record boundary is not detected. An attacker who can replace every file together can always roll back; that case cannot be fully prevented on a single device.
-7. **Secrets are not fully zeroized.** Key material is wrapped in `Zeroizing` where practical, but decrypted message text and some library-held keys are not wiped.
-8. **No audit and limited fuzzing.** The test suite is extensive but the parsers have not been fuzzed.
-9. **Dependency advisories.** `cargo audit` reports 9 `unsound` warnings for `heapless` 0.8.0, which `nostr` pulls in through `faster-hex`. They are not exploitable vulnerabilities in this application as far as I can tell, but I cannot remove them without upgrading the pinned `nostr` version.
+3. **A single lost relay event stalls the chat.** Ephemeral events are not retransmitted, so a sequence gap eventually ends the session.
+4. **Reconnects reuse the same relay topic and key**, which lets a relay link the sessions of one pair over time.
+5. **The local history log has no generation id or end marker**, so a rolled-back or truncated file at a record boundary is not detected. An attacker who can replace every file together can always roll back; that case cannot be fully prevented on a single device.
+6. **Secrets are not fully zeroized.** Key material is wrapped in `Zeroizing` where practical, but decrypted message text and some library-held keys are not wiped.
+7. **No audit and limited fuzzing.** The test suite is extensive but the parsers have not been fuzzed.
+8. **Dependency advisories.** `cargo audit` reports 9 `unsound` warnings for `heapless` 0.8.0, which `nostr` pulls in through `faster-hex`. They are not exploitable vulnerabilities in this application as far as I can tell, but I cannot remove them without upgrading the pinned `nostr` version.
+9. **The confirmation code is a guess for a man in the middle, not a proof.** He needs the invite code, and then succeeds with probability 2^-40 per attempt and can try again. Each attempt needs a new connection and ends with the users seeing different codes.
+10. **A peer on protocol version 2 fails with a generic error.** The two sides must run the same version, and the page cannot tell a version mismatch from a failed handshake.
+11. **Relays are serviced while a person compares the code, but this is untested against a real relay.** The in-memory relay used by the tests never sends pings, so it cannot show whether answering them is what keeps a real connection open. The confirmation wait is bounded at five minutes on each side.
 
 ## Supply chain
 

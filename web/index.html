@@ -226,12 +226,16 @@
       <div class="chat-workflows">
         <div id="verification" class="panel" hidden>
           <h3>상대 신원 확인</h3>
-          <p>상대 공개 키와 전체 채널 지문을 별도 연락 수단으로 비교하세요.</p>
-          <h3>상대 공개 키</h3><p id="peer-id" class="identity-id"></p>
-          <h3>채널 지문</h3><p id="fingerprint" class="fingerprint"></p>
+          <p>아래 확인 코드 12자리를 상대와 별도 연락 수단(전화 등)으로 처음부터 끝까지 비교하세요. 앞부분만 맞춰 보고 확인하지 마세요.</p>
+          <p id="confirmation-code" class="confirmation-code" aria-label="확인 코드"></p>
+          <details class="verification-details">
+            <summary>상대 공개 키와 전체 지문 보기</summary>
+            <h3>상대 공개 키</h3><p id="peer-id" class="identity-id"></p>
+            <h3>채널 지문</h3><p id="fingerprint" class="fingerprint"></p>
+          </details>
           <div class="actions verification-actions">
-            <p class="verification-warning">하나라도 다르면 확인하지 마세요.</p>
-            <button id="confirm-peer" type="button" class="primary">두 값을 비교했고 일치함을 확인했습니다</button>
+            <p class="verification-warning">코드가 한 자리라도 다르면 확인하지 마세요.</p>
+            <button id="confirm-peer" type="button" class="primary">코드를 비교했고 일치함을 확인했습니다</button>
           </div>
         </div>
         <div id="identity-transition-panel" class="panel" hidden>

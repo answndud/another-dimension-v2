@@ -1163,6 +1163,7 @@ function updateChatView(snapshot) {
   if (phase === 'verification' && lastPhase !== 'verification') {
     document.querySelector('#peer-id').textContent = snapshot.peerId || '';
     document.querySelector('#fingerprint').textContent = snapshot.fingerprint || '';
+    document.querySelector('#confirmation-code').textContent = snapshot.confirmationCode || '';
     document.querySelector('#confirm-peer').disabled = false;
   }
   if (phase === 'confirming') document.querySelector('#confirm-peer').disabled = true;

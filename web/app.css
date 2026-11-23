@@ -179,6 +179,9 @@ main:has(#chat-view:not([hidden])) { display: flex; flex-direction: column; widt
 .chat-workflows p { line-height: 1.55; overflow-wrap: anywhere; }
 #verification { border-color: var(--focus); background: var(--surface-muted); }
 #verification > p:first-of-type { margin-top: 0; color: var(--text); font-weight: 600; }
+#verification .confirmation-code { margin: var(--space-2) 0 var(--space-3); padding: var(--space-3) var(--space-4); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--surface); font: 600 1.6rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .12em; text-align: center; user-select: all; }
+#verification .verification-details { margin: 0 0 var(--space-3); }
+#verification .verification-details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
 #verification .identity-id, #verification .fingerprint { margin: var(--space-1) 0 var(--space-3); padding: var(--space-2) var(--space-3); border: 1px solid var(--border-soft); border-radius: var(--radius-control); background: var(--surface); overflow-wrap: anywhere; word-break: break-word; }
 #verification .verification-actions { display: grid; justify-items: start; gap: var(--space-2); margin-top: var(--space-4); }
 #verification .verification-warning { margin: 0; color: var(--danger); font-weight: 650; }
