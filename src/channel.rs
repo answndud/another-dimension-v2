@@ -6,8 +6,6 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use nostr::prelude::{Keys, PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::Read;
 use zeroize::Zeroizing;
 
 use crate::identity::Identity;
@@ -541,9 +539,7 @@ fn identity_proof_input(
 fn generate_relay_keys() -> Result<Keys, HandshakeError> {
     for _ in 0..8 {
         let mut secret = Zeroizing::new([0_u8; 32]);
-        File::open("/dev/urandom")
-            .and_then(|mut random| random.read_exact(secret.as_mut()))
-            .map_err(|_| HandshakeError::InvalidRelayKey)?;
+        crate::random::fill(secret.as_mut()).map_err(|_| HandshakeError::InvalidRelayKey)?;
         if let Ok(secret) = SecretKey::from_slice(secret.as_ref()) {
             return Ok(Keys::new(secret));
         }

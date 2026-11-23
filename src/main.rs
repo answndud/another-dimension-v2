@@ -2,6 +2,7 @@ pub mod channel;
 mod contacts;
 pub mod history;
 mod identity;
+mod random;
 pub mod relay;
 mod session;
 
@@ -5432,7 +5433,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 fn random_token() -> io::Result<String> {
     let mut bytes = [0_u8; 32];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    crate::random::fill(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 

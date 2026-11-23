@@ -1895,7 +1895,7 @@ impl History {
         let mut active_child_path = None;
         let result = (|| {
             let mut bundle_id = [0; 16];
-            File::open("/dev/urandom")?.read_exact(&mut bundle_id)?;
+            crate::random::fill(&mut bundle_id)?;
             let mut header = Vec::with_capacity(8 + bundle_id.len() + 4);
             header.extend_from_slice(BACKUP_STREAM_BUNDLE_MAGIC);
             header.extend_from_slice(&bundle_id);
@@ -2646,9 +2646,9 @@ impl<'a, W: Write> BackupStreamWriter<'a, W> {
         let peer = decode_peer_id(peer_id)?;
         let mut salt = [0; BACKUP_SALT_BYTES];
         let mut file_id = [0; 16];
-        File::open("/dev/urandom")?.read_exact(&mut file_id)?;
+        crate::random::fill(&mut file_id)?;
         if password.is_some() {
-            File::open("/dev/urandom")?.read_exact(&mut salt)?;
+            crate::random::fill(&mut salt)?;
         }
         let mut header = Vec::with_capacity(8 + 1 + 16 + BACKUP_SALT_BYTES);
         header.extend_from_slice(BACKUP_STREAM_MAGIC);
@@ -3821,7 +3821,7 @@ fn encode_backup_with_links(
         ));
     }
     let mut salt = [0; BACKUP_SALT_BYTES];
-    File::open("/dev/urandom")?.read_exact(&mut salt)?;
+    crate::random::fill(&mut salt)?;
     let nonce = random_nonce()?;
     let (magic, key) = match password {
         Some(password) => {
@@ -4201,7 +4201,7 @@ pub(crate) fn sign_message(
         ));
     }
     let mut id = [0; 16];
-    File::open("/dev/urandom")?.read_exact(&mut id)?;
+    crate::random::fill(&mut id)?;
     let mut proof = MessageProof {
         id,
         signer: identity.public_key(),
@@ -4561,7 +4561,7 @@ fn write_linked_keys(identity: &Identity, peer_id: &str, linked: &LinkedIds) -> 
         plaintext.extend_from_slice(&decode_peer_id(id)?);
     }
     let mut nonce = [0; NONCE_BYTES];
-    File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+    crate::random::fill(&mut nonce)?;
     let key = identity.storage_key();
     let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
         .map_err(|_| invalid_data("linked identity key unavailable"))?;
@@ -5647,7 +5647,7 @@ fn opaque_conversation_name(key: &[u8; 32], peer_id: &str) -> String {
 
 fn random_nonce() -> io::Result<[u8; NONCE_BYTES]> {
     let mut nonce = [0; NONCE_BYTES];
-    File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+    crate::random::fill(&mut nonce)?;
     Ok(nonce)
 }
 

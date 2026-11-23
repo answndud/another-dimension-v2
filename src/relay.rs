@@ -16,7 +16,6 @@ use nostr::prelude::{
 use sha2::Sha256;
 use std::collections::BTreeSet;
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -705,7 +704,7 @@ impl InviteCode {
     }
     pub fn generate() -> io::Result<Self> {
         let mut secret = Zeroizing::new([0_u8; 32]);
-        File::open("/dev/urandom")?.read_exact(secret.as_mut())?;
+        crate::random::fill(secret.as_mut())?;
         Ok(Self::from_secret(secret))
     }
 
@@ -987,7 +986,7 @@ impl RelayRendezvous {
         const ACK: &[u8] = b"AD-CONTACT-ACK-1";
         match self.role {
             Role::Responder => {
-                File::open("/dev/urandom")?.read_exact(secret.as_mut())?;
+                crate::random::fill(secret.as_mut())?;
                 let mut offer = Zeroizing::new(Vec::from(OFFER));
                 offer.extend_from_slice(secret.as_ref());
                 self.publish_frame(&active.write_message(&offer)?)?;
@@ -1359,7 +1358,7 @@ fn is_attempt_tag(tag: &str) -> bool {
 
 fn random_hex(bytes_len: usize) -> io::Result<String> {
     let mut bytes = Zeroizing::new(vec![0; bytes_len]);
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    crate::random::fill(&mut bytes)?;
     Ok(hex(&bytes))
 }
 

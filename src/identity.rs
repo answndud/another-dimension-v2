@@ -3,8 +3,8 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use zeroize::Zeroizing;
 
 const LEGACY_PREFIX: &str = "AD1-";
@@ -27,7 +27,7 @@ pub struct Identity {
 impl Identity {
     pub fn create() -> io::Result<(Self, Zeroizing<String>)> {
         let mut seed = Zeroizing::new([0_u8; 32]);
-        File::open("/dev/urandom")?.read_exact(seed.as_mut())?;
+        crate::random::fill(seed.as_mut())?;
         let identity = Self::from_seed(seed);
         let code = identity.create_access_code()?;
         Ok((identity, code))
@@ -79,8 +79,8 @@ impl Identity {
     pub fn create_access_code(&self) -> io::Result<Zeroizing<String>> {
         let mut wrap_key = Zeroizing::new([0_u8; CODE_KEY_BYTES]);
         let mut nonce = [0_u8; NONCE_BYTES];
-        File::open("/dev/urandom")?.read_exact(wrap_key.as_mut())?;
-        File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+        crate::random::fill(wrap_key.as_mut())?;
+        crate::random::fill(&mut nonce)?;
         let key = derive_code_key(&wrap_key);
         let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
             .map_err(|_| io::Error::other("identity code key unavailable"))?;
@@ -290,7 +290,7 @@ pub(crate) fn replace_previous_public_ids(identity: &Identity, ids: &[String]) -
     fs::create_dir_all(&directory)?;
     let path = directory.join(ORIGINS_FILE);
     let mut suffix = [0_u8; 12];
-    File::open("/dev/urandom")?.read_exact(&mut suffix)?;
+    crate::random::fill(&mut suffix)?;
     let suffix = suffix
         .iter()
         .map(|byte| format!("{byte:02x}"))

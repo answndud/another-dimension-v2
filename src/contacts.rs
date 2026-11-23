@@ -8,8 +8,8 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Mutex;
 use zeroize::Zeroizing;
@@ -105,7 +105,7 @@ fn save_inner(
         }
     }
     let mut nonce = [0; 12];
-    File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+    crate::random::fill(&mut nonce)?;
     let cipher =
         ChaCha20Poly1305::new_from_slice(key(identity).as_ref()).map_err(io::Error::other)?;
     let encrypted = cipher
@@ -186,7 +186,7 @@ pub fn load(
 /// same personal identity. This does not include the personal access code.
 pub fn export_backup(identity: &Identity, contact: &VerifiedContact) -> io::Result<Vec<u8>> {
     let mut nonce = [0; 12];
-    File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+    crate::random::fill(&mut nonce)?;
     let mut plain = Zeroizing::new(Vec::with_capacity(64));
     plain.extend_from_slice(&contact.peer_key);
     plain.extend_from_slice(contact.rendezvous_secret.as_ref());
