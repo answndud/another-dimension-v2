@@ -269,6 +269,11 @@ mod tests {
             ("identity.rs", include_str!("identity.rs")),
             ("main.rs", include_str!("main.rs")),
             ("anchor.rs", include_str!("anchor.rs")),
+            ("http.rs", include_str!("http.rs")),
+            ("state.rs", include_str!("state.rs")),
+            ("settings.rs", include_str!("settings.rs")),
+            ("api.rs", include_str!("api.rs")),
+            ("chat_worker.rs", include_str!("chat_worker.rs")),
         ] {
             let problems = calls_outside_the_helpers(source);
             assert!(

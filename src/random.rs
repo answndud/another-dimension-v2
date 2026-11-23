@@ -46,6 +46,11 @@ mod tests {
             ("contacts.rs", include_str!("contacts.rs")),
             ("session.rs", include_str!("session.rs")),
             ("anchor.rs", include_str!("anchor.rs")),
+            ("http.rs", include_str!("http.rs")),
+            ("state.rs", include_str!("state.rs")),
+            ("settings.rs", include_str!("settings.rs")),
+            ("api.rs", include_str!("api.rs")),
+            ("chat_worker.rs", include_str!("chat_worker.rs")),
         ] {
             assert!(
                 !source.contains(device),
