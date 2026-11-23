@@ -12,7 +12,7 @@ use crate::identity::Identity;
 use hkdf::Hkdf;
 use nostr::prelude::{
     ClientMessage, Error as NostrError, EventBuilder, Filter, FinalizeEvent, Keys, Kind, PublicKey,
-    RelayMessage, SecretKey, SingleLetterTag, SubscriptionId, Tag,
+    RelayMessage, SecretKey, SingleLetterTag, SubscriptionId, Tag, Timestamp,
 };
 use sha2::Sha256;
 use std::collections::BTreeSet;
@@ -34,6 +34,16 @@ const INVITE_PREFIX: &str = "ADI3-";
 const INVITE_TOPIC_INFO: &[u8] = b"another-dimension-v2/invite-topic/v2";
 const INVITE_KEY_INFO: &[u8] = b"another-dimension-v2/invite-relay-key/v2";
 const INVITE_DOMAIN: &[u8] = b"another-dimension-v2/invite-code/v2";
+/// A reconnect uses a long-lived secret, so the rendezvous topic and author key change
+/// every epoch. Otherwise a relay could tell from the unchanging topic that the same two
+/// people connect again and again. Both sides listen on the epochs around the current one
+/// so that clocks that disagree a little, or a connection that straddles a boundary, still
+/// meet.
+const EPOCH_LENGTH_SECONDS: u64 = 6 * 60 * 60;
+const EPOCH_INFO: &[u8] = b"another-dimension-v2/reconnect-epoch/v3";
+/// An event older or newer than this is not accepted as part of a rendezvous. A relay
+/// that stored an old event and replays it later is thereby ignored.
+const MAX_EVENT_AGE_SECONDS: u64 = 5 * 60;
 const READY_REQUEST_PREFIX: &[u8] = b"\0AD2-READY-1:";
 const READY_ACK_PREFIX: &[u8] = b"\0AD2-READY-ACK-1:";
 /// The largest frame exchanged while a session is being set up. These frames are padded
@@ -770,11 +780,16 @@ fn ensure_tls_crypto_provider() -> Result<(), RelayError> {
 pub struct InviteCode {
     secret: Zeroizing<[u8; 32]>,
     display: Zeroizing<String>,
+    /// A first-time invite is used once and keeps one topic. A reconnect secret is used
+    /// again and again, so its topic follows the epoch.
+    reconnect: bool,
 }
 
 impl InviteCode {
     pub(crate) fn from_reconnect_secret(secret: Zeroizing<[u8; 32]>) -> Self {
-        Self::from_secret(secret)
+        let mut invite = Self::from_secret(secret);
+        invite.reconnect = true;
+        invite
     }
     pub fn generate() -> io::Result<Self> {
         let mut secret = Zeroizing::new([0_u8; 32]);
@@ -810,17 +825,33 @@ impl InviteCode {
         let mut display = Zeroizing::new(String::with_capacity(INVITE_PREFIX.len() + 64));
         display.push_str(INVITE_PREFIX);
         push_secret_hex(&mut display, secret.as_ref());
-        Self { secret, display }
+        Self {
+            secret,
+            display,
+            reconnect: false,
+        }
     }
 
-    fn relay_material(&self) -> Result<(String, Keys), RelayError> {
+    /// The topic and event key for one epoch. A first-time invite ignores the epoch.
+    fn relay_material_at(&self, epoch: u64) -> Result<(String, Keys), RelayError> {
         let hkdf = Hkdf::<Sha256>::new(Some(INVITE_DOMAIN), self.secret.as_ref());
+        // Mixing the epoch into the key material changes both the topic and the key.
+        let suffix: Vec<u8> = if self.reconnect {
+            let mut suffix = EPOCH_INFO.to_vec();
+            suffix.extend_from_slice(&epoch.to_be_bytes());
+            suffix
+        } else {
+            Vec::new()
+        };
         let mut topic = [0_u8; 32];
-        hkdf.expand(INVITE_TOPIC_INFO, &mut topic)
+        let mut topic_info = INVITE_TOPIC_INFO.to_vec();
+        topic_info.extend_from_slice(&suffix);
+        hkdf.expand(&topic_info, &mut topic)
             .map_err(|_| RelayError::InvalidEvent)?;
         for counter in 0_u8..=u8::MAX {
-            let mut info = Vec::with_capacity(INVITE_KEY_INFO.len() + 1);
+            let mut info = Vec::with_capacity(INVITE_KEY_INFO.len() + suffix.len() + 1);
             info.extend_from_slice(INVITE_KEY_INFO);
+            info.extend_from_slice(&suffix);
             info.push(counter);
             let mut bytes = Zeroizing::new([0_u8; 32]);
             hkdf.expand(&info, bytes.as_mut())
@@ -831,6 +862,50 @@ impl InviteCode {
         }
         Err(RelayError::InvalidEvent)
     }
+
+    /// The epoch a given Unix time falls in.
+    fn epoch_of(unix_seconds: u64) -> u64 {
+        unix_seconds / EPOCH_LENGTH_SECONDS
+    }
+
+    /// Topic and key used to publish at `unix_seconds`, plus every topic and key to listen
+    /// on: the epochs before, at and after that time for a reconnect, just the one for a
+    /// first-time invite. The publishing pair is always among the listening ones.
+    fn rendezvous_at(&self, unix_seconds: u64) -> Result<(Vec<(String, Keys)>, usize), RelayError> {
+        if !self.reconnect {
+            return Ok((vec![self.relay_material_at(0)?], 0));
+        }
+        let current = Self::epoch_of(unix_seconds);
+        let mut pairs = Vec::new();
+        for epoch in [
+            current.saturating_sub(1),
+            current,
+            current.saturating_add(1),
+        ] {
+            pairs.push(self.relay_material_at(epoch)?);
+        }
+        // `current - 1` and `current` coincide only at epoch 0, which no real clock is in.
+        Ok((pairs, 1))
+    }
+
+    /// The topic and key used to publish right now. Only tests ask for a single pair.
+    #[cfg(test)]
+    fn relay_material(&self) -> Result<(String, Keys), RelayError> {
+        let (mut pairs, publishing) = self.rendezvous_at(unix_now())?;
+        Ok(pairs.swap_remove(publishing))
+    }
+}
+
+/// Whether an event created at `created_at` is within the allowed distance of `now`, in
+/// either direction (clocks differ, and an event may be stamped slightly ahead).
+fn is_recent(created_at: u64, now: u64) -> bool {
+    created_at.abs_diff(now) <= MAX_EVENT_AGE_SECONDS
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Initial rendezvous over NIP-01 ephemeral events. Room creator is responder;
@@ -840,8 +915,14 @@ impl InviteCode {
 pub struct RelayRendezvous {
     relays: Vec<RelayLink>,
     next_relay: usize,
-    topic: String,
-    keys: Keys,
+    /// Every topic and event key this rendezvous listens on: one for a first-time invite,
+    /// the epochs around the current one for a reconnect. An event is accepted only if its
+    /// author and its topic tag belong to the same pair.
+    listen: Vec<(String, Keys)>,
+    /// Which pair is used to publish.
+    publish: usize,
+    /// Current Unix time. A field so that a test can move the clock.
+    clock: fn() -> u64,
     role: Role,
     seen: BTreeSet<String>,
     attempt_tag: Option<String>,
@@ -894,7 +975,7 @@ impl RelayRendezvous {
     where
         F: FnMut(&str) -> Result<Box<dyn RelayIo>, RelayError>,
     {
-        let (topic, keys) = invite.relay_material()?;
+        let (listen, publish) = invite.rendezvous_at(unix_now())?;
         let attempt_tag = match role {
             Role::Initiator => Some(random_hex(16)?),
             Role::Responder => None,
@@ -902,9 +983,12 @@ impl RelayRendezvous {
         let subscription = new_subscription_id()?;
         let mut filter = Filter::new()
             .kind(Kind::Custom(EVENT_KIND))
-            .custom_tag(SingleLetterTag::LOWERCASE_T, topic.clone())
+            .custom_tags(
+                SingleLetterTag::LOWERCASE_T,
+                listen.iter().map(|(topic, _)| topic.clone()),
+            )
             .custom_tag(SingleLetterTag::LOWERCASE_R, role_tag(role.peer()))
-            .author(keys.public_key());
+            .authors(listen.iter().map(|(_, keys)| keys.public_key()));
         if let Some(attempt) = &attempt_tag {
             filter = filter.custom_tag(SingleLetterTag::LOWERCASE_S, attempt.clone());
         }
@@ -933,8 +1017,9 @@ impl RelayRendezvous {
         Ok(Self {
             relays,
             next_relay: 0,
-            topic,
-            keys,
+            listen,
+            publish,
+            clock: unix_now,
             role,
             seen: BTreeSet::new(),
             attempt_tag,
@@ -1122,8 +1207,11 @@ impl RelayRendezvous {
             return Err(RelayError::InvalidEvent);
         }
         let role = role_tag(self.role);
+        // The time is stamped here, from the same clock the receiver's freshness check
+        // uses, so the two cannot drift apart or depend on a library default.
         let event = EventBuilder::new(Kind::Custom(EVENT_KIND), hex(frame))
-            .tag(Tag::custom("t", [self.topic.as_str()]))
+            .custom_created_at(Timestamp::from_secs((self.clock)()))
+            .tag(Tag::custom("t", [self.listen[self.publish].0.as_str()]))
             .tag(Tag::custom("r", [role]))
             .tag(Tag::custom(
                 "s",
@@ -1132,7 +1220,7 @@ impl RelayRendezvous {
                     .as_deref()
                     .ok_or(RelayError::InvalidEvent)?],
             ))
-            .finalize(&self.keys)?;
+            .finalize(&self.listen[self.publish].1)?;
         let serialized = ClientMessage::event(event).as_json();
         let mut delivered = false;
         let mut index = 0;
@@ -1242,11 +1330,20 @@ impl RelayRendezvous {
                         }
                         let event = event.as_ref();
                         let event_id = event.id.to_string();
-                        if event.pubkey != self.keys.public_key()
+                        // The author and the topic must belong to the same epoch. Checking them
+                        // separately would accept an event signed for one epoch that names
+                        // the topic of another.
+                        let in_a_listened_pair = self.listen.iter().any(|(topic, keys)| {
+                            event.pubkey == keys.public_key()
+                                && tag_value(event, "t") == Some(topic.as_str())
+                        });
+                        if !in_a_listened_pair
                             || event.kind != Kind::Custom(EVENT_KIND)
                             || event.verify().is_err()
-                            || tag_value(event, "t") != Some(self.topic.as_str())
                             || tag_value(event, "r") != Some(expected_role)
+                            // A relay can store an event and replay it later. Anything not
+                            // recent is dropped before it can fix the attempt or fill `seen`.
+                            || !is_recent(event.created_at.as_secs(), (self.clock)())
                         {
                             return Ok(None);
                         }
@@ -1264,8 +1361,12 @@ impl RelayRendezvous {
                         if !self.seen.insert(event_id) {
                             return Ok(None);
                         }
-                        if self.seen.len() > 64 {
-                            return Err(RelayError::InvalidEvent);
+                        // Forget the oldest ids instead of giving up: an attacker who can
+                        // publish to the topic must not be able to end the rendezvous.
+                        while self.seen.len() > 64 {
+                            if let Some(oldest) = self.seen.iter().next().cloned() {
+                                self.seen.remove(&oldest);
+                            }
                         }
                         let frame = decode_hex(&event.content).ok_or(RelayError::InvalidEvent)?;
                         if frame.is_empty() || frame.len() > MAX_BOOTSTRAP_FRAME {
@@ -2814,6 +2915,134 @@ mod tests {
         );
     }
 
+    /// Two rendezvous objects on one fake relay, one as each role, for tests of what a
+    /// receiver accepts. `sender_clock` and `receiver_clock` are each side's idea of now.
+    fn rendezvous_pair(
+        invite: &InviteCode,
+        sender_clock: fn() -> u64,
+        receiver_clock: fn() -> u64,
+    ) -> (RelayRendezvous, RelayRendezvous) {
+        let network = FakeRelayNetwork::default();
+        let endpoint = vec!["wss://epoch.test".to_owned()];
+        let open = |network: &FakeRelayNetwork| {
+            let network = network.clone();
+            move |endpoint: &str| network.open(endpoint)
+        };
+        let mut sender =
+            RelayRendezvous::connect_with(&endpoint, invite, Role::Initiator, open(&network))
+                .unwrap();
+        let mut receiver =
+            RelayRendezvous::connect_with(&endpoint, invite, Role::Responder, open(&network))
+                .unwrap();
+        sender.clock = sender_clock;
+        receiver.clock = receiver_clock;
+        sender.timeout = Duration::from_millis(600);
+        receiver.timeout = Duration::from_millis(600);
+        // The responder takes the attempt tag from the first valid event, so give both
+        // the same one in advance.
+        receiver.attempt_tag = sender.attempt_tag.clone();
+        (sender, receiver)
+    }
+
+    const NOW: u64 = 90 * super::EPOCH_LENGTH_SECONDS + 1000;
+    fn now() -> u64 {
+        NOW
+    }
+    fn five_minutes_and_a_second_ago() -> u64 {
+        NOW - super::MAX_EVENT_AGE_SECONDS - 1
+    }
+    fn four_minutes_ago() -> u64 {
+        NOW - 240
+    }
+    fn five_minutes_and_a_second_ahead() -> u64 {
+        NOW + super::MAX_EVENT_AGE_SECONDS + 1
+    }
+
+    #[test]
+    fn a_recent_event_is_accepted_even_if_the_clocks_differ_a_little() {
+        let (mut sender, mut receiver) =
+            rendezvous_pair(&reconnect_invite(), four_minutes_ago, now);
+        sender.publish_frame(b"hello").unwrap();
+        assert_eq!(receiver.receive_frame("test").unwrap(), b"hello");
+    }
+
+    #[test]
+    fn an_event_older_than_the_window_is_ignored_as_a_replay() {
+        let (mut sender, mut receiver) =
+            rendezvous_pair(&reconnect_invite(), five_minutes_and_a_second_ago, now);
+        sender.publish_frame(b"replayed").unwrap();
+        // The event is genuine and correctly signed, but a relay could be replaying it.
+        assert!(matches!(
+            receiver.receive_frame("test"),
+            Err(RelayError::TimedOut("test"))
+        ));
+    }
+
+    #[test]
+    fn an_event_dated_too_far_ahead_is_ignored_too() {
+        let (mut sender, mut receiver) =
+            rendezvous_pair(&reconnect_invite(), five_minutes_and_a_second_ahead, now);
+        sender.publish_frame(b"from the future").unwrap();
+        assert!(matches!(
+            receiver.receive_frame("test"),
+            Err(RelayError::TimedOut("test"))
+        ));
+    }
+
+    #[test]
+    fn replayed_events_cannot_fix_the_attempt_or_end_the_rendezvous() {
+        // A relay replays many old events from this topic ahead of the genuine one. They
+        // must not use up the receiver's bookkeeping or pin it to a stale attempt.
+        let invite = reconnect_invite();
+        let (mut replayer, mut receiver) =
+            rendezvous_pair(&invite, five_minutes_and_a_second_ago, now);
+        receiver.attempt_tag = None; // the responder learns the attempt from the first event
+        receiver.timeout = Duration::from_secs(3);
+        for index in 0..100_u8 {
+            // Each replayed event is a different attempt.
+            replayer.attempt_tag = Some(super::random_hex(16).unwrap());
+            replayer.publish_frame(&[index, 1]).unwrap();
+        }
+        assert!(matches!(
+            receiver.receive_frame("test"),
+            Err(RelayError::TimedOut("test"))
+        ));
+        assert!(
+            receiver.attempt_tag.is_none(),
+            "no replayed event fixed the attempt"
+        );
+        assert!(receiver.seen.is_empty(), "no replayed event was remembered");
+    }
+
+    #[test]
+    fn an_event_mixing_one_epochs_key_with_another_epochs_topic_is_ignored() {
+        // Both the key and the topic are ones the receiver listens to, but they do not
+        // belong together, so the event was not made by someone holding the secret's
+        // material for any single epoch.
+        let (mut sender, mut receiver) = rendezvous_pair(&reconnect_invite(), now, now);
+        let other_topic = sender.listen[0].0.clone();
+        sender.listen[sender.publish].0 = other_topic;
+        sender.publish_frame(b"mixed").unwrap();
+        assert!(matches!(
+            receiver.receive_frame("test"),
+            Err(RelayError::TimedOut("test"))
+        ));
+    }
+
+    #[test]
+    fn flooding_the_topic_with_valid_events_does_not_end_the_rendezvous() {
+        let (mut sender, mut receiver) = rendezvous_pair(&reconnect_invite(), now, now);
+        receiver.attempt_tag = sender.attempt_tag.clone();
+        for index in 0..200_u32 {
+            sender.publish_frame(&index.to_be_bytes()).unwrap();
+        }
+        // Reading far more than the 64 remembered ids is not an error.
+        for index in 0..200_u32 {
+            assert_eq!(receiver.receive_frame("test").unwrap(), index.to_be_bytes());
+        }
+        assert!(receiver.seen.len() <= 64);
+    }
+
     #[test]
     fn subscription_ids_are_random_and_carry_no_program_marker() {
         let mut seen = std::collections::HashSet::new();
@@ -2825,6 +3054,125 @@ mod tests {
             assert!(!id.contains("ad-v2") && !id.contains("live"), "{id}");
             assert!(seen.insert(id), "a subscription id was repeated");
         }
+    }
+
+    fn reconnect_invite() -> InviteCode {
+        InviteCode::from_reconnect_secret(zeroize::Zeroizing::new([7_u8; 32]))
+    }
+
+    fn key_of(pair: &(String, nostr::prelude::Keys)) -> nostr::prelude::PublicKey {
+        pair.1.public_key()
+    }
+
+    #[test]
+    fn a_reconnect_secret_lands_on_a_different_topic_and_key_in_each_epoch() {
+        let invite = reconnect_invite();
+        let epoch_a = invite.relay_material_at(1000).unwrap();
+        let epoch_b = invite.relay_material_at(1001).unwrap();
+        // A relay watching the topic or the author key cannot tie two epochs together.
+        assert_ne!(epoch_a.0, epoch_b.0);
+        assert_ne!(key_of(&epoch_a), key_of(&epoch_b));
+        // Within one epoch both sides derive the same pair, which is how they meet.
+        let again = invite.relay_material_at(1000).unwrap();
+        assert_eq!(epoch_a.0, again.0);
+        assert_eq!(key_of(&epoch_a), key_of(&again));
+    }
+
+    #[test]
+    fn many_epochs_never_share_a_topic_or_a_key() {
+        let invite = reconnect_invite();
+        let mut topics = std::collections::HashSet::new();
+        let mut keys = std::collections::HashSet::new();
+        for epoch in 0..200_u64 {
+            let (topic, pair_keys) = invite.relay_material_at(epoch).unwrap();
+            assert!(topics.insert(topic), "epoch {epoch} repeated a topic");
+            assert!(
+                keys.insert(pair_keys.public_key()),
+                "epoch {epoch} repeated a key"
+            );
+        }
+    }
+
+    #[test]
+    fn different_reconnect_secrets_never_meet_in_the_same_epoch() {
+        let first = reconnect_invite();
+        let second = InviteCode::from_reconnect_secret(zeroize::Zeroizing::new([8_u8; 32]));
+        let (a, b) = (
+            first.relay_material_at(500).unwrap(),
+            second.relay_material_at(500).unwrap(),
+        );
+        assert_ne!(a.0, b.0);
+        assert_ne!(key_of(&a), key_of(&b));
+    }
+
+    #[test]
+    fn a_first_time_invite_keeps_one_topic_whatever_the_time() {
+        // An invite is used once. Giving it a lifetime would only make it fail when typed
+        // in late, so it ignores the epoch.
+        let invite = InviteCode::generate().unwrap();
+        let early = invite.relay_material_at(1).unwrap();
+        let late = invite.relay_material_at(9_999).unwrap();
+        assert_eq!(early.0, late.0);
+        assert_eq!(key_of(&early), key_of(&late));
+        let (pairs, publishing) = invite.rendezvous_at(1_700_000_000).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(publishing, 0);
+    }
+
+    #[test]
+    fn a_reconnect_listens_on_the_epochs_before_at_and_after_the_current_one() {
+        let invite = reconnect_invite();
+        let now = 50 * super::EPOCH_LENGTH_SECONDS + 123;
+        let (pairs, publishing) = invite.rendezvous_at(now).unwrap();
+        assert_eq!(pairs.len(), 3);
+        // It publishes on the current epoch, which is the middle one.
+        assert_eq!(pairs[publishing].0, invite.relay_material_at(50).unwrap().0);
+        let listened: Vec<_> = pairs.iter().map(|pair| pair.0.clone()).collect();
+        for epoch in [49, 50, 51] {
+            assert!(
+                listened.contains(&invite.relay_material_at(epoch).unwrap().0),
+                "epoch {epoch}"
+            );
+        }
+        assert!(!listened.contains(&invite.relay_material_at(48).unwrap().0));
+        assert!(!listened.contains(&invite.relay_material_at(52).unwrap().0));
+    }
+
+    #[test]
+    fn two_clocks_that_disagree_across_an_epoch_boundary_still_find_each_other() {
+        // One side is just before the boundary, the other just after it. Each publishes on
+        // its own current epoch and listens on the neighbours, so each hears the other.
+        let invite = reconnect_invite();
+        let boundary = 80 * super::EPOCH_LENGTH_SECONDS;
+        let slow = invite.rendezvous_at(boundary - 30).unwrap();
+        let fast = invite.rendezvous_at(boundary + 30).unwrap();
+        let publishes_to =
+            |side: &(Vec<(String, nostr::prelude::Keys)>, usize)| side.0[side.1].0.clone();
+        let hears = |side: &(Vec<(String, nostr::prelude::Keys)>, usize), topic: &str| {
+            side.0.iter().any(|pair| pair.0 == topic)
+        };
+        assert_ne!(
+            publishes_to(&slow),
+            publishes_to(&fast),
+            "they do publish apart"
+        );
+        assert!(hears(&fast, &publishes_to(&slow)));
+        assert!(hears(&slow, &publishes_to(&fast)));
+    }
+
+    #[test]
+    fn clocks_more_than_one_epoch_apart_do_not_meet() {
+        // The tolerance is a single epoch either way. Beyond it the sides are on topics the
+        // other is not listening to, which is the cost of not reusing one topic.
+        let invite = reconnect_invite();
+        let early = invite
+            .rendezvous_at(10 * super::EPOCH_LENGTH_SECONDS)
+            .unwrap();
+        let late = invite
+            .rendezvous_at(13 * super::EPOCH_LENGTH_SECONDS)
+            .unwrap();
+        let topic = late.0[late.1].0.clone();
+        assert!(!early.0.iter().any(|pair| pair.0 == topic));
     }
 
     #[test]

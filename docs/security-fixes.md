@@ -19,6 +19,17 @@
 
 ## 기록
 
+## SF-018 같은 쌍의 재연결이 항상 같은 relay 토픽과 키로 보임
+
+- 날짜: 2026-11-23
+- 심각도: Medium
+- 위치: `src/relay.rs`(`InviteCode::relay_material_at`, `rendezvous_at`, `RelayRendezvous`의 수신 검증)
+- 발견: 재연결 비밀에서 파생된 토픽과 서명 키가 시간과 무관하게 고정이었습니다.
+- 영향: relay 운영자는 같은 토픽·키가 반복되는 것으로 한 쌍의 재연결을 몇 달이고 이어서 추적할 수 있었습니다. 또 relay가 저장해 둔 오래된 이벤트를 다시 보내도 수신 측이 시각을 보지 않았습니다.
+- 수정(프로토콜 v3에 합류, 버전 올림 없음): 재연결 비밀에서 6시간 epoch마다 다른 토픽과 키를 HKDF로 파생합니다(`EPOCH_INFO`). 이전·현재·다음 epoch 세 곳을 구독하고 현재 epoch에 게시하므로 경계에서 시계가 어긋나도 만납니다. 수신 측은 (작성자 키, 토픽 태그)가 같은 epoch의 쌍인지 확인하고, 생성 시각이 5분 이내인 이벤트만 받습니다. 처음 초대 코드는 한 번만 쓰이므로 epoch를 쓰지 않습니다. 중복 방지 집합이 가득 차면 연결을 끝내던 동작은 오래된 항목을 버리도록 바꿨습니다(채워서 연결을 끊는 공격 방지).
+- 회귀 테스트: epoch마다 토픽·키가 다르고 다른 비밀과 겹치지 않는 테스트 3개, 경계 시계 어긋남 테스트(`two_clocks_that_disagree_across_an_epoch_boundary_still_find_each_other`, `clocks_more_than_one_epoch_apart_do_not_meet`), 수신 검증 테스트(`an_event_older_than_the_window_is_ignored_as_a_replay`, `an_event_dated_too_far_ahead_is_ignored_too`, `replayed_events_cannot_fix_the_attempt_or_end_the_rendezvous`, `an_event_mixing_one_epochs_key_with_another_epochs_topic_is_ignored`, `flooding_the_topic_with_valid_events_does_not_end_the_rendezvous`). 변이 검사: 신선도 검사 제거 시 3개, 쌍 검사 완화 시 1개, `seen` 초과 오류 복원 시 1개가 해당 테스트만 실패하는 것을 확인했습니다.
+- 남은 한계: 같은 epoch 안에서는 토픽이 같아 연결 가능합니다. 시계가 한 epoch(6시간) 넘게 어긋난 두 기기는 만나지 못합니다. 이벤트 시각의 5분 허용 범위는 재전송을 완전히 막지 못하고 세션 인증이 최종 방어입니다. 실제 relay와 실제 기기는 검증하지 못했습니다.
+
 ## SF-017 relay와 구독자에게 메시지 길이와 이 프로그램의 흔적이 그대로 보임
 
 - 날짜: 2026-11-23
