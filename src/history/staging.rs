@@ -671,40 +671,104 @@ pub(crate) fn add_restore_run_level(
     }
 }
 
-// TODO(PLAN 3.2): group the restore sort state into a struct when history.rs is split.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn push_restore_sort_item(
-    message: StoredMessage,
-    buffer: &mut Vec<(u64, StoredMessage)>,
-    buffer_bytes: &mut usize,
-    peak_buffer_bytes: &mut usize,
-    levels: &mut Vec<Vec<PathBuf>>,
-    serial: &mut u64,
-    key: &[u8; 32],
-    identity_id: &str,
-    peer_id: &str,
-    directory: &std::path::Path,
-) -> io::Result<()> {
-    let size = std::mem::size_of::<StoredMessage>()
-        + message.text.len()
-        + if message.proof.is_some() { 144 } else { 0 };
-    if !buffer.is_empty()
-        && (buffer.len() >= RESTORE_SORT_RUN_RECORDS
-            || buffer_bytes.saturating_add(size) > RESTORE_SORT_RUN_BYTES)
-    {
-        let run = write_restore_sort_run(directory, serial, key, identity_id, peer_id, buffer)?;
-        *buffer_bytes = 0;
-        add_restore_run_level(run, levels, serial, key, identity_id, peer_id, directory)?;
+/// Sorts messages by time without holding them all in memory: they are collected in a
+/// buffer, written out as sorted runs when it fills, and the runs are merged level by
+/// level so the number of open runs stays bounded.
+pub(crate) struct RestoreSorter<'a> {
+    directory: &'a std::path::Path,
+    key: &'a [u8; 32],
+    identity_id: &'a str,
+    peer_id: &'a str,
+    buffer: Vec<(u64, StoredMessage)>,
+    buffer_bytes: usize,
+    peak_buffer_bytes: usize,
+    levels: Vec<Vec<PathBuf>>,
+    serial: u64,
+}
+
+/// What a finished `RestoreSorter` leaves behind.
+pub(crate) struct SortedRuns {
+    pub(crate) runs: Vec<PathBuf>,
+    /// The next unused file number in the directory, for further merge outputs.
+    pub(crate) serial: u64,
+    #[cfg(test)]
+    pub(crate) peak_buffer_bytes: usize,
+}
+
+impl<'a> RestoreSorter<'a> {
+    pub(crate) fn new(
+        directory: &'a std::path::Path,
+        key: &'a [u8; 32],
+        identity_id: &'a str,
+        peer_id: &'a str,
+    ) -> Self {
+        Self {
+            directory,
+            key,
+            identity_id,
+            peer_id,
+            buffer: Vec::new(),
+            buffer_bytes: 0,
+            peak_buffer_bytes: 0,
+            levels: Vec::new(),
+            serial: 0,
+        }
     }
-    *buffer_bytes = buffer_bytes.saturating_add(size);
-    *peak_buffer_bytes = (*peak_buffer_bytes).max(*buffer_bytes);
-    buffer.push((0, message));
-    if buffer.len() >= RESTORE_SORT_RUN_RECORDS || *buffer_bytes >= RESTORE_SORT_RUN_BYTES {
-        let run = write_restore_sort_run(directory, serial, key, identity_id, peer_id, buffer)?;
-        *buffer_bytes = 0;
-        add_restore_run_level(run, levels, serial, key, identity_id, peer_id, directory)?;
+
+    fn spill(&mut self) -> io::Result<()> {
+        let run = write_restore_sort_run(
+            self.directory,
+            &mut self.serial,
+            self.key,
+            self.identity_id,
+            self.peer_id,
+            &mut self.buffer,
+        )?;
+        self.buffer_bytes = 0;
+        add_restore_run_level(
+            run,
+            &mut self.levels,
+            &mut self.serial,
+            self.key,
+            self.identity_id,
+            self.peer_id,
+            self.directory,
+        )
     }
-    Ok(())
+
+    pub(crate) fn push(&mut self, message: StoredMessage) -> io::Result<()> {
+        let size = std::mem::size_of::<StoredMessage>()
+            + message.text.len()
+            + if message.proof.is_some() { 144 } else { 0 };
+        if !self.buffer.is_empty()
+            && (self.buffer.len() >= RESTORE_SORT_RUN_RECORDS
+                || self.buffer_bytes.saturating_add(size) > RESTORE_SORT_RUN_BYTES)
+        {
+            self.spill()?;
+        }
+        self.buffer_bytes = self.buffer_bytes.saturating_add(size);
+        self.peak_buffer_bytes = self.peak_buffer_bytes.max(self.buffer_bytes);
+        self.buffer.push((0, message));
+        if self.buffer.len() >= RESTORE_SORT_RUN_RECORDS
+            || self.buffer_bytes >= RESTORE_SORT_RUN_BYTES
+        {
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    /// Writes out what is still buffered and returns the runs that remain.
+    pub(crate) fn finish(mut self) -> io::Result<SortedRuns> {
+        if !self.buffer.is_empty() {
+            self.spill()?;
+        }
+        Ok(SortedRuns {
+            runs: self.levels.into_iter().flatten().collect(),
+            serial: self.serial,
+            #[cfg(test)]
+            peak_buffer_bytes: self.peak_buffer_bytes,
+        })
+    }
 }
 
 impl History {
@@ -752,11 +816,8 @@ impl History {
                 .checked_add(staging.count())
                 .ok_or_else(|| invalid_data("restore record count overflow"))?;
             let mut index = RestoreDiskIndex::new(staging, total_capacity)?;
-            let mut levels = Vec::<Vec<PathBuf>>::new();
-            let mut serial = 0u64;
-            let mut buffer = Vec::<(u64, StoredMessage)>::new();
-            let mut buffer_bytes = 0usize;
-            let mut peak_buffer_bytes = 0usize;
+            let mut sorter =
+                RestoreSorter::new(&stage_root, &self.key, &self.identity_id, &self.peer_id);
             let mut existing = open_history_reader(
                 self.path.clone(),
                 Zeroizing::new(*self.key),
@@ -765,18 +826,7 @@ impl History {
             )?;
             while let Some(message) = existing.next_record()? {
                 index.index_message(&message, false)?;
-                push_restore_sort_item(
-                    message,
-                    &mut buffer,
-                    &mut buffer_bytes,
-                    &mut peak_buffer_bytes,
-                    &mut levels,
-                    &mut serial,
-                    &self.key,
-                    &self.identity_id,
-                    &self.peer_id,
-                    &stage_root,
-                )?;
+                sorter.push(message)?;
             }
             staging.rewind()?;
             let mut imported_count = 0u64;
@@ -785,40 +835,14 @@ impl History {
                     imported_count = imported_count
                         .checked_add(1)
                         .ok_or_else(|| invalid_data("restore count overflow"))?;
-                    push_restore_sort_item(
-                        message,
-                        &mut buffer,
-                        &mut buffer_bytes,
-                        &mut peak_buffer_bytes,
-                        &mut levels,
-                        &mut serial,
-                        &self.key,
-                        &self.identity_id,
-                        &self.peer_id,
-                        &stage_root,
-                    )?;
+                    sorter.push(message)?;
                 }
             }
-            if !buffer.is_empty() {
-                let run = write_restore_sort_run(
-                    &stage_root,
-                    &mut serial,
-                    &self.key,
-                    &self.identity_id,
-                    &self.peer_id,
-                    &mut buffer,
-                )?;
-                add_restore_run_level(
-                    run,
-                    &mut levels,
-                    &mut serial,
-                    &self.key,
-                    &self.identity_id,
-                    &self.peer_id,
-                    &stage_root,
-                )?;
-            }
-            let mut runs: Vec<_> = levels.into_iter().flatten().collect();
+            let sorted = sorter.finish()?;
+            #[cfg(test)]
+            let peak_buffer_bytes = sorted.peak_buffer_bytes;
+            let mut runs = sorted.runs;
+            let mut serial = sorted.serial;
             while runs.len() > RESTORE_MERGE_FAN_IN {
                 let mut reduced = Vec::new();
                 for group in runs.chunks(RESTORE_MERGE_FAN_IN) {

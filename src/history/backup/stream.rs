@@ -61,7 +61,7 @@ impl<'a, W: Write> BackupStreamWriter<'a, W> {
         let mut metadata = Vec::with_capacity(BACKUP_PEER_METADATA.len() + peer.len());
         metadata.extend_from_slice(BACKUP_PEER_METADATA);
         metadata.extend_from_slice(&peer);
-        writer.write_frame(2, 0, &metadata)?;
+        writer.write_frame(FRAME_METADATA, 0, &metadata)?;
         Ok(writer)
     }
 
@@ -71,7 +71,7 @@ impl<'a, W: Write> BackupStreamWriter<'a, W> {
             .count
             .checked_add(1)
             .ok_or_else(|| invalid_data("backup message count overflow"))?;
-        self.write_frame(1, index, &plain)?;
+        self.write_frame(FRAME_MESSAGE, index, &plain)?;
         self.count = self
             .count
             .checked_add(1)
@@ -90,7 +90,7 @@ impl<'a, W: Write> BackupStreamWriter<'a, W> {
             .count
             .checked_add(1)
             .ok_or_else(|| invalid_data("backup message count overflow"))?;
-        self.write_frame(0, trailer_index, &trailer)?;
+        self.write_frame(FRAME_LINKS, trailer_index, &trailer)?;
         self.output.flush()
     }
 
@@ -116,6 +116,11 @@ impl<'a, W: Write> BackupStreamWriter<'a, W> {
         self.output.write_all(&encrypted)
     }
 }
+
+/// The kinds of frame in a stream backup.
+pub(crate) const FRAME_LINKS: u8 = 0;
+pub(crate) const FRAME_MESSAGE: u8 = 1;
+pub(crate) const FRAME_METADATA: u8 = 2;
 
 pub(crate) fn backup_stream_frame_aad(base: &[u8], kind: u8, index: u64) -> Vec<u8> {
     let mut aad = Vec::with_capacity(base.len() + 9);
@@ -164,59 +169,9 @@ pub(crate) fn decode_backup_stream_v6<R: Read>(
     let mut base_aad = backup_aad(identity, BACKUP_STREAM_V6_MAGIC, salt.as_ref());
     base_aad.push(flags[0]);
     base_aad.extend_from_slice(&peer);
-    let request_id = format!(
-        "{}{}{}",
-        hex_encode(&random_nonce()?),
-        hex_encode(&random_nonce()?),
-        hex_encode(&random_nonce()?)
-    )[..64]
-        .to_owned();
-    let mut staging = RestoreStaging::create(identity, &peer_id, &request_id)?;
     let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
         .map_err(|_| invalid_data("invalid backup key"))?;
-    let mut count = 0u64;
-    let links = loop {
-        let mut frame_header = [0; 1 + 8 + NONCE_BYTES + 4];
-        input.read_exact(&mut frame_header)?;
-        let kind = frame_header[0];
-        let index = u64::from_be_bytes(frame_header[1..9].try_into().expect("fixed slice"));
-        let nonce = &frame_header[9..9 + NONCE_BYTES];
-        let length = u32::from_be_bytes(
-            frame_header[9 + NONCE_BYTES..]
-                .try_into()
-                .expect("fixed slice"),
-        ) as usize;
-        if !(16..=MAX_MESSAGE_BYTES + 256).contains(&length) {
-            return Err(invalid_data("invalid backup frame length"));
-        }
-        let mut encrypted = vec![0; length];
-        input.read_exact(&mut encrypted)?;
-        let plain = Zeroizing::new(
-            cipher
-                .decrypt(
-                    Nonce::from_slice(nonce),
-                    Payload {
-                        msg: &encrypted,
-                        aad: &backup_stream_frame_aad(&base_aad, kind, index),
-                    },
-                )
-                .map_err(|_| invalid_data("backup frame authentication failed"))?,
-        );
-        match kind {
-            1 if index == count => {
-                let message = decode_history_plain(&plain, false)?;
-                staging.append_verified(&message)?;
-                count = count
-                    .checked_add(1)
-                    .ok_or_else(|| invalid_data("backup message count overflow"))?;
-            }
-            0 if index == count => break decode_backup_links(&plain, &peer_id, identity)?,
-            _ => return Err(invalid_data("backup frame order is invalid")),
-        }
-    };
-    staging.finish()?;
-    verify_stream_staged_proofs(identity, &peer_id, &mut staging, &links)?;
-    Ok((peer_id, staging, links))
+    read_stream_frames(input, identity, peer_id, &cipher, &base_aad, 0)
 }
 
 pub(crate) fn decode_backup_stream<R: Read>(
@@ -270,7 +225,7 @@ pub(crate) fn decode_backup_stream<R: Read>(
             .try_into()
             .expect("fixed slice"),
     ) as usize;
-    if metadata_kind != 2 || metadata_index != 0 || metadata_len != 8 + 32 + 16 {
+    if metadata_kind != FRAME_METADATA || metadata_index != 0 || metadata_len != 8 + 32 + 16 {
         return Err(invalid_data("invalid encrypted backup metadata frame"));
     }
     let mut encrypted_metadata = vec![0; metadata_len];
@@ -292,14 +247,21 @@ pub(crate) fn decode_backup_stream<R: Read>(
         return Err(invalid_data("invalid encrypted backup metadata"));
     }
     let peer_id = hex_encode(&metadata[BACKUP_PEER_METADATA.len()..]);
-    let request_id = format!(
-        "{}{}{}",
-        hex_encode(&random_nonce()?),
-        hex_encode(&random_nonce()?),
-        hex_encode(&random_nonce()?)
-    )[..64]
-        .to_owned();
-    let mut staging = RestoreStaging::create(identity, &peer_id, &request_id)?;
+    read_stream_frames(input, identity, peer_id, &cipher, &base_aad, 1)
+}
+
+/// Reads the message frames and the closing links frame of a stream backup into a new
+/// restore staging area. Message frames are numbered from `first_index` (0 in ADBACK6,
+/// 1 in ADBACK7, where index 0 is the metadata frame).
+fn read_stream_frames<R: Read>(
+    input: &mut R,
+    identity: &Identity,
+    peer_id: String,
+    cipher: &ChaCha20Poly1305,
+    base_aad: &[u8],
+    first_index: u64,
+) -> io::Result<(String, RestoreStaging, BackupLinks)> {
+    let mut staging = RestoreStaging::create(identity, &peer_id, &new_restore_request_id()?)?;
     let mut count = 0u64;
     let links = loop {
         let mut frame_header = [0; 1 + 8 + NONCE_BYTES + 4];
@@ -323,29 +285,41 @@ pub(crate) fn decode_backup_stream<R: Read>(
                     Nonce::from_slice(nonce),
                     Payload {
                         msg: &encrypted,
-                        aad: &backup_stream_frame_aad(&base_aad, kind, index),
+                        aad: &backup_stream_frame_aad(base_aad, kind, index),
                     },
                 )
                 .map_err(|_| invalid_data("backup frame authentication failed"))?,
         );
         let expected_index = count
-            .checked_add(1)
+            .checked_add(first_index)
             .ok_or_else(|| invalid_data("backup message count overflow"))?;
         match kind {
-            1 if index == expected_index => {
+            FRAME_MESSAGE if index == expected_index => {
                 let message = decode_history_plain(&plain, false)?;
                 staging.append_verified(&message)?;
                 count = count
                     .checked_add(1)
                     .ok_or_else(|| invalid_data("backup message count overflow"))?;
             }
-            0 if index == expected_index => break decode_backup_links(&plain, &peer_id, identity)?,
+            FRAME_LINKS if index == expected_index => {
+                break decode_backup_links(&plain, &peer_id, identity)?;
+            }
             _ => return Err(invalid_data("backup frame order is invalid")),
         }
     };
     staging.finish()?;
     verify_stream_staged_proofs(identity, &peer_id, &mut staging, &links)?;
     Ok((peer_id, staging, links))
+}
+
+/// A fresh 64-hex id for one restore staging area.
+pub(crate) fn new_restore_request_id() -> io::Result<String> {
+    let mut id = String::with_capacity(72);
+    for _ in 0..3 {
+        id.push_str(&hex_encode(&random_nonce()?));
+    }
+    id.truncate(64);
+    Ok(id)
 }
 
 pub(crate) fn ensure_stream_eof<R: Read>(input: &mut R) -> io::Result<()> {

@@ -49,7 +49,7 @@ flowchart LR
 | `src/identity.rs` | 신원 시드 생성, 접속 코드(AD1/AD2) 복원, 서명 키·저장 키 유도, 신원 교체 시 데이터 복사 |
 | `src/channel.rs` | Noise XX 핸드셰이크, 신원 증명, 지문 확인, 세션 프레임 순번·재정렬 창 |
 | `src/relay.rs` | 초대 코드, Nostr 이벤트 송수신, 랑데부, wss/TLS, SOCKS5 |
-| `src/history.rs` | 대화별 암호화 로그, 인덱스, 검색·삭제, 백업(ADBACK/ADPACK), 복원 병합 |
+| `src/history/` | 대화 저장. `log`(ADLOG3 로그·리더·append/replace), `index`(인덱스·잠금), `conversations`(목록·페이지·삭제), `staging`(복원 병합·정렬), `backup/{legacy,stream,bundle}`(ADBACK/ADPACK), `wire`(서명·전송 프레임), `linked_keys`, `transfer_workspace`, `paths`(데이터 위치) |
 | `src/contacts.rs` | 사용자가 확인한 상대 관계의 암호화 저장 |
 | `web/` | 프레임워크 없는 UI. 자세한 내용은 [frontend.md](frontend.md) |
 
@@ -133,5 +133,5 @@ flowchart TB
 
 ## 5. 알려진 구조적 한계
 
-- `history.rs`가 1만 줄 가까이 커서 분리가 필요합니다. `chat_worker.rs`의 `spawn_chat_worker`는 하나의 긴 함수로 남아 있습니다.
+- `chat_worker.rs`의 `spawn_chat_worker`는 약 1,500줄짜리 하나의 함수로 남아 있습니다. `history/tests.rs`(약 3,900줄)와 `send_tests.rs`(약 2,800줄)도 큽니다.
 - 보안 한계의 전체 목록은 [SECURITY.md](../SECURITY.md#known-weaknesses)에 있습니다.
