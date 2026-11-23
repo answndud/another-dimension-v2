@@ -45,6 +45,7 @@ mod tests {
             ("identity.rs", include_str!("identity.rs")),
             ("contacts.rs", include_str!("contacts.rs")),
             ("session.rs", include_str!("session.rs")),
+            ("anchor.rs", include_str!("anchor.rs")),
         ] {
             assert!(
                 !source.contains(device),

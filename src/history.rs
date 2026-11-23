@@ -32,6 +32,7 @@ const NONCE_BYTES: usize = 12;
 // conversation files (ADIDX1). ADIDX2 uses a key of its own; ADIDX1 is still read.
 const INDEX_MAGIC: &[u8; 8] = b"ADIDX1\0\0";
 const INDEX_MAGIC_V2: &[u8; 8] = b"ADIDX2\0\0";
+const LOG_AEAD_LABEL: &[u8] = b"another-dimension-v2/history-log-aead/v3";
 const INDEX_AEAD_LABEL: &[u8] = b"another-dimension-v2/history-index-aead/v2";
 const BACKUP_MAGIC: &[u8; 8] = b"ADBACK1\0";
 const BACKUP_PASSWORD_MAGIC: &[u8; 8] = b"ADBACK2\0";
@@ -223,6 +224,16 @@ impl LogFormat {
     }
 }
 
+/// The key that encrypts the records of a log. ADLOG3 uses a key of its own, derived
+/// from the storage key, so the storage key itself no longer encrypts record data;
+/// ADLOG1 and ADLOG2 used the storage key directly and are still read that way.
+fn record_key(format: &LogFormat, storage_key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    match format {
+        LogFormat::V3 { .. } => crate::identity::purpose_key(storage_key, LOG_AEAD_LABEL),
+        LogFormat::V1 | LogFormat::V2 => Zeroizing::new(*storage_key),
+    }
+}
+
 /// Reads the header of a log whose cursor is at offset 0, leaving the cursor after it.
 fn read_log_header(file: &mut File) -> io::Result<LogFormat> {
     let mut magic = [0; 8];
@@ -286,7 +297,21 @@ pub struct History {
     next_index: u64,
     file_version: HistoryFileVersion,
     format: LogFormat,
+    integrity_warning: Option<IntegrityWarning>,
     operation_lock: Arc<Mutex<()>>,
+}
+
+/// What opening a conversation found when it compared the log with the state this
+/// program last recorded for it. The conversation still opens, and the state is
+/// recorded again, so each finding is reported once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntegrityWarning {
+    /// The log holds fewer records than were written: its end may have been cut off.
+    Truncated { recorded: u64, found: u64 },
+    /// The log is not a version this program wrote: an older copy may have been put back.
+    UnknownGeneration,
+    /// The record of the log's state could not be read.
+    AnchorUnreadable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -621,7 +646,8 @@ impl HistoryReader {
         let mut record = vec![0; length];
         self.file.read_exact(&mut record)?;
         let (nonce, encrypted) = record.split_at(NONCE_BYTES);
-        let cipher = ChaCha20Poly1305::new_from_slice(self.key.as_ref())
+        let record_key = record_key(&self.format, &self.key);
+        let cipher = ChaCha20Poly1305::new_from_slice(record_key.as_ref())
             .map_err(|_| invalid_data("invalid history key"))?;
         let plain = Zeroizing::new(
             cipher
@@ -972,7 +998,7 @@ impl History {
         set_private_file(&file)?;
         let file_version = history_file_version(&file)?;
         register_conversation(identity, &identity_id, &peer_id, &directory)?;
-        let history = Self {
+        let mut history = Self {
             file,
             path,
             key,
@@ -981,8 +1007,10 @@ impl History {
             next_index: count as u64,
             file_version,
             format,
+            integrity_warning: None,
             operation_lock: Arc::clone(&operation_lock),
         };
+        history.check_anchor();
         unlock_conversation_file(file_lock);
         drop(operation_guard);
         Ok((history, count, recovered_partial))
@@ -1104,8 +1132,10 @@ impl History {
             next_index,
             file_version,
             format,
+            integrity_warning: None,
             operation_lock: Arc::clone(&operation_lock),
         };
+        history.check_anchor();
         unlock_conversation_file(file_lock);
         drop(operation_guard);
         if format.needs_migration() {
@@ -1175,8 +1205,109 @@ impl History {
             next_index,
             file_version,
             format,
+            integrity_warning: None,
             operation_lock,
         })
+    }
+
+    fn directory(&self) -> &std::path::Path {
+        self.path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+    }
+
+    fn generation(&self) -> Option<[u8; GENERATION_BYTES]> {
+        match self.format {
+            LogFormat::V3 { generation } => Some(generation),
+            LogFormat::V1 | LogFormat::V2 => None,
+        }
+    }
+
+    /// Records the log's current generation and length. The log is already durable, so
+    /// a failure here leaves the anchor behind the log, which is the safe direction.
+    fn record_anchor(&self) {
+        let Some(generation) = self.generation() else {
+            return;
+        };
+        let anchor = crate::anchor::Anchor {
+            generation,
+            records: self.next_index,
+            pending: None,
+        };
+        if let Err(error) = crate::anchor::store(
+            &self.key,
+            &self.identity_id,
+            self.directory(),
+            &self.peer_id,
+            Some(anchor),
+        ) {
+            eprintln!("대화 기록 상태를 저장하지 못했습니다: {error}");
+        }
+    }
+
+    /// Records the generation a replacement is about to install, before the rename, so a
+    /// crash right after it is not mistaken for tampering.
+    fn announce_replacement(&self, next: &LogFormat) -> io::Result<()> {
+        let LogFormat::V3 { generation } = next else {
+            return Ok(());
+        };
+        let current = match crate::anchor::load(
+            &self.key,
+            &self.identity_id,
+            self.directory(),
+            &self.peer_id,
+        ) {
+            Ok(current) => current,
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => None,
+            Err(error) => return Err(error),
+        };
+        let anchor = crate::anchor::Anchor {
+            generation: current.map_or(
+                self.generation().unwrap_or([0; GENERATION_BYTES]),
+                |anchor| anchor.generation,
+            ),
+            records: current.map_or(0, |anchor| anchor.records),
+            pending: Some(*generation),
+        };
+        crate::anchor::store(
+            &self.key,
+            &self.identity_id,
+            self.directory(),
+            &self.peer_id,
+            Some(anchor),
+        )
+    }
+
+    /// Compares the log that was just opened with the recorded state, remembers any
+    /// finding, and records the log's state from now on.
+    fn check_anchor(&mut self) {
+        let loaded = crate::anchor::load(
+            &self.key,
+            &self.identity_id,
+            self.directory(),
+            &self.peer_id,
+        );
+        self.integrity_warning = match (&loaded, self.generation()) {
+            (Err(_), _) => Some(IntegrityWarning::AnchorUnreadable),
+            // A log of an older format cannot have been the one this program anchored.
+            (Ok(anchor), None) => anchor.map(|_| IntegrityWarning::UnknownGeneration),
+            (Ok(anchor), Some(generation)) => {
+                match crate::anchor::verify(anchor.as_ref(), generation, self.next_index) {
+                    crate::anchor::Verdict::Unanchored | crate::anchor::Verdict::Consistent => None,
+                    crate::anchor::Verdict::Truncated { recorded, found } => {
+                        Some(IntegrityWarning::Truncated { recorded, found })
+                    }
+                    crate::anchor::Verdict::UnknownGeneration => {
+                        Some(IntegrityWarning::UnknownGeneration)
+                    }
+                }
+            }
+        };
+        self.record_anchor();
+    }
+
+    pub(crate) fn integrity_warning(&self) -> Option<IntegrityWarning> {
+        self.integrity_warning
     }
 
     pub fn append(&mut self, message: &StoredMessage) -> io::Result<()> {
@@ -1206,6 +1337,7 @@ impl History {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("history record limit reached"))?;
         self.file_version = history_file_version(&self.file)?;
+        self.record_anchor();
         unlock_conversation_file(file_lock);
         Ok(())
     }
@@ -1253,12 +1385,14 @@ impl History {
                 file.write_all(&record)?;
             }
             file.sync_all()?;
+            self.announce_replacement(&format)?;
             crate::fsutil::rename_durable(&temporary, &self.path)?;
             let file_version = history_file_version(&file)?;
             self.file = file;
             self.next_index = messages.len() as u64;
             self.file_version = file_version;
             self.format = format;
+            self.record_anchor();
             Ok(())
         })();
         if result.is_err() {
@@ -1343,11 +1477,13 @@ impl History {
                 return Err(io::Error::other("injected history delete replace failure"));
             }
             let file_version = history_file_version(&output)?;
+            self.announce_replacement(&format)?;
             crate::fsutil::rename_durable(&temporary, &self.path)?;
             self.file_version = file_version;
             self.file = output;
             self.next_index = next_index;
             self.format = format;
+            self.record_anchor();
             Ok(summary)
         })();
         if let (Err(error), true) = (&result, temporary.exists()) {
@@ -1587,6 +1723,7 @@ impl History {
                     "injected restore atomic replacement failure",
                 ));
             }
+            self.announce_replacement(&final_format)?;
             crate::fsutil::rename_durable(&temporary, &self.path)?;
             final_temp = None;
             let file_version = history_file_version(&append_file)?;
@@ -1594,6 +1731,7 @@ impl History {
             self.next_index = total_count;
             self.file_version = file_version;
             self.format = final_format;
+            self.record_anchor();
             Ok(RestoreMergeSummary {
                 total_count,
                 imported_count,
@@ -1825,6 +1963,7 @@ impl History {
                 next_index: 0,
                 file_version: version,
                 format,
+                integrity_warning: None,
                 operation_lock: Arc::clone(&operation_lock),
             };
             history.replace_filtered_unlocked(&mut reader, keep, validate)
@@ -1918,6 +2057,9 @@ impl History {
             // The index update is the logical delete. A leftover encrypted
             // tombstone must not make callers believe the operation rolled back.
             let _ = std::fs::remove_file(tombstone);
+        }
+        if let Err(error) = crate::anchor::store(&key, &identity_id, &directory, &peer_id, None) {
+            eprintln!("대화 기록 상태를 지우지 못했습니다: {error}");
         }
         Ok(())
     }
@@ -4910,7 +5052,8 @@ fn encode_record(
         None => plain.push(0),
     }
     let nonce_bytes = random_nonce()?;
-    let cipher = ChaCha20Poly1305::new_from_slice(key)
+    let record_key = record_key(format, key);
+    let cipher = ChaCha20Poly1305::new_from_slice(record_key.as_ref())
         .map_err(|_| io::Error::other("history key unavailable"))?;
     let encrypted = cipher
         .encrypt(
@@ -5073,7 +5216,8 @@ fn read_records(
 ) -> io::Result<(Vec<StoredMessage>, u64, bool, LogFormat)> {
     let format = read_log_header(file)?;
     let legacy_format = format.is_legacy();
-    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
+    let record_key = record_key(&format, &key);
+    let cipher = ChaCha20Poly1305::new_from_slice(record_key.as_ref())
         .map_err(|_| invalid_data("invalid history key"))?;
     let mut messages = Vec::new();
     let mut index = 0_u64;
@@ -7611,6 +7755,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn adlog3_records_use_their_own_key_not_the_storage_key() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "78".repeat(32);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history.append(&message(1, "secret")).unwrap();
+        let bytes = std::fs::read(conversation_path(&identity, &peer)).unwrap();
+        let (header, records) = records_of(&bytes);
+        let record = &bytes[records[0].clone()][4..];
+        let (nonce, encrypted) = record.split_at(super::NONCE_BYTES);
+        let generation: [u8; 16] = bytes[8..header].try_into().unwrap();
+        let aad = super::associated_data(
+            &identity.public_id(),
+            &peer,
+            0,
+            &super::LogFormat::V3 { generation },
+        );
+        let try_key = |key: &[u8; 32]| {
+            ChaCha20Poly1305::new_from_slice(key)
+                .unwrap()
+                .decrypt(
+                    Nonce::from_slice(nonce),
+                    Payload {
+                        msg: encrypted,
+                        aad: &aad,
+                    },
+                )
+                .is_ok()
+        };
+        assert!(
+            !try_key(&identity.storage_key()),
+            "the storage key must not decrypt it"
+        );
+        assert!(try_key(&super::record_key(
+            &super::LogFormat::V3 { generation },
+            &identity.storage_key()
+        )));
+    }
+
+    #[test]
     fn an_adlog2_log_still_opens_and_is_rewritten_as_adlog3() {
         let _data = IsolatedData::new();
         let (identity, _) = Identity::create().unwrap();
@@ -7681,6 +7865,176 @@ pub(crate) mod tests {
         history.append(&message(1, "after")).unwrap();
         drop(history);
         assert_eq!(History::open(&identity, &peer).unwrap().1.len(), 1);
+    }
+
+    fn warning_on_open(identity: &Identity, peer: &str) -> Option<super::IntegrityWarning> {
+        let (history, _, _) = History::open_for_chat(identity, peer).unwrap();
+        history.integrity_warning()
+    }
+
+    fn append_messages(identity: &Identity, peer: &str, count: u64) {
+        let (mut history, _, _) = History::open_for_chat(identity, peer).unwrap();
+        for index in 0..count {
+            history.append(&message(index, "text")).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_log_cut_at_a_record_boundary_is_reported_once() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "81".repeat(32);
+        append_messages(&identity, &peer, 3);
+        let path = conversation_path(&identity, &peer);
+        let bytes = std::fs::read(&path).unwrap();
+        let (_, records) = records_of(&bytes);
+        // Every remaining record still authenticates, so only the anchor can notice.
+        std::fs::write(&path, &bytes[..records[1].end]).unwrap();
+        assert_eq!(
+            warning_on_open(&identity, &peer),
+            Some(super::IntegrityWarning::Truncated {
+                recorded: 3,
+                found: 2
+            })
+        );
+        assert_eq!(warning_on_open(&identity, &peer), None, "reported once");
+    }
+
+    #[test]
+    fn an_older_copy_of_the_log_is_reported_after_a_replace() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "82".repeat(32);
+        append_messages(&identity, &peer, 4);
+        let path = conversation_path(&identity, &peer);
+        let old_copy = std::fs::read(&path).unwrap();
+        History::delete_time_range(&identity, &peer, 0, 1).unwrap();
+        assert_eq!(warning_on_open(&identity, &peer), None);
+        // The deleted messages come back with an old file: valid records, wrong generation.
+        std::fs::write(&path, &old_copy).unwrap();
+        assert_eq!(
+            warning_on_open(&identity, &peer),
+            Some(super::IntegrityWarning::UnknownGeneration)
+        );
+    }
+
+    #[test]
+    fn ordinary_use_never_raises_the_warning() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "83".repeat(32);
+        assert_eq!(
+            warning_on_open(&identity, &peer),
+            None,
+            "a new conversation"
+        );
+        append_messages(&identity, &peer, 5);
+        assert_eq!(warning_on_open(&identity, &peer), None, "after appends");
+        // Deleting makes the log shorter on purpose.
+        History::delete_time_range(&identity, &peer, 0, 3).unwrap();
+        assert_eq!(warning_on_open(&identity, &peer), None, "after a delete");
+        let (mut history, _, _) = History::open_for_chat(&identity, &peer).unwrap();
+        history.replace(&[message(1, "only")]).unwrap();
+        drop(history);
+        assert_eq!(warning_on_open(&identity, &peer), None, "after a replace");
+        append_messages(&identity, &peer, 2);
+        assert_eq!(warning_on_open(&identity, &peer), None);
+    }
+
+    #[test]
+    fn a_conversation_from_before_anchors_existed_is_adopted_without_a_warning() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "84".repeat(32);
+        append_messages(&identity, &peer, 3);
+        let path = conversation_path(&identity, &peer);
+        let directory = path.parent().unwrap().to_owned();
+        std::fs::remove_file(directory.join("conversations.anchor")).unwrap();
+        assert_eq!(warning_on_open(&identity, &peer), None);
+        assert!(directory.join("conversations.anchor").exists());
+    }
+
+    #[test]
+    fn crashes_between_the_steps_of_a_write_are_not_mistaken_for_tampering() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "85".repeat(32);
+        append_messages(&identity, &peer, 3);
+        let path = conversation_path(&identity, &peer);
+        let directory = path.parent().unwrap().to_owned();
+        let key = identity.storage_key();
+        let id = identity.public_id();
+        let generation = |path: &PathBuf| -> [u8; 16] {
+            std::fs::read(path).unwrap()[8..24].try_into().unwrap()
+        };
+        let current = generation(&path);
+        let store = |anchor| {
+            crate::anchor::store(&key, &id, &directory, &peer, Some(anchor)).unwrap();
+        };
+        // An append reached the log but not the anchor: the anchor is behind.
+        store(crate::anchor::Anchor {
+            generation: current,
+            records: 1,
+            pending: None,
+        });
+        assert_eq!(warning_on_open(&identity, &peer), None);
+        // A replacement announced itself and stopped before the rename.
+        store(crate::anchor::Anchor {
+            generation: current,
+            records: 3,
+            pending: Some([9; 16]),
+        });
+        assert_eq!(warning_on_open(&identity, &peer), None);
+        // A replacement renamed the file and stopped before the final update.
+        store(crate::anchor::Anchor {
+            generation: [7; 16],
+            records: 8,
+            pending: Some(current),
+        });
+        assert_eq!(warning_on_open(&identity, &peer), None);
+    }
+
+    #[test]
+    fn an_unreadable_anchor_is_reported_and_then_replaced() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "86".repeat(32);
+        append_messages(&identity, &peer, 2);
+        let directory = conversation_path(&identity, &peer)
+            .parent()
+            .unwrap()
+            .to_owned();
+        std::fs::write(directory.join("conversations.anchor"), b"not an anchor").unwrap();
+        assert_eq!(
+            warning_on_open(&identity, &peer),
+            Some(super::IntegrityWarning::AnchorUnreadable)
+        );
+        assert_eq!(warning_on_open(&identity, &peer), None);
+    }
+
+    #[test]
+    fn deleting_a_conversation_forgets_its_anchor() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "87".repeat(32);
+        append_messages(&identity, &peer, 2);
+        let directory = conversation_path(&identity, &peer)
+            .parent()
+            .unwrap()
+            .to_owned();
+        let key = identity.storage_key();
+        let id = identity.public_id();
+        assert!(crate::anchor::load(&key, &id, &directory, &peer)
+            .unwrap()
+            .is_some());
+        History::delete_conversation(&identity, &peer).unwrap();
+        assert_eq!(
+            crate::anchor::load(&key, &id, &directory, &peer).unwrap(),
+            None
+        );
+        // A new conversation with the same peer starts clean.
+        append_messages(&identity, &peer, 1);
+        assert_eq!(warning_on_open(&identity, &peer), None);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+mod anchor;
 pub mod channel;
 mod contacts;
 mod fsutil;
@@ -3844,8 +3845,10 @@ fn spawn_chat_worker(
                         Err(error) => (previous_identity_ids.clone(), Some(format!("이전 신원 연결 정보를 읽지 못했습니다. 재확인이 필요합니다: {error}"))),
                     };
                     let entries = Vec::new();
-                    let warning = link_error.or_else(|| recovered_partial
-                        .then(|| "대화 기록의 마지막 불완전 항목을 제거했습니다.".to_owned()));
+                    let warning = link_error
+                        .or_else(|| history.integrity_warning().map(history_integrity_message))
+                        .or_else(|| recovered_partial
+                            .then(|| "대화 기록의 마지막 불완전 항목을 제거했습니다.".to_owned()));
                     (Some(history), entries, message_count, warning, pending)
                 }
                 Err(_) => (None, Vec::new(), 0, Some("대화 기록을 열지 못했습니다. 이번 대화는 프로그램을 종료하면 사라질 수 있습니다.".to_owned()), previous_identity_ids.clone()),
@@ -5791,6 +5794,22 @@ fn read_request_head(
 /// Replaces absolute file system paths in an error text with `…/<file name>`. The
 /// directory layout of the user's machine does not belong in a response, while the
 /// file name is still enough to find a temporary file by hand.
+/// The notice shown when a conversation's log does not match what this program last
+/// recorded for it. It says what was seen and what it does not prove.
+fn history_integrity_message(warning: history::IntegrityWarning) -> String {
+    match warning {
+        history::IntegrityWarning::Truncated { recorded, found } => format!(
+            "대화 기록 파일이 마지막으로 저장한 상태보다 짧습니다({recorded}개였는데 {found}개). 마지막 메시지가 사라졌을 수 있습니다."
+        ),
+        history::IntegrityWarning::UnknownGeneration => {
+            "대화 기록 파일이 이 프로그램이 마지막으로 저장한 것과 다른 버전입니다. 이전 파일로 되돌려졌을 수 있습니다.".to_owned()
+        }
+        history::IntegrityWarning::AnchorUnreadable => {
+            "대화 기록의 상태 정보를 읽지 못해 되돌림 여부를 확인할 수 없습니다.".to_owned()
+        }
+    }
+}
+
 fn redact_paths(text: &str) -> String {
     text.split(' ')
         .map(|word| {

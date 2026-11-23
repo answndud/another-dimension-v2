@@ -19,6 +19,21 @@
 
 ## 기록
 
+## SF-019 로컬 대화 로그의 롤백·꼬리 절단을 알아차리지 못함
+
+- 날짜: 2026-11-23
+- 심각도: Medium
+- 위치: `src/history.rs`(`LogFormat`, `write_log_header`, `History::check_anchor`, `announce_replacement`, `record_anchor`), `src/anchor.rs`(새 파일), `src/main.rs`(경고 문구)
+- 발견: 로그 레코드의 AAD가 `ADLOG2 ‖ 신원 ‖ 상대 ‖ 순번`뿐이라, ① `replace`/삭제 뒤에도 같은 키와 같은 순번으로 인증되는 **이전 세대 레코드를 현재 파일에 끼워 넣을 수 있었고** ② 파일 꼬리를 레코드 경계에서 자르거나 이전 파일을 되돌려도 남은 레코드가 모두 인증되어 **알아차릴 방법이 없었습니다**.
+- 영향: 로그 파일 하나만 바꿀 수 있는 공격자(백업 동기화 서비스, 다른 사용자 계정의 도구 등)가 지운 메시지를 되살리거나 마지막 대화를 조용히 없앨 수 있었습니다.
+- 수정:
+  1. **ADLOG3**: 헤더에 무작위 16바이트 세대 id를 두고 모든 레코드의 AAD에 넣습니다. `replace`, 삭제, 복원 병합, 이전 형식 이전은 새 세대를 만듭니다. ADLOG1/2는 계속 읽고, 대화를 열 때 ADLOG3로 다시 씁니다. 헤더가 일부만 쓰이다 끊긴 경우는 다시 씁니다.
+  1-b. 레코드는 저장 키에서 용도별로 파생한 키(`history-log-aead`)로 암호화합니다(2.11에서 남겨 둔 마지막 항목). `adlog3_records_use_their_own_key_not_the_storage_key`가 저장 키로는 풀리지 않음을 확인하고, 파생을 빼면 실패합니다.
+  2. **앵커 파일** `conversations.anchor`: 각 대화의 (세대 id, 레코드 수, 설치 예정 세대)를 별도 용도 키로 암호화해 저장합니다. 로그가 디스크에 내려간 **뒤에** 갱신하므로 충돌 뒤에는 로그보다 뒤처질 수는 있어도 앞서지는 않습니다. 교체는 이름을 바꾸기 전에 새 세대를 `pending`으로 먼저 기록해, 이름 변경 직후 충돌을 변조로 오인하지 않습니다.
+  3. 열 때 비교해 ① 같은 세대인데 레코드가 적으면 "짧아짐", ② 설치된 적 없는 세대면 "다른 버전", ③ 앵커를 읽을 수 없으면 "상태 정보 읽기 실패"를 **한 번** 경고하고 현재 상태를 다시 기록합니다. 대화는 열립니다(경고만 하고 기록을 막지는 않습니다).
+- 회귀 테스트: `a_record_from_an_earlier_generation_does_not_authenticate_in_the_current_one`(AAD에서 세대를 빼면 실패), `a_log_cut_at_a_record_boundary_is_reported_once`, `an_older_copy_of_the_log_is_reported_after_a_replace`, `crashes_between_the_steps_of_a_write_are_not_mistaken_for_tampering`, `ordinary_use_never_raises_the_warning`(삭제로 짧아진 경우 포함), `a_conversation_from_before_anchors_existed_is_adopted_without_a_warning`, `an_unreadable_anchor_is_reported_and_then_replaced`, `deleting_a_conversation_forgets_its_anchor`, `an_adlog2_log_still_opens_and_is_rewritten_as_adlog3`, `a_header_cut_short_by_a_crash_is_rewritten`, 앵커 판정 단위 테스트. 변이 검사: 세대 AAD 제거, 추가 시 앵커 갱신 제거, `pending` 허용 제거, 길이 비교 제거가 각각 해당 테스트만 실패시키는 것을 확인했습니다.
+- 남은 한계: 데이터 디렉터리의 모든 파일을 함께 되돌리는 공격, 또는 앵커 파일을 지우고 로그를 자르는 공격은 단일 기기에서 막을 수 없습니다(신뢰할 카운터가 없음). 경고는 사라진 메시지를 복구하지 않습니다. 앵커는 메시지를 저장할 때마다 다시 쓰이므로 대화가 아주 많으면 비용이 늘어납니다(측정하지 않았습니다). 프로세스 사이의 앵커 파일 경쟁은 막지 않습니다(기존 인덱스와 같은 한계).
+
 ## SF-018 같은 쌍의 재연결이 항상 같은 relay 토픽과 키로 보임
 
 - 날짜: 2026-11-23

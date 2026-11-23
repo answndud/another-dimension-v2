@@ -268,6 +268,7 @@ mod tests {
             ("contacts.rs", include_str!("contacts.rs")),
             ("identity.rs", include_str!("identity.rs")),
             ("main.rs", include_str!("main.rs")),
+            ("anchor.rs", include_str!("anchor.rs")),
         ] {
             let problems = calls_outside_the_helpers(source);
             assert!(
