@@ -206,8 +206,17 @@ impl From<HandshakeError> for RelayError {
 #[derive(Debug, PartialEq, Eq)]
 pub enum RelayUpdate {
     Messages(Vec<Vec<u8>>),
-    Published { event_id: String },
-    PublishUnknown { event_id: String },
+    /// A hole in the sequence never filled, so the receiver moved past it. Relay events
+    /// are not retransmitted, which means `count` messages from the peer may be lost.
+    MessagesLost {
+        count: u64,
+    },
+    Published {
+        event_id: String,
+    },
+    PublishUnknown {
+        event_id: String,
+    },
     Ready,
 }
 
@@ -282,6 +291,8 @@ pub struct RelaySession {
     pending_publishes: HashMap<String, BTreeSet<usize>>,
     uncertain_publishes: BTreeSet<String>,
     publish_unknown: VecDeque<String>,
+    /// A loss report that follows messages that were just delivered.
+    pending_gap_update: Option<RelayUpdate>,
 }
 
 impl RelaySession {
@@ -361,6 +372,7 @@ impl RelaySession {
             pending_publishes: HashMap::new(),
             uncertain_publishes: BTreeSet::new(),
             publish_unknown: VecDeque::new(),
+            pending_gap_update: None,
         })
     }
 
@@ -401,6 +413,20 @@ impl RelaySession {
     pub fn poll(&mut self) -> Result<Option<RelayUpdate>, RelayError> {
         if let Some(event_id) = self.publish_unknown.pop_front() {
             return Ok(Some(RelayUpdate::PublishUnknown { event_id }));
+        }
+        // A hole is given up on by time, not by the arrival of more frames, so check it
+        // on every poll even when nothing new came in.
+        if let Some(update) = self.pending_gap_update.take() {
+            return Ok(Some(update));
+        }
+        let (messages, skipped) = self.transport.skip_expired_gap(Instant::now())?;
+        if skipped > 0 {
+            if !messages.is_empty() {
+                // Deliver what was held back first, and report the loss on the next poll.
+                self.pending_gap_update = Some(RelayUpdate::MessagesLost { count: skipped });
+                return Ok(Some(RelayUpdate::Messages(messages)));
+            }
+            return Ok(Some(RelayUpdate::MessagesLost { count: skipped }));
         }
         if self.relays.is_empty() {
             return Err(RelayError::Disconnected);
@@ -2291,6 +2317,98 @@ mod tests {
         assert!(rendezvous.relays.iter().any(|relay| relay.ready));
     }
 
+    /// Drains whatever a session has ready, so a test sees the updates in order.
+    fn poll_until_quiet(session: &mut super::RelaySession) -> Vec<RelayUpdate> {
+        let mut updates = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < deadline {
+            match session.poll().unwrap() {
+                Some(RelayUpdate::Ready) | None => {}
+                Some(update) => updates.push(update),
+            }
+        }
+        updates
+    }
+
+    #[test]
+    fn a_hole_that_never_fills_is_reported_as_lost_messages_after_the_delivered_ones() {
+        let network = FakeRelayNetwork::default();
+        let relay = "wss://gap.test".to_owned();
+        let (mut sender, mut receiver) =
+            fake_session_pair(network, vec![relay.clone()], vec![relay]);
+        // One message is sequenced but never published: it is lost in transit.
+        sender.transport.send(b"lost in transit").unwrap();
+        sender.send(b"after one").unwrap();
+        sender.send(b"after two").unwrap();
+
+        // Before the hole times out the receiver holds the two messages back.
+        let early = poll_until_quiet(&mut receiver);
+        assert!(
+            early.is_empty(),
+            "nothing is delivered across a hole yet: {early:?}"
+        );
+
+        // Pretend the hole has been open for the timeout. The receiver's clock is the real
+        // one, so move the recorded start of the hole back instead of waiting.
+        receiver
+            .transport
+            .age_gap_for_test(super::super::channel::GAP_TIMEOUT);
+        let updates = poll_until_quiet(&mut receiver);
+        let delivered: Vec<_> = updates
+            .iter()
+            .filter_map(|update| match update {
+                RelayUpdate::Messages(messages) => Some(messages.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            delivered,
+            vec![b"after one".to_vec(), b"after two".to_vec()]
+        );
+        let lost: Vec<_> = updates
+            .iter()
+            .filter_map(|update| match update {
+                RelayUpdate::MessagesLost { count } => Some(*count),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lost, vec![1], "exactly one message was lost: {updates:?}");
+        // The messages come first and the report follows, in that order.
+        assert!(matches!(updates.first(), Some(RelayUpdate::Messages(_))));
+        assert!(matches!(
+            updates.last(),
+            Some(RelayUpdate::MessagesLost { .. })
+        ));
+        // The report is made once, not on every later poll.
+        assert!(poll_until_quiet(&mut receiver).is_empty());
+    }
+
+    #[test]
+    fn a_gap_that_fills_in_time_reports_nothing_lost() {
+        let network = FakeRelayNetwork::default();
+        let relay = "wss://nogap.test".to_owned();
+        let (mut sender, mut receiver) =
+            fake_session_pair(network, vec![relay.clone()], vec![relay]);
+        for index in 0..5_u8 {
+            sender.send(&[index]).unwrap();
+        }
+        let updates = poll_until_quiet(&mut receiver);
+        assert!(updates
+            .iter()
+            .all(|update| !matches!(update, RelayUpdate::MessagesLost { .. })));
+        let delivered: Vec<u8> = updates
+            .iter()
+            .filter_map(|update| match update {
+                RelayUpdate::Messages(messages) => Some(messages.clone()),
+                _ => None,
+            })
+            .flatten()
+            .map(|message| message[0])
+            .collect();
+        assert_eq!(delivered, vec![0, 1, 2, 3, 4]);
+    }
+
     #[test]
     fn lost_publish_path_and_pending_limit_have_explicit_results_without_sequence_gaps() {
         let relay_a = "wss://publish-a.test".to_owned();
@@ -2316,6 +2434,9 @@ mod tests {
                     panic!("unexpected acceptance: {event_id}")
                 }
                 Err(RelayError::RelayRejected { event_id, .. }) => rejected = Some(event_id),
+                Ok(Some(RelayUpdate::MessagesLost { count })) => {
+                    panic!("a publish failure must not leave a gap, but {count} were lost")
+                }
                 Ok(Some(RelayUpdate::Messages(_))) | Ok(Some(RelayUpdate::Ready)) | Ok(None) => {}
                 Err(error) => panic!("unexpected relay failure: {error:?}"),
             }

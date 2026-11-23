@@ -19,6 +19,35 @@
 
 ## 기록
 
+## SF-016 메시지 하나가 유실되면 대화가 멈추고 결국 세션이 닫힘, 그리고 한 키로 모든 메시지를 보호
+
+- 날짜: 2026-11-23
+- 심각도: Medium (가용성), Low (키 수명)
+- 위치: `src/channel.rs`의 `SessionTransport`, `src/relay.rs`의 `RelaySession::poll`, `src/main.rs`의 채팅 워커, 프런트엔드의 시스템 항목 처리
+- 발견: 서브에이전트의 프로토콜 리뷰가 지적했고 **먼저 테스트로 재현했습니다.** relay 이벤트(kind 20000)는 휘발성이라 재전송되지 않습니다. 프레임 하나가 도착하지 않으면 `receive_sequence`가 그 자리에서 멈춰서, 그 뒤의 메시지는 한 개도 전달되지 않다가 32개가 쌓이면 `OutsideReorderWindow`로 세션이 닫혔습니다. 또한 한 세션의 모든 메시지가 키 하나로 보호되었습니다.
+- 영향: 네트워크가 잠깐 끊기거나 relay가 이벤트 하나를 놓치면 사용자에게는 "상대가 말이 없다"로 보이다가 연결이 끊겼습니다. 어떤 메시지가 사라졌는지 알 길이 없었습니다.
+- 수정(계획서의 안 A):
+  1. 순번에 구멍이 생기면 이후 프레임을 보관하고, 10초(`GAP_TIMEOUT`) 지나도 안 메워지면 구멍을 건너뜁니다. 건너뛰려면 Noise 수신 nonce를 옮겨야 하는데, `snow`의 `set_receiving_nonce`로 그렇게 합니다. 건너뛴 프레임은 나중에 도착해도 이미 지나간 nonce라 버려서 **같은 (키, nonce)가 두 번 쓰이지 않습니다.**
+  2. 건너뛰면 `RelayUpdate::MessagesLost`로 알리고, 앱은 대화 화면에 시스템 안내("상대가 보낸 메시지 N개가 도착하지 않았을 수 있습니다…")를 넣습니다. 이 안내는 연결의 일시적 사실이라 **기록에는 저장하지 않습니다.** 보관돼 있던 메시지를 먼저 전달하고 안내를 그다음에 한 번만 내보냅니다.
+  3. 각 방향은 1,000개마다 키를 갱신합니다(Noise Rekey). 어느 키를 쓸지는 순번으로만 정해져서 구멍을 건너뛰어도 양쪽이 일치합니다.
+  4. 프런트엔드는 "시스템 발신자" 판정을 한 함수로 모았고, 연결 안내의 접근성 레이블을 "연결 상태 안내"로 따로 둡니다(신원 변경 안내와 구분).
+- **조사 중 틀린 가정을 바로잡았습니다.** 처음에는 순번이 곧 Noise nonce라고 가정하고 `set_receiving_nonce(순번)`을 썼는데, 순서가 바뀐 프레임을 받는 기존 테스트가 `Noise(Decrypt)`로 깨졌습니다. 측정해 보니 세션이 시작될 때 Noise 수신 nonce는 **3**이었습니다(핸드셰이크 뒤 신원 증명, 공개, 확인 프레임이 각각 nonce를 씀). 따라서 순번 `n`의 프레임은 nonce `3 + n`으로 암호화됩니다. 이 오프셋은 프로토콜 단계 수에 따라 달라지므로 하드코딩하지 않고 세션 시작 시점의 수신 nonce를 기준(`receive_base_nonce`)으로 저장합니다.
+- 회귀 테스트:
+  - `a_lost_frame_stops_delivery_only_until_the_gap_times_out`, `a_skipped_frame_that_arrives_late_is_ignored_and_cannot_be_replayed`, `a_gap_that_fills_in_time_is_not_skipped_and_nothing_is_reported_lost`, `several_separate_losses_are_each_counted`.
+  - 키 갱신: `frames_keep_flowing_across_many_key_changes`, `a_hole_that_spans_a_key_change_is_crossed_with_the_right_key`, `the_real_key_change_interval_is_crossed_without_a_problem`(실제 간격 1,000을 넘겨 1,005개 송수신), `a_key_change_means_old_ciphertext_does_not_open_with_the_new_key`.
+  - 세션 수준: `a_hole_that_never_fills_is_reported_as_lost_messages_after_the_delivered_ones`(메시지가 먼저, 알림이 그다음에 한 번), `a_gap_that_fills_in_time_reports_nothing_lost`.
+  - 프런트엔드: 연결 안내가 시스템 항목처럼 보이고 접근성 레이블이 "연결 상태 안내"이며 서명 없음 표지가 붙지 않는다.
+  - nonce 기준을 잊게 하거나, 키 갱신을 한쪽이라도 빼거나, 시간 초과를 없애거나, 알림을 빼거나 순서를 바꾸면 각각 해당 테스트가 실패하는 것을 확인했습니다(변이 검사 7건, 프런트엔드 3건).
+- 이 작업에서 **테스트 환경의 빈틈도 하나 메웠습니다.** 가짜 DOM의 `setAttribute`가 아무것도 저장하지 않는 빈 함수여서 지금까지 어떤 테스트도 `aria-label`을 검증하지 못했습니다. 속성을 저장하고 읽게 만들어 기존 테스트 137개가 그대로 통과함을 확인한 뒤, 접근성 레이블 테스트를 추가했습니다.
+- 남은 한계:
+  - **유실된 메시지는 복구되지 않습니다.** 재전송이나 수신 확인(안 B)은 만들지 않았습니다. 사용자에게 알릴 뿐이고, 보낸 사람은 상대가 놓쳤다는 것을 알 수 없습니다.
+  - 건너뛸 수 있는 구멍은 32프레임까지입니다. 그보다 크게 건너뛴 프레임이 오면 여전히 세션이 닫힙니다.
+  - 10초라는 시간과 1,000개라는 간격은 제가 정한 값입니다(`GAP_TIMEOUT`, `REKEY_INTERVAL`).
+  - **실제 relay에서의 유실은 확인하지 못했습니다.** 가짜 relay로 프레임 하나를 발행하지 않는 방식으로 재현했을 뿐입니다.
+  - 유실 안내의 문구와 위치(대화 목록 안)는 화면에서 직접 보지 못했고 JS 테스트까지만 확인했습니다.
+  - 키 갱신으로 순방향 비밀성이 생기는 것은 아닙니다. 새 키는 이전 키에서 유도되므로, 키 하나가 유출되면 이후 키는 계산할 수 있습니다. 한 키가 보호하는 메시지 수를 줄이는 효과뿐입니다.
+  - 상대가 키 갱신을 하지 않는 이전 판이었다면 맞지 않겠지만, 이 판(v3)은 아직 한 번도 배포되지 않았으므로 호환성 문제는 없습니다.
+
 ## SF-015 Tor 모드에서 모든 relay 연결이 같은 회로를 공유할 수 있었음
 
 - 날짜: 2026-11-23

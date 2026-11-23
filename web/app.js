@@ -828,7 +828,7 @@ function renderHistoryMessages() {
   for (const item of selectedHistoryMessages) {
     if (query && !item.text.toLocaleLowerCase().includes(query)) continue;
     const card = document.createElement('article');
-    card.className = `entry${item.sender === '나' ? ' mine' : ''}${item.sender === '신원 변경' ? ' system' : ''}`;
+    card.className = `entry${item.sender === '나' ? ' mine' : ''}${isSystemSender(item.sender) ? ' system' : ''}`;
     const selection = document.createElement('label');
     selection.className = 'message-select';
     const checkbox = document.createElement('input');
@@ -846,7 +846,7 @@ function renderHistoryMessages() {
     const body = document.createElement('div');
     appendMessageBody(body, item.text);
     card.append(selection, time);
-    if (item.signed === false && item.sender !== '신원 변경') {
+    if (item.signed === false && !isSystemSender(item.sender)) {
       const unsigned = document.createElement('small');
       unsigned.className = 'unsigned-note';
       unsigned.textContent = '서명 없음 · 미검증';
@@ -938,6 +938,17 @@ function stopPolling() {
   pollTimer = null;
 }
 
+// Entries that describe the conversation or the connection itself, not something a person
+// wrote. They are shown apart from messages and are never marked signed or unsigned.
+const systemSenders = {
+  '신원 변경': '신원 변경 안내',
+  '시스템': '연결 상태 안내',
+};
+
+function isSystemSender(sender) {
+  return Object.prototype.hasOwnProperty.call(systemSenders, sender);
+}
+
 function formatTime(seconds) {
   const date = new Date(seconds * 1000);
   const pad = (value) => String(value).padStart(2, '0');
@@ -982,7 +993,7 @@ function appendMessages(items) {
     const timestamp = Number.isFinite(item.time) ? new Date(item.time * 1000) : null;
     const validTimestamp = timestamp && Number.isFinite(timestamp.getTime());
     const localDate = validTimestamp ? formatChatDate(timestamp) : null;
-    const isSystem = item.sender === '신원 변경';
+    const isSystem = isSystemSender(item.sender);
     if (localDate && lastRenderedMessageDate && localDate !== lastRenderedMessageDate) {
       const divider = document.createElement('div');
       divider.className = 'message-date-divider';
@@ -995,7 +1006,7 @@ function appendMessages(items) {
       && localDate === lastRenderedMessageDate
       && item.sender === lastRenderedMessageSender;
     card.className = `entry${item.sender === '나' ? ' mine' : ''}${isSystem ? ' system' : ''} ${continuation ? 'group-continuation' : 'group-start'}`;
-    card.setAttribute('aria-label', isSystem ? '신원 변경 안내' : item.sender === '나' ? '내가 보낸 메시지' : `${item.sender}가 보낸 메시지`);
+    card.setAttribute('aria-label', isSystem ? systemSenders[item.sender] : item.sender === '나' ? '내가 보낸 메시지' : `${item.sender}가 보낸 메시지`);
     if (validTimestamp) {
       const time = document.createElement('time');
       time.dateTime = timestamp.toISOString();

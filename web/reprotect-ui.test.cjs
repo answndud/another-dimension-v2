@@ -77,7 +77,7 @@ function createHarness(options = {}) {
         replaceChildren(...children) { this.children = children; },
         append(...children) { this.children.push(...children); },
         appendChild(child) { this.children.push(child); return child; },
-        focus() { this.focused = true; this.focusCalls = (this.focusCalls || 0) + 1; document.activeElement = this; }, click() {}, remove() {}, setAttribute() {},
+        focus() { this.focused = true; this.focusCalls = (this.focusCalls || 0) + 1; document.activeElement = this; }, click() {}, remove() {}, setAttribute(name, value) { (this.attributes ||= {})[name] = String(value); }, getAttribute(name) { return this.attributes && name in this.attributes ? this.attributes[name] : null; },
         requestSubmit() {
           this.requestSubmitCalls = (this.requestSubmitCalls || 0) + 1;
           if (this.listeners.submit) return this.listeners.submit({ preventDefault() {} });
@@ -3335,4 +3335,53 @@ test('a relay acceptance is never worded as the peer having received the message
   none.evaluate(snapshot({ pendingSends: 0 }));
   assert.equal(status(none), '');
   assert.equal(none.element('#delivery-status').hidden, true);
+});
+
+test('a lost-message notice looks and reads as a connection notice, not as a message from the peer', () => {
+  const h = createHarness();
+  const conversation = h.element('#conversation');
+  const when = new Date(2026, 0, 2, 12, 0, 0).getTime() / 1000;
+  h.evaluate(`updateChatView({ phase: 'connected', messageCount: 0, messageEpoch: 1 })`);
+  h.evaluate(`appendMessages([
+    { sender: '상대', time: ${when}, text: 'before the loss' },
+    { sender: '시스템', time: ${when + 1}, text: '상대가 보낸 메시지 2개가 도착하지 않았을 수 있습니다.' },
+    { sender: '상대', time: ${when + 2}, text: 'after the loss' },
+  ])`);
+  const [before, notice, after] = conversation.children;
+  assert.equal(notice.className, 'entry system group-start', 'it is styled as a system entry');
+  // Read aloud as a connection notice. It must not be announced as a peer message, nor
+  // as an identity change, which is what the other system sender says.
+  assert.equal(notice.getAttribute('aria-label'), '연결 상태 안내');
+  assert.notEqual(notice.getAttribute('aria-label'), '신원 변경 안내');
+  assert.match(before.getAttribute('aria-label'), /상대가 보낸 메시지/);
+  // A notice never joins a run of messages from the peer: the next message starts a new one.
+  assert.match(after.className, /group-start/);
+  assert.equal(h.evaluate('messageCursor'), 3, 'a notice is counted like any entry the server sends');
+});
+
+test('the identity-change notice keeps its own label and both are system senders', () => {
+  const h = createHarness();
+  const conversation = h.element('#conversation');
+  const when = new Date(2026, 0, 2, 12, 0, 0).getTime() / 1000;
+  h.evaluate(`updateChatView({ phase: 'connected', messageCount: 0, messageEpoch: 1 })`);
+  h.evaluate(`appendMessages([{ sender: '신원 변경', time: ${when}, text: 'identity changed' }])`);
+  assert.equal(conversation.children[0].getAttribute('aria-label'), '신원 변경 안내');
+  assert.equal(h.evaluate("isSystemSender('시스템')"), true);
+  assert.equal(h.evaluate("isSystemSender('신원 변경')"), true);
+  assert.equal(h.evaluate("isSystemSender('상대')"), false);
+  assert.equal(h.evaluate("isSystemSender('나')"), false);
+  // Object keys that exist on every object must not count as senders.
+  assert.equal(h.evaluate("isSystemSender('constructor')"), false);
+  assert.equal(h.evaluate("isSystemSender('toString')"), false);
+});
+
+test('a lost-message notice in the history list is not marked as unsigned', () => {
+  const h = createHarness();
+  h.evaluate(`selectedHistoryMessages = [
+    {index: 0, time: 1, sender: '시스템', text: 'notice', signed: false},
+    {index: 1, time: 2, sender: '상대', text: 'unsigned message', signed: false},
+  ]; renderHistoryMessages()`);
+  const cards = h.element('#history-messages').children.slice(0, 2);
+  const marks = cards.map((card) => card.children.filter((child) => child.className === 'unsigned-note').length);
+  assert.deepEqual(marks, [0, 1]);
 });

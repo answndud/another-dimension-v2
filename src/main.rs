@@ -587,6 +587,16 @@ fn send_history_sync_done(
         .map_err(|error| io::Error::other(format!("{error:?}")))
 }
 
+/// Sender of entries that describe the connection itself. The page shows them apart from
+/// messages and never counts them as signed or unsigned.
+const SYSTEM_SENDER: &str = "시스템";
+
+fn messages_lost_notice(count: u64) -> String {
+    format!(
+        "상대가 보낸 메시지 {count}개가 도착하지 않았을 수 있습니다. relay는 한 번 보낸 메시지를 다시 보내지 않아서 연결이 끊긴 사이의 메시지는 받을 수 없습니다. 상대에게 확인해 보세요."
+    )
+}
+
 fn chat_update(operation: &ChatOperation, update: impl FnOnce(&mut ChatSnapshot)) {
     if let Ok(mut snapshot) = operation.snapshot.lock() {
         update(&mut snapshot);
@@ -5187,6 +5197,18 @@ fn spawn_chat_worker(
                             );
                         });
                     }
+                }
+                Ok(Some(RelayUpdate::MessagesLost { count })) => {
+                    // This is a fact about the connection, not part of the conversation, so
+                    // it is shown in the chat but never written to the history.
+                    chat_update(&operation, |snapshot| {
+                        snapshot.message_count = snapshot.message_count.saturating_add(1);
+                        snapshot.messages.push(ChatEntry {
+                            unix_time: now_seconds(),
+                            sender: SYSTEM_SENDER,
+                            text: messages_lost_notice(count),
+                        });
+                    });
                 }
                 Ok(Some(RelayUpdate::Ready)) | Ok(None) => {}
                 Err(error) => {
