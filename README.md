@@ -36,7 +36,20 @@ cargo run --release
 
 의존성이 이미 로컬에 준비되어 있으면 `cargo run --offline`을 사용할 수 있습니다. 처음 빌드에는 Cargo 의존성 다운로드가 필요할 수 있습니다.
 
-macOS에서 실행하면 신원·대화 기록과 앱 설정은 이 저장소의 `chat-data/`에 저장됩니다. 이 폴더는 Git에서 제외됩니다. 기존에 `~/Library/Application Support/Another Dimension v2/`에 저장된 데이터는 자동으로 이동하지 않으므로, 이전 기록이 필요하면 기존 앱 데이터 위치를 보존해 주세요. 격리된 별도 데이터 위치가 필요할 때는 디버그 실행에서 `ANOTHER_DIMENSION_DATA_DIR`에 절대 경로를 지정할 수 있습니다.
+데이터(신원·대화 기록·앱 설정)는 암호화해 로컬에 저장하고, 시작할 때 터미널에 저장 위치를 표시합니다.
+
+| 빌드 | macOS 저장 위치 |
+|---|---|
+| 릴리스 (`cargo run --release`) | `~/Library/Application Support/Another Dimension v2/` |
+| 디버그 (`cargo run`) | 이 저장소의 `chat-data/` (Git에서 제외) |
+
+`ANOTHER_DIMENSION_DATA_DIR`에 절대 경로를 지정하면 두 빌드 모두 그 위치를 씁니다. 이 폴더는 심볼릭 링크가 아니어야 하고, `..`를 포함하지 않으며, 이미 있다면 내 소유에 `chmod 700`(다른 사용자 접근 불가)이어야 합니다. 조건에 맞지 않으면 권한을 바꾸지 않고 실행을 거부합니다. 없는 폴더는 비공개로 만듭니다.
+
+**이전에 저장소의 `chat-data/`를 쓰던 경우:** 릴리스 빌드는 이제 그 폴더를 읽지 않습니다. 데이터를 자동으로 옮기지는 않으며, 옛 위치에 데이터가 남아 있으면 시작할 때 경고합니다. 계속 그 위치를 쓰려면 폴더를 `chmod 700 chat-data` 한 뒤 아래처럼 실행하세요.
+
+```sh
+ANOTHER_DIMENSION_DATA_DIR="$PWD/chat-data" cargo run --release
+```
 
 터미널에 표시된 `http://127.0.0.1:포트/` 주소를 지원되는 Chromium 계열 브라우저에서 엽니다. 앱이 터미널에 발급한 일회용 로컬 연결 코드를 화면에 입력합니다. 이 연결 코드는 개인 접속 코드와 다릅니다. 새 신원은 화면에서 개인 접속 코드를 생성해 별도 안전한 곳에 저장한 뒤 로그인합니다. 연결 코드는 만료되거나 한 번 사용된 뒤 다시 쓸 수 없습니다.
 
@@ -87,7 +100,7 @@ node --check web/app.js
 node --test web/reprotect-ui.test.cjs
 ```
 
-`cargo test`는 약 10초 걸립니다. 64 MiB 초과 파일이나 10만 건 이상의 기록을 다루는 대용량 테스트 6개는 느려서(약 2~3분) 기본으로는 건너뛰며, `cargo test -- --ignored --skip live_relay`로 실행합니다. 이 테스트는 CI에서 주 1회 돌고, 같은 주기로 의존성 권고도 점검합니다. 실제 대화 데이터를 건드리지 않도록 테스트는 임시 디렉터리를 사용합니다. 앱을 직접 실행해 시험할 때는 디버그 빌드에서 `ANOTHER_DIMENSION_DATA_DIR`에 임시 절대 경로를 지정하세요.
+`cargo test`는 약 10초 걸립니다. 64 MiB 초과 파일이나 10만 건 이상의 기록을 다루는 대용량 테스트 6개는 느려서(약 2~3분) 기본으로는 건너뛰며, `cargo test -- --ignored --skip live_relay`로 실행합니다. 이 테스트는 CI에서 주 1회 돌고, 같은 주기로 의존성 권고도 점검합니다. 실제 대화 데이터를 건드리지 않도록 테스트는 임시 디렉터리를 사용합니다. 앱을 직접 실행해 시험할 때는 `ANOTHER_DIMENSION_DATA_DIR`에 임시 절대 경로(`chmod 700`)를 지정하세요.
 
 ## 라이선스
 

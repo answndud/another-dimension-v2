@@ -7526,6 +7526,23 @@ fn main() -> io::Result<()> {
             "실행 옵션은 지원하지 않습니다. 연결 모드는 앱 설정에서 선택하세요.",
         ));
     }
+    // Say where the data lives, and warn if an earlier run kept some elsewhere.
+    match history::data_directory() {
+        Ok(directory) => {
+            println!("데이터 위치: {}", directory.display());
+            if cfg!(target_os = "macos") {
+                if let Some(warning) =
+                    history::legacy_data_warning(&directory, &history::source_tree_data_directory())
+                {
+                    eprintln!("{warning}");
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("데이터 위치를 사용할 수 없습니다: {error}");
+            return Err(error);
+        }
+    }
     match history::History::cleanup_abandoned_backup_transfers() {
         Ok(removed) if removed > 0 => {
             eprintln!("이전 실행의 백업 전송 임시 파일 {removed}개 작업 공간을 정리했습니다.")

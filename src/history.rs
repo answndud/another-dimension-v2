@@ -5661,32 +5661,40 @@ fn random_nonce() -> io::Result<[u8; NONCE_BYTES]> {
     Ok(nonce)
 }
 
+/// Where the application keeps its data.
+///
+/// `ANOTHER_DIMENSION_DATA_DIR` overrides the default in every build, but only for a
+/// directory that is safe to put secrets in (see `checked_data_directory`). Otherwise
+/// a debug build on macOS uses `chat-data/` in the source tree, and every other build
+/// uses the per-user data location of the platform. A path is never taken from the
+/// machine the binary was built on.
 pub(crate) fn data_directory() -> io::Result<PathBuf> {
     #[cfg(test)]
     if let Some(path) = TEST_DATA_DIRECTORY.with(|directory| directory.borrow().clone()) {
         return Ok(path);
     }
-    #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os("ANOTHER_DIMENSION_DATA_DIR") {
-        let path = PathBuf::from(path);
-        if !path.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "data directory must be absolute",
-            ));
-        }
-        return Ok(path);
+        return checked_data_directory(PathBuf::from(path));
     }
+    default_data_directory()
+}
+
+fn default_data_directory() -> io::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("chat-data"))
+        macos_data_directory(
+            &home_dir()?,
+            cfg!(debug_assertions),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory is unavailable"))
     }
     #[cfg(target_os = "windows")]
     {
-        return std::env::var_os("APPDATA")
+        std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .map(|path| path.join("Another Dimension v2"))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "APPDATA is not set"));
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "APPDATA is not set"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -5695,6 +5703,97 @@ pub(crate) fn data_directory() -> io::Result<PathBuf> {
         }
         home_dir().map(|home| home.join(".local/share/another-dimension-v2"))
     }
+}
+
+/// The macOS location: the source tree in a debug build (convenient while developing),
+/// the per-user Application Support folder otherwise.
+#[cfg(any(target_os = "macos", test))]
+fn macos_data_directory(
+    home: &std::path::Path,
+    debug_build: bool,
+    manifest_directory: &std::path::Path,
+) -> Option<PathBuf> {
+    if debug_build {
+        Some(manifest_directory.join("chat-data"))
+    } else if home.as_os_str().is_empty() {
+        None
+    } else {
+        Some(home.join("Library/Application Support/Another Dimension v2"))
+    }
+}
+
+/// Accepts a data directory chosen by the user only if it is safe to keep secrets in:
+/// an absolute path without `..`, not a symbolic link, and, if it already exists, a
+/// directory owned by this user that nobody else can enter. Permissions are not
+/// changed here. Pointing the variable at a shared directory such as the home
+/// directory must fail, not quietly lock the user out of it.
+fn checked_data_directory(path: PathBuf) -> io::Result<PathBuf> {
+    let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_owned());
+    if !path.is_absolute() {
+        return Err(invalid("data directory must be absolute"));
+    }
+    if path
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(invalid("data directory must not contain '..'"));
+    }
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        // Not created yet: it will be created private.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(path),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(invalid("data directory must not be a symbolic link"));
+    }
+    if !metadata.is_dir() {
+        return Err(invalid("data directory exists but is not a directory"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(invalid("data directory must be owned by the current user"));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(invalid(
+                "data directory must not be accessible by other users (run chmod 700 on it)",
+            ));
+        }
+    }
+    Ok(path)
+}
+
+/// A message for the terminal when an earlier run kept data somewhere else: a release
+/// build no longer reads the source tree's `chat-data/`, so existing conversations
+/// there would otherwise seem to have disappeared. Nothing is moved automatically.
+pub(crate) fn legacy_data_warning(
+    current: &std::path::Path,
+    legacy: &std::path::Path,
+) -> Option<String> {
+    if current == legacy {
+        return None;
+    }
+    let has_data = std::fs::read_dir(legacy)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    has_data.then(|| {
+        format!(
+            "이전 위치에 대화 데이터가 있습니다: {legacy}\n\
+             이 실행은 다른 위치를 사용합니다: {current}\n\
+             이전 데이터를 계속 쓰려면 ANOTHER_DIMENSION_DATA_DIR={legacy} 를 지정해 실행하세요(그 폴더는 chmod 700 이어야 합니다).",
+            legacy = legacy.display(),
+            current = current.display(),
+        )
+    })
+}
+
+/// The source tree's `chat-data/` directory, where debug builds on macOS keep data and
+/// where earlier versions kept it for every build.
+pub(crate) fn source_tree_data_directory() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("chat-data")
 }
 
 #[cfg(test)]
@@ -5725,7 +5824,6 @@ fn wait_history_delete_test_gate() {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
 fn home_dir() -> io::Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -7842,6 +7940,88 @@ pub(crate) mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn macos_data_directory_depends_on_the_build_and_never_on_the_build_machine() {
+        let home = std::path::Path::new("/Users/someone");
+        let source = std::path::Path::new("/build/machine/another-dimension-v2");
+        // A debug build keeps data in the source tree, as before.
+        assert_eq!(
+            super::macos_data_directory(home, true, source).unwrap(),
+            std::path::Path::new("/build/machine/another-dimension-v2/chat-data")
+        );
+        // A release build uses the user's Application Support folder, so a binary
+        // built elsewhere does not write to the builder's directories.
+        let release = super::macos_data_directory(home, false, source).unwrap();
+        assert_eq!(
+            release,
+            std::path::Path::new("/Users/someone/Library/Application Support/Another Dimension v2")
+        );
+        assert!(!release.starts_with(source));
+        assert!(super::macos_data_directory(std::path::Path::new(""), false, source).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_user_chosen_data_directory_must_be_safe_for_secrets() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = IsolatedData::new();
+        let check = |path: &std::path::Path| super::checked_data_directory(path.to_owned());
+        let message = |path: &std::path::Path| check(path).unwrap_err().to_string();
+
+        // Shape of the path.
+        assert!(message(std::path::Path::new("relative/dir")).contains("absolute"));
+        assert!(message(&data.0.join("a").join("..").join("b")).contains(".."));
+        // Not created yet: fine, it will be created private.
+        let fresh = data.0.join("not-yet");
+        assert_eq!(check(&fresh).unwrap(), fresh);
+
+        // An owner-only directory is accepted.
+        let private = data.0.join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(check(&private).unwrap(), private);
+
+        // Group or world access is refused, and the permissions are left as they were.
+        for mode in [0o750, 0o755, 0o707, 0o777] {
+            std::fs::set_permissions(&private, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(message(&private).contains("chmod 700"), "{mode:o}");
+            let after = std::fs::metadata(&private).unwrap().permissions().mode() & 0o777;
+            assert_eq!(after, mode, "a rejected directory must not be modified");
+        }
+
+        // A symbolic link, even to a good directory, and a plain file are refused.
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = data.0.join("link");
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        assert!(message(&link).contains("symbolic link"));
+        let file = data.0.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(message(&file).contains("not a directory"));
+    }
+
+    #[test]
+    fn legacy_data_is_reported_but_never_moved() {
+        let data = IsolatedData::new();
+        let (legacy, current) = (data.0.join("legacy"), data.0.join("current"));
+        // Nothing there, or an empty directory, or the same place: no warning.
+        assert!(super::legacy_data_warning(&current, &legacy).is_none());
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert!(super::legacy_data_warning(&current, &legacy).is_none());
+        std::fs::write(legacy.join("conversation"), b"data").unwrap();
+        assert!(super::legacy_data_warning(&legacy, &legacy).is_none());
+
+        let warning = super::legacy_data_warning(&current, &legacy).unwrap();
+        assert!(warning.contains(&legacy.display().to_string()), "{warning}");
+        assert!(
+            warning.contains(&current.display().to_string()),
+            "{warning}"
+        );
+        assert!(warning.contains("ANOTHER_DIMENSION_DATA_DIR="), "{warning}");
+        // The warning only reports. The data stays where it was.
+        assert!(legacy.join("conversation").exists());
+        assert!(!current.exists());
     }
 
     #[test]
