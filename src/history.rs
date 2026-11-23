@@ -16,8 +16,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use zeroize::Zeroizing;
 
-const MAGIC: &[u8; 8] = b"ADLOG2\0\0";
+// The conversation log. ADLOG3 stores a random generation id right after the magic and
+// binds it into every record's associated data, so a record from an earlier version of
+// the file (before a replace or delete) does not authenticate in the current one.
+// ADLOG1 and ADLOG2 are still read, and are rewritten as ADLOG3 when a conversation
+// is opened for chat.
+const MAGIC: &[u8; 8] = b"ADLOG3\0\0";
+const PREVIOUS_MAGIC: &[u8; 8] = b"ADLOG2\0\0";
 const LEGACY_MAGIC: &[u8; 8] = b"ADLOG1\0\0";
+const GENERATION_BYTES: usize = 16;
+const HEADER_LEN: u64 = (MAGIC.len() + GENERATION_BYTES) as u64;
 const MAX_MESSAGE_BYTES: usize = 4096;
 const NONCE_BYTES: usize = 12;
 // Index files written before 2026-11 encrypted with the same key that names the
@@ -190,6 +198,85 @@ pub(crate) struct HistoryDeleteSummary {
     pub(crate) peak_record_bytes: usize,
 }
 
+/// Which on-disk version a conversation log is in. Only `V3` carries a generation id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogFormat {
+    V1,
+    V2,
+    V3 { generation: [u8; GENERATION_BYTES] },
+}
+
+impl LogFormat {
+    fn header_len(self) -> u64 {
+        match self {
+            Self::V1 | Self::V2 => MAGIC.len() as u64,
+            Self::V3 { .. } => HEADER_LEN,
+        }
+    }
+
+    fn is_legacy(self) -> bool {
+        self == Self::V1
+    }
+
+    fn needs_migration(self) -> bool {
+        !matches!(self, Self::V3 { .. })
+    }
+}
+
+/// Reads the header of a log whose cursor is at offset 0, leaving the cursor after it.
+fn read_log_header(file: &mut File) -> io::Result<LogFormat> {
+    let mut magic = [0; 8];
+    file.read_exact(&mut magic)?;
+    if &magic == LEGACY_MAGIC {
+        Ok(LogFormat::V1)
+    } else if &magic == PREVIOUS_MAGIC {
+        Ok(LogFormat::V2)
+    } else if &magic == MAGIC {
+        let mut generation = [0; GENERATION_BYTES];
+        file.read_exact(&mut generation)
+            .map_err(|_| invalid_data("history header is incomplete"))?;
+        Ok(LogFormat::V3 { generation })
+    } else {
+        Err(invalid_data("unsupported history format"))
+    }
+}
+
+/// Writes the header of a new log with a fresh generation id and returns its format.
+fn write_log_header(output: &mut impl Write) -> io::Result<LogFormat> {
+    let mut generation = [0; GENERATION_BYTES];
+    crate::random::fill(&mut generation)?;
+    output.write_all(MAGIC)?;
+    output.write_all(&generation)?;
+    Ok(LogFormat::V3 { generation })
+}
+
+/// Makes sure a log file that was just created or opened has a complete header: an empty
+/// file gets one, and a header cut short by a crash is rewritten. Returns whether a
+/// partial header was discarded.
+fn ensure_log_header(file: &mut File) -> io::Result<bool> {
+    let length = file.metadata()?.len();
+    let torn = if length == 0 {
+        false
+    } else if length < MAGIC.len() as u64 {
+        true
+    } else if length < HEADER_LEN {
+        file.seek(SeekFrom::Start(0))?;
+        let mut magic = [0; 8];
+        file.read_exact(&mut magic)?;
+        &magic == MAGIC
+    } else {
+        false
+    };
+    if length == 0 || torn {
+        if torn {
+            file.set_len(0)?;
+        }
+        write_log_header(file)?;
+        file.sync_data()?;
+    }
+    Ok(torn)
+}
+
 pub struct History {
     file: File,
     path: PathBuf,
@@ -198,6 +285,7 @@ pub struct History {
     peer_id: String,
     next_index: u64,
     file_version: HistoryFileVersion,
+    format: LogFormat,
     operation_lock: Arc<Mutex<()>>,
 }
 
@@ -243,7 +331,7 @@ pub(crate) struct HistoryReader {
     end: u64,
     valid_end: u64,
     truncated: bool,
-    legacy: bool,
+    format: LogFormat,
 }
 
 pub(crate) struct RestoreStaging {
@@ -486,14 +574,17 @@ impl HistoryReader {
             end: 0,
             valid_end: 0,
             truncated: false,
-            legacy: false,
+            format: LogFormat::V3 {
+                generation: [0; GENERATION_BYTES],
+            },
         }
     }
 
     pub(crate) fn rewind(&mut self) -> io::Result<()> {
-        self.file.seek(SeekFrom::Start(MAGIC.len() as u64))?;
+        let header_len = self.format.header_len();
+        self.file.seek(SeekFrom::Start(header_len))?;
         self.index = 0;
-        self.valid_end = MAGIC.len() as u64;
+        self.valid_end = header_len;
         self.truncated = false;
         Ok(())
     }
@@ -542,13 +633,13 @@ impl HistoryReader {
                             &self.identity_id,
                             &self.peer_id,
                             self.index,
-                            self.legacy,
+                            &self.format,
                         ),
                     },
                 )
                 .map_err(|_| invalid_data("history authentication failed"))?,
         );
-        let message = decode_history_plain(&plain, self.legacy)?;
+        let message = decode_history_plain(&plain, self.format.is_legacy())?;
         #[cfg(test)]
         TEST_DECRYPTED_RECORDS.with(|count| count.set(count.get() + 1));
         self.index = self
@@ -579,11 +670,9 @@ fn history_reader_from_file(
     if end < MAGIC.len() as u64 {
         return Err(invalid_data("history snapshot header is incomplete"));
     }
-    let mut magic = [0; 8];
-    file.read_exact(&mut magic)?;
-    let legacy = &magic == LEGACY_MAGIC;
-    if &magic != MAGIC && !legacy {
-        return Err(invalid_data("unsupported history format"));
+    let format = read_log_header(&mut file)?;
+    if end < format.header_len() {
+        return Err(invalid_data("history snapshot header is incomplete"));
     }
     Ok(HistoryReader {
         file,
@@ -592,9 +681,9 @@ fn history_reader_from_file(
         peer_id,
         index: 0,
         end,
-        valid_end: MAGIC.len() as u64,
+        valid_end: format.header_len(),
         truncated: false,
-        legacy,
+        format,
     })
 }
 
@@ -607,7 +696,7 @@ fn open_history_reader_from(
     index: u64,
 ) -> io::Result<HistoryReader> {
     let mut reader = open_history_reader(path, key, identity_id, peer_id)?;
-    if offset < MAGIC.len() as u64 || offset > reader.end {
+    if offset < reader.format.header_len() || offset > reader.end {
         return Err(invalid_data("invalid append refresh offset"));
     }
     reader.file.seek(SeekFrom::Start(offset))?;
@@ -616,7 +705,7 @@ fn open_history_reader_from(
     Ok(reader)
 }
 
-fn migrate_legacy_history_streaming(
+fn migrate_history_streaming(
     path: &std::path::Path,
     key: Zeroizing<[u8; 32]>,
     identity_id: &str,
@@ -637,7 +726,7 @@ fn migrate_legacy_history_streaming(
             .write(true)
             .open(&temporary)?;
         set_private_file(&output)?;
-        output.write_all(MAGIC)?;
+        let format = write_log_header(&mut output)?;
         let mut index = 0u64;
         let mut truncated = false;
         loop {
@@ -648,6 +737,7 @@ fn migrate_legacy_history_streaming(
                         identity_id,
                         peer_id,
                         index,
+                        &format,
                         &message,
                     )?)?;
                     index = index
@@ -834,33 +924,17 @@ impl History {
                 format!("indexed conversation file is missing: {}", path.display()),
             ));
         }
-        let mut recovered_partial = false;
         let mut file = crate::fsutil::private_options()
             .create(true)
             .read(true)
             .append(true)
             .open(&path)?;
         set_private_file(&file)?;
-        if file.metadata()?.len() < MAGIC.len() as u64 {
-            if file.metadata()?.len() > 0 {
-                file.set_len(0)?;
-                recovered_partial = true;
-            }
-            file.write_all(MAGIC)?;
-            file.sync_data()?;
-        }
+        let mut recovered_partial = ensure_log_header(&mut file)?;
         file.seek(SeekFrom::Start(0))?;
-        let mut magic = [0; 8];
-        file.read_exact(&mut magic)?;
-        if &magic == LEGACY_MAGIC {
-            recovered_partial |= migrate_legacy_history_streaming(
-                &path,
-                Zeroizing::new(*key),
-                &identity_id,
-                &peer_id,
-            )?;
-        } else if &magic != MAGIC {
-            return Err(invalid_data("unsupported history format"));
+        if read_log_header(&mut file)?.needs_migration() {
+            recovered_partial |=
+                migrate_history_streaming(&path, Zeroizing::new(*key), &identity_id, &peer_id)?;
         }
         let mut reader = open_history_reader(
             path.clone(),
@@ -868,6 +942,7 @@ impl History {
             identity_id.clone(),
             peer_id.clone(),
         )?;
+        let format = reader.format;
         let mut count = 0usize;
         loop {
             match reader.next_record() {
@@ -905,6 +980,7 @@ impl History {
             peer_id,
             next_index: count as u64,
             file_version,
+            format,
             operation_lock: Arc::clone(&operation_lock),
         };
         unlock_conversation_file(file_lock);
@@ -1007,24 +1083,9 @@ impl History {
             .open(&path)?;
         set_private_file(&file)?;
 
-        let mut recovered_header = false;
-        if file.metadata()?.len() < MAGIC.len() as u64 {
-            if file.metadata()?.len() > 0 {
-                file.set_len(0)?;
-                recovered_header = true;
-            }
-            file.write_all(MAGIC)?;
-            file.sync_data()?;
-        }
+        let recovered_header = ensure_log_header(&mut file)?;
         file.seek(SeekFrom::Start(0))?;
-        let mut file_magic = [0; MAGIC.len()];
-        file.read_exact(&mut file_magic)?;
-        let migrate_legacy = &file_magic == LEGACY_MAGIC;
-        if &file_magic != MAGIC && !migrate_legacy {
-            return Err(invalid_data("unsupported history format"));
-        }
-        file.seek(SeekFrom::Start(0))?;
-        let (messages, next_index, recovered_partial) = read_records(
+        let (messages, next_index, recovered_partial, format) = read_records(
             &mut file,
             Zeroizing::new(*key),
             &identity_id,
@@ -1042,11 +1103,12 @@ impl History {
             peer_id,
             next_index,
             file_version,
+            format,
             operation_lock: Arc::clone(&operation_lock),
         };
         unlock_conversation_file(file_lock);
         drop(operation_guard);
-        if migrate_legacy {
+        if format.needs_migration() {
             history.replace(&messages)?;
         }
         Ok((history, messages, recovered_header || recovered_partial))
@@ -1086,16 +1148,14 @@ impl History {
             .append(true)
             .open(&path)?;
         set_private_file(&file)?;
-        if file.metadata()?.len() == 0 {
-            file.write_all(MAGIC)?;
-            file.sync_data()?;
-        }
+        ensure_log_header(&mut file)?;
         let mut reader = open_history_reader(
             path.clone(),
             Zeroizing::new(*key),
             identity_id.clone(),
             peer_id.clone(),
         )?;
+        let format = reader.format;
         let mut next_index = 0u64;
         while reader.next_record()?.is_some() {
             next_index = next_index
@@ -1114,6 +1174,7 @@ impl History {
             peer_id,
             next_index,
             file_version,
+            format,
             operation_lock,
         })
     }
@@ -1135,6 +1196,7 @@ impl History {
             &self.identity_id,
             &self.peer_id,
             self.next_index,
+            &self.format,
             message,
         )?;
         self.file.write_all(&record)?;
@@ -1178,13 +1240,14 @@ impl History {
                 .append(true)
                 .open(&temporary)?;
             set_private_file(&file)?;
-            file.write_all(MAGIC)?;
+            let format = write_log_header(&mut file)?;
             for (index, message) in messages.iter().enumerate() {
                 let record = encode_record(
                     &self.key,
                     &self.identity_id,
                     &self.peer_id,
                     index as u64,
+                    &format,
                     message,
                 )?;
                 file.write_all(&record)?;
@@ -1195,6 +1258,7 @@ impl History {
             self.file = file;
             self.next_index = messages.len() as u64;
             self.file_version = file_version;
+            self.format = format;
             Ok(())
         })();
         if result.is_err() {
@@ -1227,7 +1291,7 @@ impl History {
                 .append(true)
                 .open(&temporary)?;
             set_private_file(&output)?;
-            output.write_all(MAGIC)?;
+            let format = write_log_header(&mut output)?;
             let mut summary = HistoryDeleteSummary::default();
             let mut next_index = 0_u64;
             while let Some(message) = reader.next_record()? {
@@ -1243,6 +1307,7 @@ impl History {
                         &self.identity_id,
                         &self.peer_id,
                         next_index,
+                        &format,
                         &message,
                     )?;
                     summary.peak_record_bytes = summary.peak_record_bytes.max(
@@ -1282,6 +1347,7 @@ impl History {
             self.file_version = file_version;
             self.file = output;
             self.next_index = next_index;
+            self.format = format;
             Ok(summary)
         })();
         if let (Err(error), true) = (&result, temporary.exists()) {
@@ -1314,6 +1380,7 @@ impl History {
             return Ok(());
         }
         let mut next_index = self.next_index;
+        let format;
         if same_file && current_version.length > self.file_version.length {
             let mut reader = open_history_reader_from(
                 self.path.clone(),
@@ -1328,6 +1395,7 @@ impl History {
                     .checked_add(1)
                     .ok_or_else(|| invalid_data("history record index overflow"))?;
             }
+            format = reader.format;
         } else {
             let mut reader = open_history_reader(
                 self.path.clone(),
@@ -1341,6 +1409,7 @@ impl History {
                     .checked_add(1)
                     .ok_or_else(|| invalid_data("history record index overflow"))?;
             }
+            format = reader.format;
         }
         let file = crate::fsutil::private_options()
             .read(true)
@@ -1349,6 +1418,7 @@ impl History {
         set_private_file(&file)?;
         self.file = file;
         self.next_index = next_index;
+        self.format = format;
         self.file_version = history_file_version(&self.file)?;
         Ok(())
     }
@@ -1499,7 +1569,7 @@ impl History {
                 filename.to_string_lossy()
             ));
             final_temp = Some(temporary.clone());
-            let total_count = merge_encrypted_runs(
+            let (total_count, final_format) = merge_encrypted_runs(
                 &runs,
                 &temporary,
                 &self.key,
@@ -1523,6 +1593,7 @@ impl History {
             self.file = append_file;
             self.next_index = total_count;
             self.file_version = file_version;
+            self.format = final_format;
             Ok(RestoreMergeSummary {
                 total_count,
                 imported_count,
@@ -1740,6 +1811,7 @@ impl History {
                 identity_id.clone(),
                 peer_id.clone(),
             )?;
+            let format = reader.format;
             let append_file = crate::fsutil::private_options()
                 .read(true)
                 .append(true)
@@ -1752,6 +1824,7 @@ impl History {
                 peer_id,
                 next_index: 0,
                 file_version: version,
+                format,
                 operation_lock: Arc::clone(&operation_lock),
             };
             history.replace_filtered_unlocked(&mut reader, keep, validate)
@@ -1781,7 +1854,7 @@ impl History {
             .map_err(|_| io::Error::other("conversation lock unavailable"))?;
         let file_lock = acquire_conversation_file_lock(identity, &peer_id)?;
         let mut file = File::open(path)?;
-        let (messages, _, recovered_partial) = read_records(
+        let (messages, _, recovered_partial, _) = read_records(
             &mut file,
             Zeroizing::new(*key),
             &identity_id,
@@ -4808,6 +4881,7 @@ fn encode_record(
     identity_id: &str,
     peer_id: &str,
     index: u64,
+    format: &LogFormat,
     message: &StoredMessage,
 ) -> io::Result<Vec<u8>> {
     let text = message.text.as_bytes();
@@ -4843,7 +4917,7 @@ fn encode_record(
             Nonce::from_slice(&nonce_bytes),
             Payload {
                 msg: &plain,
-                aad: &associated_data(identity_id, peer_id, index, false),
+                aad: &associated_data(identity_id, peer_id, index, format),
             },
         )
         .map_err(|_| io::Error::other("history encryption failed"))?;
@@ -4996,13 +5070,9 @@ fn read_records(
     identity_id: &str,
     peer_id: &str,
     repair_partial: bool,
-) -> io::Result<(Vec<StoredMessage>, u64, bool)> {
-    let mut magic = [0; MAGIC.len()];
-    file.read_exact(&mut magic)?;
-    let legacy_format = &magic == LEGACY_MAGIC;
-    if &magic != MAGIC && !legacy_format {
-        return Err(invalid_data("unsupported history format"));
-    }
+) -> io::Result<(Vec<StoredMessage>, u64, bool, LogFormat)> {
+    let format = read_log_header(file)?;
+    let legacy_format = format.is_legacy();
     let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
         .map_err(|_| invalid_data("invalid history key"))?;
     let mut messages = Vec::new();
@@ -5046,7 +5116,7 @@ fn read_records(
                     Nonce::from_slice(nonce_bytes),
                     Payload {
                         msg: encrypted,
-                        aad: &associated_data(identity_id, peer_id, index, legacy_format),
+                        aad: &associated_data(identity_id, peer_id, index, &format),
                     },
                 )
                 .map_err(|_| invalid_data("history authentication failed"))?,
@@ -5107,7 +5177,7 @@ fn read_records(
             .checked_add(1)
             .ok_or_else(|| invalid_data("history record limit reached"))?;
     }
-    Ok((messages, index, recovered_partial))
+    Ok((messages, index, recovered_partial, format))
 }
 
 fn decode_history_plain(plain: &[u8], legacy_format: bool) -> io::Result<StoredMessage> {
@@ -5504,13 +5574,14 @@ fn write_restore_sort_run(
         .write(true)
         .open(&path)?;
     set_private_file(&file)?;
-    file.write_all(MAGIC)?;
+    let format = write_log_header(&mut file)?;
     for (index, (_, message)) in items.drain(..).enumerate() {
         file.write_all(&encode_record(
             key,
             identity_id,
             peer_id,
             index as u64,
+            &format,
             &message,
         )?)?;
     }
@@ -5524,7 +5595,7 @@ fn merge_encrypted_runs(
     key: &[u8; 32],
     identity_id: &str,
     peer_id: &str,
-) -> io::Result<u64> {
+) -> io::Result<(u64, LogFormat)> {
     if input_paths.len() > RESTORE_MERGE_FAN_IN {
         return Err(invalid_data("too many restore sort inputs"));
     }
@@ -5554,7 +5625,7 @@ fn merge_encrypted_runs(
         .write(true)
         .open(output_path)?;
     set_private_file(&output)?;
-    output.write_all(MAGIC)?;
+    let format = write_log_header(&mut output)?;
     let mut output_index = 0u64;
     while let Some(Reverse((_, source))) = heap.pop() {
         let message = current[source]
@@ -5565,6 +5636,7 @@ fn merge_encrypted_runs(
             identity_id,
             peer_id,
             output_index,
+            &format,
             &message,
         )?)?;
         output_index = output_index
@@ -5580,7 +5652,7 @@ fn merge_encrypted_runs(
         }
     }
     output.sync_all()?;
-    Ok(output_index)
+    Ok((output_index, format))
 }
 
 fn add_restore_run_level(
@@ -5651,9 +5723,16 @@ fn push_restore_sort_item(
     Ok(())
 }
 
-fn associated_data(identity_id: &str, peer_id: &str, index: u64, legacy: bool) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(6 + 64 + 64 + 8);
-    aad.extend_from_slice(if legacy { b"ADLOG1" } else { b"ADLOG2" });
+fn associated_data(identity_id: &str, peer_id: &str, index: u64, format: &LogFormat) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(6 + GENERATION_BYTES + 64 + 64 + 8);
+    match format {
+        LogFormat::V1 => aad.extend_from_slice(b"ADLOG1"),
+        LogFormat::V2 => aad.extend_from_slice(b"ADLOG2"),
+        LogFormat::V3 { generation } => {
+            aad.extend_from_slice(b"ADLOG3");
+            aad.extend_from_slice(generation);
+        }
+    }
     aad.extend_from_slice(identity_id.as_bytes());
     aad.extend_from_slice(peer_id.as_bytes());
     aad.extend_from_slice(&index.to_be_bytes());
@@ -6379,13 +6458,14 @@ pub(crate) mod tests {
             .truncate(true)
             .open(&history.path)
             .unwrap();
-        file.write_all(super::MAGIC).unwrap();
+        let format = super::write_log_header(&mut file).unwrap();
         for index in 0..count {
             let record = super::encode_record(
                 &history.key,
                 &history.identity_id,
                 &history.peer_id,
                 index,
+                &format,
                 &message(index, text),
             )
             .unwrap();
@@ -6804,6 +6884,7 @@ pub(crate) mod tests {
                 &count_history.identity_id,
                 &count_history.peer_id,
                 index,
+                &count_history.format,
                 &item,
             )
             .unwrap();
@@ -6837,6 +6918,7 @@ pub(crate) mod tests {
                 &byte_history.identity_id,
                 &byte_history.peer_id,
                 index,
+                &byte_history.format,
                 &item,
             )
             .unwrap();
@@ -7410,7 +7492,7 @@ pub(crate) mod tests {
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: &plain,
-                    aad: &super::associated_data(&identity_id, &peer, 0, true),
+                    aad: &super::associated_data(&identity_id, &peer, 0, &super::LogFormat::V1),
                 },
             )
             .unwrap();
@@ -7430,6 +7512,175 @@ pub(crate) mod tests {
         assert_eq!(reader.next_record().unwrap(), None);
         drop(history);
         assert_eq!(&std::fs::read(path).unwrap()[..8], super::MAGIC);
+    }
+
+    fn conversation_path(identity: &Identity, peer: &str) -> PathBuf {
+        let identity_id = identity.public_id();
+        let key = identity.storage_key();
+        super::data_directory()
+            .unwrap()
+            .join(&identity_id)
+            .join(format!(
+                "{}.adlog",
+                super::opaque_conversation_name(&super::derive_index_key(&key), peer)
+            ))
+    }
+
+    /// Splits a log into its header and the byte ranges of its records.
+    fn records_of(bytes: &[u8]) -> (usize, Vec<std::ops::Range<usize>>) {
+        let header = if &bytes[..8] == super::MAGIC {
+            super::HEADER_LEN as usize
+        } else {
+            8
+        };
+        let mut position = header;
+        let mut ranges = Vec::new();
+        while position < bytes.len() {
+            let length =
+                u32::from_be_bytes(bytes[position..position + 4].try_into().unwrap()) as usize;
+            ranges.push(position..position + 4 + length);
+            position += 4 + length;
+        }
+        (header, ranges)
+    }
+
+    #[test]
+    fn a_new_log_has_an_adlog3_header_with_a_random_generation() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let (first, second) = ("71".repeat(32), "72".repeat(32));
+        for peer in [&first, &second] {
+            let (mut history, _, _) = History::open(&identity, peer).unwrap();
+            history.append(&message(1, "one")).unwrap();
+        }
+        let a = std::fs::read(conversation_path(&identity, &first)).unwrap();
+        let b = std::fs::read(conversation_path(&identity, &second)).unwrap();
+        assert_eq!(&a[..8], super::MAGIC);
+        assert_ne!(a[8..24], b[8..24], "each log has its own generation");
+        assert_ne!(a[8..24], [0; 16]);
+    }
+
+    #[test]
+    fn replacing_or_deleting_records_starts_a_new_generation() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "73".repeat(32);
+        let path = conversation_path(&identity, &peer);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history.append(&message(1, "one")).unwrap();
+        history.append(&message(2, "two")).unwrap();
+        let generation = |path: &PathBuf| std::fs::read(path).unwrap()[8..24].to_vec();
+        let first = generation(&path);
+        history.append(&message(3, "three")).unwrap();
+        assert_eq!(generation(&path), first, "an append keeps the generation");
+        history.replace(&[message(1, "one")]).unwrap();
+        let second = generation(&path);
+        assert_ne!(second, first);
+        History::delete_time_range(&identity, &peer, 0, 10).unwrap();
+        assert_ne!(generation(&path), second, "a delete rewrites the file too");
+    }
+
+    #[test]
+    fn a_record_from_an_earlier_generation_does_not_authenticate_in_the_current_one() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "74".repeat(32);
+        let path = conversation_path(&identity, &peer);
+        let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+        history.append(&message(1, "old first")).unwrap();
+        history.append(&message(2, "old second")).unwrap();
+        let old = std::fs::read(&path).unwrap();
+        // The same keys and the same record numbers: only the generation differs.
+        history
+            .replace(&[message(1, "new first"), message(2, "new second")])
+            .unwrap();
+        drop(history);
+        let (_, old_records) = records_of(&old);
+        let current = std::fs::read(&path).unwrap();
+        let (_, current_records) = records_of(&current);
+        let mut spliced = current[..current_records[1].start].to_vec();
+        spliced.extend_from_slice(&old[old_records[1].clone()]);
+        std::fs::write(&path, &spliced).unwrap();
+        let Err(error) = History::open(&identity, &peer) else {
+            panic!("a spliced record was accepted");
+        };
+        assert!(error.to_string().contains("authentication"), "{error}");
+        // Without the splice the file is fine, so the failure is the old record.
+        std::fs::write(&path, &current).unwrap();
+        assert_eq!(History::open(&identity, &peer).unwrap().1.len(), 2);
+    }
+
+    #[test]
+    fn an_adlog2_log_still_opens_and_is_rewritten_as_adlog3() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "75".repeat(32);
+        let path = conversation_path(&identity, &peer);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let key = identity.storage_key();
+        let mut bytes = super::PREVIOUS_MAGIC.to_vec();
+        let entries = [message(5, "kept one"), message(6, "kept two")];
+        for (index, entry) in entries.iter().enumerate() {
+            bytes.extend_from_slice(
+                &super::encode_record(
+                    &key,
+                    &identity.public_id(),
+                    &peer,
+                    index as u64,
+                    &super::LogFormat::V2,
+                    entry,
+                )
+                .unwrap(),
+            );
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let (mut history, count, _) = History::open_for_chat(&identity, &peer).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(&std::fs::read(&path).unwrap()[..8], super::MAGIC);
+        // Appending after the migration uses the new generation.
+        history.append(&message(7, "added")).unwrap();
+        drop(history);
+        let (_, messages, _) = History::open(&identity, &peer).unwrap();
+        let texts: Vec<_> = messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["kept one", "kept two", "added"]);
+        // The streaming and the full-read open paths agree on an ADLOG2 file.
+        let other = "76".repeat(32);
+        let other_path = conversation_path(&identity, &other);
+        let mut bytes = super::PREVIOUS_MAGIC.to_vec();
+        bytes.extend_from_slice(
+            &super::encode_record(
+                &key,
+                &identity.public_id(),
+                &other,
+                0,
+                &super::LogFormat::V2,
+                &message(9, "full read"),
+            )
+            .unwrap(),
+        );
+        std::fs::write(&other_path, bytes).unwrap();
+        let (_, messages, _) = History::open(&identity, &other).unwrap();
+        assert_eq!(messages[0].text, "full read");
+        assert_eq!(&std::fs::read(&other_path).unwrap()[..8], super::MAGIC);
+    }
+
+    #[test]
+    fn a_header_cut_short_by_a_crash_is_rewritten() {
+        let _data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        let peer = "77".repeat(32);
+        let path = conversation_path(&identity, &peer);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // ADLOG3 magic with only part of the generation id.
+        let mut torn = super::MAGIC.to_vec();
+        torn.extend_from_slice(&[7; 5]);
+        std::fs::write(&path, &torn).unwrap();
+        let (mut history, count, recovered) = History::open_for_chat(&identity, &peer).unwrap();
+        assert_eq!(count, 0);
+        assert!(recovered, "the discarded partial header is reported");
+        history.append(&message(1, "after")).unwrap();
+        drop(history);
+        assert_eq!(History::open(&identity, &peer).unwrap().1.len(), 1);
     }
 
     #[test]
