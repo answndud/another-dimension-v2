@@ -2077,14 +2077,7 @@ impl History {
         if &magic == BACKUP_STREAM_BUNDLE_V2_MAGIC {
             return import_backup_bundle_stream_v2(identity, &mut file);
         }
-        let length = file.metadata()?.len();
-        if length > MAX_LEGACY_BACKUP_BYTES as u64 {
-            return Err(invalid_data(
-                "legacy backup exceeds the supported 16 MiB format limit",
-            ));
-        }
-        let mut bytes = Vec::with_capacity(length as usize);
-        file.read_to_end(&mut bytes)?;
+        let bytes = read_legacy_backup(&mut file)?;
         if bytes.starts_with(BACKUP_BUNDLE_MAGIC) {
             return Self::import_backup_bundle_with_info(identity, &bytes);
         }
@@ -2113,14 +2106,7 @@ impl History {
             staging.cleanup()?;
             return Ok(result);
         }
-        let length = file.metadata()?.len();
-        if length > MAX_LEGACY_BACKUP_BYTES as u64 {
-            return Err(invalid_data(
-                "legacy backup exceeds the supported 16 MiB format limit",
-            ));
-        }
-        let mut bytes = Vec::with_capacity(length as usize);
-        file.read_to_end(&mut bytes)?;
+        let bytes = read_legacy_backup(&mut file)?;
         let (peer_id, count) = Self::verify_backup(identity, &bytes, password)?;
         Ok((peer_id, count as u64))
     }
@@ -2164,14 +2150,7 @@ impl History {
         input.seek(SeekFrom::Start(0))?;
         require_legacy_opt_in(&magic, policy)?;
         if &magic != BACKUP_STREAM_MAGIC && &magic != BACKUP_STREAM_V6_MAGIC {
-            let length = input.metadata()?.len();
-            if length > MAX_LEGACY_BACKUP_BYTES as u64 {
-                return Err(invalid_data(
-                    "legacy backup exceeds the supported 16 MiB format limit",
-                ));
-            }
-            let mut bytes = Vec::with_capacity(length as usize);
-            input.read_to_end(&mut bytes)?;
+            let bytes = read_legacy_backup(&mut input)?;
             let bytes = Self::reprotect_backup(
                 previous_identity,
                 replacement_identity,
@@ -4142,6 +4121,28 @@ fn validate_peer_id(peer_id: &str) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Reads a whole legacy (in-memory) backup file, at most `MAX_LEGACY_BACKUP_BYTES`.
+///
+/// The length in the file's metadata is not trusted: a FIFO or a device reports zero,
+/// and a file that is still growing can pass a size check and then keep going. So the
+/// read itself is capped at one byte over the limit, and anything that is not a
+/// regular file is refused before it is read.
+fn read_legacy_backup(file: &mut File) -> io::Result<Vec<u8>> {
+    if !file.metadata()?.is_file() {
+        return Err(invalid_data("backup must be a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_LEGACY_BACKUP_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_LEGACY_BACKUP_BYTES {
+        zeroize::Zeroize::zeroize(&mut bytes);
+        return Err(invalid_data(
+            "legacy backup exceeds the supported 16 MiB format limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Whether a backup in a format with weaker guarantees may be processed.
@@ -8196,6 +8197,116 @@ pub(crate) mod tests {
                 .is_ok();
         assert!(!opens_with_storage_key);
         drop(data);
+    }
+
+    fn open_for_reading(path: &std::path::Path) -> std::fs::File {
+        std::fs::File::open(path).unwrap()
+    }
+
+    #[test]
+    fn a_legacy_backup_is_read_up_to_the_limit_and_not_one_byte_more() {
+        let data = IsolatedData::new();
+        let at_limit = write_backup_fixture(
+            &data,
+            "at-limit",
+            &vec![7_u8; super::MAX_LEGACY_BACKUP_BYTES],
+        );
+        let over = write_backup_fixture(
+            &data,
+            "over",
+            &vec![7_u8; super::MAX_LEGACY_BACKUP_BYTES + 1],
+        );
+        let empty = write_backup_fixture(&data, "empty", &[]);
+        assert_eq!(
+            super::read_legacy_backup(&mut open_for_reading(&at_limit))
+                .unwrap()
+                .len(),
+            super::MAX_LEGACY_BACKUP_BYTES
+        );
+        let error = super::read_legacy_backup(&mut open_for_reading(&over)).unwrap_err();
+        assert!(error.to_string().contains("16 MiB"), "{error}");
+        assert!(super::read_legacy_backup(&mut open_for_reading(&empty))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_legacy_backup_that_is_not_a_regular_file_is_refused_before_it_is_read() {
+        // A FIFO reports a length of zero, so a size check on metadata lets it through,
+        // and it can then supply any number of bytes.
+        let data = IsolatedData::new();
+        let fifo = data.0.join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // Keep a writer open so that opening for reading does not block, and make sure
+        // the reader gives up at once instead of draining the pipe.
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        let mut reader = std::fs::File::open(&fifo).unwrap();
+        // Run the read on its own thread: a reader that trusts the metadata would block on
+        // the pipe forever, and a test that hangs hides the failure from CI.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(super::read_legacy_backup(&mut reader));
+        });
+        let error = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the read must not block on a pipe")
+            .unwrap_err();
+        assert!(error.to_string().contains("regular file"), "{error}");
+        drop(writer);
+        // A directory is not a regular file either.
+        let mut directory = std::fs::File::open(&data.0).unwrap();
+        assert!(super::read_legacy_backup(&mut directory).is_err());
+    }
+
+    #[test]
+    fn importing_verifying_and_reprotecting_all_refuse_an_oversized_legacy_file() {
+        let data = IsolatedData::new();
+        let (identity, _) = Identity::create().unwrap();
+        // An unknown magic is treated as a legacy in-memory backup, so every path reads it
+        // through read_legacy_backup.
+        let mut bytes = vec![0_u8; super::MAX_LEGACY_BACKUP_BYTES + 1];
+        bytes[..8].copy_from_slice(b"ADBACK1\0");
+        let path = write_backup_fixture(&data, "oversized.backup", &bytes);
+        let policy = super::LegacyBackupPolicy::Allow;
+        let import = History::import_backup_file_with_policy(&identity, &path, None, policy);
+        assert!(import.unwrap_err().to_string().contains("16 MiB"));
+        let verify = History::verify_backup_file(&identity, &path, None);
+        assert!(verify.unwrap_err().to_string().contains("16 MiB"));
+        let (replacement, _) = Identity::create().unwrap();
+        let mut output = tempfile_in(&data);
+        let reprotect = History::reprotect_backup_file_with_policy(
+            &identity,
+            &replacement,
+            &path,
+            &mut output,
+            None,
+            None,
+            policy,
+        );
+        assert!(reprotect.unwrap_err().to_string().contains("16 MiB"));
+        assert_eq!(
+            output.metadata().unwrap().len(),
+            0,
+            "nothing is written for a refused file"
+        );
+    }
+
+    fn tempfile_in(data: &IsolatedData) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(data.0.join("reprotect-output"))
+            .unwrap()
     }
 
     #[test]
