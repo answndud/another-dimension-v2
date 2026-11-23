@@ -19,6 +19,25 @@
 
 ## 기록
 
+## SF-024 상태 파일 읽기·가져오기 경합·메모리 잔존 등 작은 보강 묶음
+
+- 날짜: 2026-11-23
+- 심각도: Low
+- 위치: `src/fsutil.rs`(`read_regular_file`, `create_private_dir`), `src/anchor.rs`, `src/history/{index,linked_keys,staging,transfer_workspace}.rs`, `src/contacts.rs`, `src/settings.rs`, `src/api/backup_transfer.rs`, `src/api/account.rs`, `src/state.rs`, `src/chat_worker.rs`, `src/relay.rs`
+- 발견: 최종 리뷰의 낮은 심각도 지적을 코드에서 확인한 것들입니다.
+  1. 앵커·인덱스·연결 키 저장소·연락처 레코드·설정 파일이 크기 상한 없이, 또는 길이만 확인하고 `read`했습니다. 같은 이름의 FIFO를 두면 열기나 읽기가 영원히 멈췄습니다(SF-013과 같은 유형). 앵커는 전역 잠금을 쥔 채 읽으므로 모든 메시지 저장이 멈췄습니다.
+  2. `upload-chunk`가 가져오기 중인 전송 파일에 덧붙일 수 있었습니다(가져오기는 State 잠금을 놓고 그 파일을 읽음).
+  3. 로그아웃해도 끝난 채팅의 스냅샷(메시지 평문)이 메모리에 남았습니다.
+  4. 신원 연결 실패 오류가 `client_message`를 거치지 않아 절대 경로가 화면에 나갈 수 있었습니다(SF-005 주장의 빈틈).
+  5. 랑데부의 중복 방지 집합이 "가장 오래된" 항목이 아니라 사전순으로 가장 작은 id를 버렸습니다(주석과 다름, 방금 넣은 항목이 빠질 수 있음).
+  6. 응답자가 준비 요청의 nonce 길이를 확인하지 않고 그대로 되돌려, 256자 넘는 nonce는 확인 프레임을 게시할 수 없게 만들어 랑데부를 끝냈습니다(초대 키를 가진 쪽만 보낼 수 있음).
+  7. 복원 병합 인덱스의 HMAC 키로 스테이징 AEAD 키를 그대로 썼습니다(ADR 0006의 키 분리 원칙에 어긋남, 알려진 공격은 없음).
+  8. 스테이징·전송 작업 공간 디렉터리를 기본 umask로 만든 뒤 권한을 좁혔습니다(부모가 0700이라 노출은 없었지만 가드 테스트가 `create_dir(`를 잡지 못함).
+- 영향: 1은 데이터 디렉터리에 쓸 수 있는 쪽의 가용성 공격, 2는 실패하거나 혼란스러운 가져오기, 3은 로그아웃 뒤에도 평문이 프로세스 메모리에 남음, 4~8은 위 설명대로 작습니다.
+- 수정: 상태 파일은 `read_regular_file`(`O_NONBLOCK`으로 열고 일반 파일만, 상한 32 MiB, 설정은 4 KiB)로 읽습니다. `upload-chunk`는 가져오기가 진행 중이면 409입니다. 로그아웃은 끝난 채팅을 지웁니다(실행 중이거나 병합 중인 채팅은 취소·충돌 차단을 위해 남김). 신원 연결 오류는 `client_message`를 거칩니다. 중복 방지 집합은 도착 순서를 따로 기억해 가장 오래된 것을 버립니다. 응답자는 길이가 맞지 않는 준비 요청을 무시합니다. 병합 인덱스는 스테이징 키에서 파생한 별도 키를 씁니다. 디렉터리는 `create_private_dir`(0700)로 만들고, 소스 가드가 `create_dir(`과 `fs::read(`를 막습니다.
+- 회귀 테스트: `a_state_file_is_read_whole_up_to_the_limit_and_not_one_byte_more`, `a_named_pipe_in_place_of_a_state_file_is_refused_without_waiting`(`O_NONBLOCK`을 빼면 5초 뒤 실패), `a_private_directory_is_owner_only_and_must_not_exist_yet`, `a_chunk_cannot_be_appended_to_an_upload_while_an_import_is_running`(검사를 빼면 실패), `logging_out_forgets_the_plaintext_of_finished_chats_but_not_running_ones`(호출을 빼면 실패), `a_ready_request_with_an_oversized_nonce_does_not_end_the_rendezvous`(길이 확인을 빼면 `InvalidEvent`로 실패), 가드 테스트(index.rs에 `std::fs::read(`를 되돌리면 실패). 중복 방지 집합의 순서(`flooding_the_topic_…`)는 짝이 맞는지만 확인하고 "가장 오래된 것을 버린다"는 성질 자체는 테스트하지 못했습니다. 병합 인덱스 키 분리도 테스트가 없습니다(저장 형식이 아니라 임시 파일이라 호환 문제는 없음).
+- 남은 한계: 대화 로그 파일과 백업 파일을 여는 곳(`File::open`)은 이번에 바꾸지 않았습니다. 같은 이름으로 FIFO를 둔 경우 그 대화를 열 때 멈출 수 있습니다(데이터 디렉터리에 쓸 수 있는 공격자 전제). 채팅 진행 중 쌓이는 스냅샷은 로그아웃 전까지 남습니다(SECURITY.md 15번). 설정 파일 인증, 데이터 디렉터리의 부모 경로 검사, 직접 만든 가드 외의 `File::open` 정리는 SECURITY.md 13·14번과 ADR 0007에 한계로 적었습니다.
+
 ## SF-023 손상된 연락처 레코드가 같은 상대와의 재확인을 영구히 막음
 
 - 날짜: 2026-11-23
