@@ -54,6 +54,9 @@ const MAX_RELAY_MESSAGE: usize = 20 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_millis(250);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait for a SOCKS proxy to finish connecting, which includes building a
+/// Tor circuit.
+const SOCKS_CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(15);
 const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a rendezvous waits for the peer to appear on the topic before giving up.
@@ -746,7 +749,10 @@ fn authenticate_socks5(stream: &mut TcpStream) -> Result<(), RelayError> {
 
 fn connect_socks5(proxy: SocketAddr, host: &str, port: u16) -> Result<TcpStream, RelayError> {
     let mut stream = TcpStream::connect_timeout(&proxy, CONNECT_TIMEOUT)?;
-    stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
+    // The proxy answers the CONNECT request only once its circuit to the relay is built,
+    // and a connection with credentials of its own gets a circuit of its own, so this
+    // wait is much longer than a direct TCP connect.
+    stream.set_read_timeout(Some(SOCKS_CONNECT_TIMEOUT))?;
     stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
     // Offer both methods. Tor puts streams with different credentials on different
     // circuits (IsolateSOCKSAuth), so every connection presents credentials of its own
@@ -2964,6 +2970,77 @@ mod tests {
         assert!(super::validate_relay_endpoint(&format!("wss://{longest_label}.example")).is_ok());
     }
 
+    /// Opens connections through a real Tor and asks its control port which circuit each
+    /// stream uses. Needs `AD_TOR_SOCKS`, `AD_TOR_CONTROL` and `AD_TOR_COOKIE`; run with
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore = "needs a running Tor; prints which circuit each stream used"]
+    fn live_tor_puts_each_connection_on_its_own_circuit() {
+        let socks: std::net::SocketAddr = std::env::var("AD_TOR_SOCKS").unwrap().parse().unwrap();
+        let control = std::env::var("AD_TOR_CONTROL").unwrap();
+        let cookie = std::fs::read(std::env::var("AD_TOR_COOKIE").unwrap()).unwrap();
+        let (host, port) = ("relay.primal.net", 443);
+        // Ours: each connection offers credentials of its own.
+        let ours: Vec<_> = (0..4)
+            .map(|_| super::connect_socks5(socks, host, port).unwrap())
+            .collect();
+        // A control group: plain SOCKS5 with no credentials, which Tor groups together.
+        let plain: Vec<_> = (0..4)
+            .map(|_| {
+                let mut stream = std::net::TcpStream::connect(socks).unwrap();
+                stream.write_all(&[5, 1, 0]).unwrap();
+                let mut reply = [0; 2];
+                stream.read_exact(&mut reply).unwrap();
+                let mut request = vec![5, 1, 0, 3, host.len() as u8];
+                request.extend_from_slice(host.as_bytes());
+                request.extend_from_slice(&port.to_be_bytes());
+                stream.write_all(&request).unwrap();
+                let mut answer = [0; 10];
+                stream.read_exact(&mut answer).unwrap();
+                assert_eq!(answer[1], 0, "plain SOCKS connect failed");
+                stream
+            })
+            .collect();
+        let mut control = std::net::TcpStream::connect(control).unwrap();
+        let mut cookie_hex = String::new();
+        crate::hex::push_encoded(&mut cookie_hex, &cookie);
+        control
+            .write_all(
+                format!("AUTHENTICATE {cookie_hex}\r\nGETINFO stream-status\r\nQUIT\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        let mut reply = String::new();
+        control.read_to_string(&mut reply).unwrap();
+        println!("{reply}");
+        // Tor reports the resolved address, not the host name, so take the last eight
+        // streams: ours were opened first and the control group after them.
+        let circuits: Vec<&str> = reply
+            .lines()
+            .filter(|line| line.contains("SUCCEEDED"))
+            .filter_map(|line| line.split_whitespace().nth(2))
+            .collect();
+        assert!(
+            circuits.len() >= 8,
+            "Tor listed only {} open streams",
+            circuits.len()
+        );
+        let recent = &circuits[circuits.len() - 8..];
+        let distinct = |part: &[&str]| part.iter().collect::<std::collections::BTreeSet<_>>().len();
+        let (own, control_group) = recent.split_at(4);
+        println!(
+            "our 4 connections used {} distinct circuits; the 4 without credentials used {}",
+            distinct(own),
+            distinct(control_group)
+        );
+        assert_eq!(
+            distinct(own),
+            4,
+            "each connection should get its own circuit"
+        );
+        drop((ours, plain));
+    }
+
     #[test]
     fn tls_crypto_provider_is_initialized_before_network_use() {
         super::ensure_tls_crypto_provider().unwrap();
@@ -3512,7 +3589,11 @@ mod tests {
             .unwrap_or(0);
         let paused = Instant::now();
         while paused.elapsed() < Duration::from_secs(pause) {
-            rendezvous.keep_alive().unwrap();
+            // `AD_LIVE_NO_KEEPALIVE` leaves the connection unread, to see whether the relay
+            // drops it without the servicing `keep_alive` does.
+            if std::env::var_os("AD_LIVE_NO_KEEPALIVE").is_none() {
+                rendezvous.keep_alive().unwrap();
+            }
             thread::sleep(Duration::from_millis(250));
         }
         let fingerprint = verification.fingerprint().to_vec();

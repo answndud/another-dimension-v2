@@ -32,7 +32,7 @@
   2. **앵커 파일** `conversations.anchor`: 각 대화의 (세대 id, 레코드 수, 설치 예정 세대)를 별도 용도 키로 암호화해 저장합니다. 로그가 디스크에 내려간 **뒤에** 갱신하므로 충돌 뒤에는 로그보다 뒤처질 수는 있어도 앞서지는 않습니다. 교체는 이름을 바꾸기 전에 새 세대를 `pending`으로 먼저 기록해, 이름 변경 직후 충돌을 변조로 오인하지 않습니다.
   3. 열 때 비교해 ① 같은 세대인데 레코드가 적으면 "짧아짐", ② 설치된 적 없는 세대면 "다른 버전", ③ 앵커를 읽을 수 없으면 "상태 정보 읽기 실패"를 **한 번** 경고하고 현재 상태를 다시 기록합니다. 대화는 열립니다(경고만 하고 기록을 막지는 않습니다).
 - 회귀 테스트: `a_record_from_an_earlier_generation_does_not_authenticate_in_the_current_one`(AAD에서 세대를 빼면 실패), `a_log_cut_at_a_record_boundary_is_reported_once`, `an_older_copy_of_the_log_is_reported_after_a_replace`, `crashes_between_the_steps_of_a_write_are_not_mistaken_for_tampering`, `ordinary_use_never_raises_the_warning`(삭제로 짧아진 경우 포함), `a_conversation_from_before_anchors_existed_is_adopted_without_a_warning`, `an_unreadable_anchor_is_reported_and_then_replaced`, `deleting_a_conversation_forgets_its_anchor`, `an_adlog2_log_still_opens_and_is_rewritten_as_adlog3`, `a_header_cut_short_by_a_crash_is_rewritten`, 앵커 판정 단위 테스트. 변이 검사: 세대 AAD 제거, 추가 시 앵커 갱신 제거, `pending` 허용 제거, 길이 비교 제거가 각각 해당 테스트만 실패시키는 것을 확인했습니다.
-- 남은 한계: 데이터 디렉터리의 모든 파일을 함께 되돌리는 공격, 또는 앵커 파일을 지우고 로그를 자르는 공격은 단일 기기에서 막을 수 없습니다(신뢰할 카운터가 없음). 경고는 사라진 메시지를 복구하지 않습니다. 앵커는 메시지를 저장할 때마다 다시 쓰이므로 대화가 아주 많으면 비용이 늘어납니다(측정하지 않았습니다). 프로세스 사이의 앵커 파일 경쟁은 막지 않습니다(기존 인덱스와 같은 한계).
+- 남은 한계: 데이터 디렉터리의 모든 파일을 함께 되돌리는 공격, 또는 앵커 파일을 지우고 로그를 자르는 공격은 단일 기기에서 막을 수 없습니다(신뢰할 카운터가 없음). 경고는 사라진 메시지를 복구하지 않습니다. 앵커는 메시지를 저장할 때마다 다시 쓰입니다. **측정(2026-11-23, 릴리스 빌드, 이 Mac의 SSD 한 대):** 메시지 추가 한 번이 약 12.6ms(로그 쓰기와 sync만 약 4.3ms, 앵커 쓰기가 약 8.7ms)입니다. 앵커 쓰기는 대화 수 1~100개에서 8.6~9.1ms로 거의 일정하고 1,001개에서 17.3ms입니다. 앵커는 fsync가 지배하므로 대화 수보다 디스크 쓰기 지연에 좌우됩니다. 채팅에서는 체감되지 않는 값이지만 메시지당 저장 시간이 약 3배가 된 것은 사실입니다. 재현은 `cargo test --release anchor_cost -- --ignored --nocapture`입니다. 프로세스 사이의 앵커 파일 경쟁은 막지 않습니다(기존 인덱스와 같은 한계).
 
 ## SF-018 같은 쌍의 재연결이 항상 같은 relay 토픽과 키로 보임
 
@@ -115,7 +115,8 @@
   - `socks_connection_offers_username_authentication_so_tor_can_isolate_circuits`: 메서드 2를 제안하고 무작위 자격 증명을 보낸다. 옛 코드에서 실패하는 것을 먼저 확인했습니다.
   - `every_socks_connection_uses_credentials_of_its_own`: 연결마다 자격 증명이 다르다. 항상 같은 값으로 바꾸면 실패하는 것을 확인했습니다.
   - `a_proxy_that_needs_no_authentication_still_works_and_gets_no_credentials`, `a_proxy_that_accepts_none_of_our_methods_is_an_error_not_a_direct_connection`, `a_proxy_that_rejects_the_credentials_is_an_error`, 기존의 `socks_proxy_failure_never_falls_back_to_direct_relay_connection`(새 협상에 맞게 고침).
-- **증명하지 못한 것:** "relay별·세션별로 실제로 다른 회로를 쓴다"는 최종 효과입니다. 그것은 사용자의 Tor가 `IsolateSOCKSAuth`를 켠 상태에서 자격 증명에 따라 회로를 나누는 동작이며, Tor 데몬 없이는 관찰할 수 없습니다. 테스트가 보장하는 것은 "연결마다 서로 다른 무작위 자격 증명을 RFC 1929대로 보낸다"까지입니다.
+- **실측(2026-11-23):** Tor Browser에 들어 있는 `tor` 0.4.9.16을 별도 데이터 디렉터리와 포트로 띄우고, `connect_socks5`로 같은 relay 주소(`relay.primal.net:443`)에 연결 4개를 열어 제어 포트의 `GETINFO stream-status`로 회로를 확인했습니다. **앱 연결 4개는 서로 다른 회로 4개**를 썼고, 자격 증명 없이 연 대조군 4개는 **회로 1개를 공유**했습니다. 재현은 `AD_TOR_SOCKS`, `AD_TOR_CONTROL`, `AD_TOR_COOKIE`를 설정하고 `live_tor_puts_each_connection_on_its_own_circuit`을 `--ignored`로 실행하면 됩니다. 이 확인은 Tor의 기본 `SocksPort`(IsolateSOCKSAuth 켜짐)에서 한 것이며, 사용자의 Tor 설정이 다르면 결과가 다릅니다.
+- **실측 중 찾은 문제와 수정:** 연결마다 새 회로를 만들다 보니 SOCKS 응답을 기다리는 10초 제한에 가끔 걸려(`WouldBlock`) 연결이 실패했습니다. SOCKS 응답 대기를 45초로 늘렸고(`SOCKS_CONNECT_TIMEOUT`), 이후 같은 시험에서 연결 실패가 나오지 않았습니다(8회 중 연결 실패 0, 단언 실패 1은 열린 스트림 수를 세던 시험 쪽 문제로 고침). 이 timeout 값은 임의로 정했고 별도 회귀 테스트는 없습니다.
 - 남은 한계:
   - 격리는 사용자의 Tor 설정에 달려 있습니다. 앱은 프록시가 Tor인지도, 격리가 켜져 있는지도 확인하지 않습니다(README에 이미 적은 한계).
   - 같은 연결 안의 모든 트래픽은 당연히 한 회로입니다. 세션 하나가 쓰는 여러 relay는 서로 다른 회로로 가지만, 한 relay와의 연결은 그 세션 내내 같은 회로입니다.
@@ -178,7 +179,7 @@
   - `frames_that_arrive_while_a_person_decides_are_kept_in_order`, `both_users_taking_a_long_time_to_confirm_still_connect`.
   - 보관함이 프레임을 버리게 하거나, 대기를 다시 프로토콜 타임아웃에 묶으면 해당 테스트가 실패하는 것을 확인했습니다.
 - 남은 한계:
-  - **`keep_alive`가 실제 relay에서 연결을 유지하는 데 필요한지는 확인하지 못했습니다.** `keep_alive`를 아무것도 안 하게 바꿔도 위 테스트가 통과합니다. 테스트가 쓰는 가짜 relay가 ping을 보내지 않고 응답이 없다고 연결을 끊지도 않기 때문입니다. 비용이 거의 없는 방어라서 유지했지만, 효과는 실제 relay에서만 볼 수 있습니다. 무시된 수동 테스트 `live_relay_two_party_channel_roundtrip`에 `AD_LIVE_CONFIRM_PAUSE_SECS`(확인 전 대기 초)를 줄 수 있게 해 두었습니다.
+  - **`keep_alive`는 실제 relay에서 필요했습니다(2026-11-23 실측, 표본 1회씩).** `wss://relay.primal.net`에서 두 쪽이 150초 동안 확인을 누르지 않고 기다리게 했습니다. `keep_alive`로 연결을 돌보면 두 번의 150초 대기를 포함해 336초 만에 통과했고, 읽기를 전혀 하지 않으면 150초 대기 직후 확인 단계에서 `NoRelayAvailable`(연결이 끊김)로 실패했습니다(158초). **한 relay에서 한 번씩 해 본 결과**이므로 다른 relay의 유휴 제한이나 정확한 끊김 시점은 모릅니다. 재현은 `AD_LIVE_CONFIRM_PAUSE_SECS=150`(`AD_LIVE_NO_KEEPALIVE=1`이면 읽지 않음)으로 `live_relay_two_party_channel_roundtrip`을 실행하면 됩니다. 자동 테스트(가짜 relay)는 이 차이를 잡지 못합니다.
   - 확인 대기 루프 한 번이 relay 수에 비례해 길어질 수 있습니다(relay 읽기 제한 250ms × relay 수). 3개면 약 1초이며, 이는 측정이 아니라 계산한 값입니다. "확인"이나 "취소"를 누른 뒤 반응이 그만큼 늦을 수 있습니다.
   - 화면에는 "상대를 기다리는 중" 같은 대기 안내가 이전 그대로입니다. 최대 5분이라는 한도를 화면에서 알려 주지는 않습니다.
   - 확인 시간이 지나면 연결을 닫고 새 초대 코드로 다시 시작하게 합니다.

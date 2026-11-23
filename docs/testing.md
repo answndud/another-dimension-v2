@@ -40,7 +40,17 @@ CI의 `ci.yml`이 push마다 포맷·clippy·`cargo test`·JS 테스트를 돌�
 
 위의 속성 테스트는 무작위 입력과 변형을 쓰지만 **커버리지 정보로 입력을 진화시키지 않으므로** 깊은 분기까지 닿는다는 보장이 없습니다. "퍼징했다"고 쓸 수 있는 상태가 아닙니다. 다음 단계로 `lib.rs` 분리 후 다음 타깃을 추가하는 것을 권합니다: ADBACK7·ADPACK3 디코더, `read_request_head`, 릴레이 `receive`, `InviteCode::parse`, `load_settings_from_path`.
 
+## 실제 환경 확인 (수동, `--ignored`)
+
+| 시험 | 환경 변수 | 확인하는 것 |
+|---|---|---|
+| `live_relay_two_party_channel_roundtrip` | `AD_LIVE_CONFIRM_PAUSE_SECS`, `AD_LIVE_NO_KEEPALIVE` | 실제 relay에서의 연결, 긴 확인 대기에서 `keep_alive`의 필요성 |
+| `live_tor_puts_each_connection_on_its_own_circuit` | `AD_TOR_SOCKS`, `AD_TOR_CONTROL`, `AD_TOR_COOKIE` | 실제 Tor에서 연결마다 다른 회로를 쓰는지 |
+| `anchor_cost_per_append_and_per_conversation_count` | 없음 | 앵커 갱신이 추가에 더하는 시간 |
+
+결과와 한계는 [security-fixes.md](security-fixes.md)의 SF-012, SF-015, SF-019에 있습니다. 모두 CI에서는 돌지 않습니다.
+
 ## 알려진 한계
 
 - `history/tests.rs`(약 3,900줄)와 `send_tests.rs`(약 2,800줄)는 길고, 긴 시나리오 테스트 일부는 한 함수에 여러 단계가 들어 있습니다.
-- 실제 relay, 실제 기기 두 대, Tor 회로 분리는 자동 테스트로 확인하지 못했습니다(가짜 relay와 가짜 SOCKS 서버로만 검증).
+- 자동 테스트(CI)는 가짜 relay와 가짜 SOCKS 서버만 씁니다. 실제 relay와 Tor는 위 수동 시험으로 한 번씩 확인했고, 서로 다른 기기 두 대는 확인하지 못했습니다.

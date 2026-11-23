@@ -3934,3 +3934,67 @@ mod mutated_backups {
         assert_eq!(restored.len(), 2);
     }
 }
+
+/// Measures what the anchor adds to each append. Run with
+/// `cargo test --release anchor_cost -- --ignored --nocapture`; it prints numbers and asserts nothing.
+#[test]
+#[ignore = "benchmark; prints timings"]
+fn anchor_cost_per_append_and_per_conversation_count() {
+    use std::time::Instant;
+    let _data = IsolatedData::new();
+    let (identity, _) = Identity::create().unwrap();
+    let peer = "a1".repeat(32);
+    let (mut history, _, _) = History::open(&identity, &peer).unwrap();
+    let count = 300;
+    let started = Instant::now();
+    for index in 0..count {
+        history
+            .append(&message(index, "benchmark message"))
+            .unwrap();
+    }
+    let per_append = started.elapsed() / count as u32;
+    println!("append (log fsync + anchor write), 1 conversation: {per_append:?}");
+
+    let directory = history.path.parent().unwrap().to_owned();
+    let key = identity.storage_key();
+    let id = identity.public_id();
+    let anchor = crate::anchor::Anchor {
+        generation: [1; 16],
+        records: 1,
+        pending: None,
+    };
+    for conversations in [1_usize, 10, 100, 1000] {
+        // Fill the anchor file with this many conversations, then time one more write.
+        let mut entries = 0;
+        while entries < conversations {
+            let other = format!("{:064x}", entries + 1000);
+            crate::anchor::store(&key, &id, &directory, &other, Some(anchor)).unwrap();
+            entries += 1;
+        }
+        let rounds = 50;
+        let started = Instant::now();
+        for _ in 0..rounds {
+            crate::anchor::store(&key, &id, &directory, &peer, Some(anchor)).unwrap();
+        }
+        println!(
+            "anchor write alone with {} conversations: {:?}",
+            conversations + 1,
+            started.elapsed() / rounds
+        );
+    }
+    // The cost of the log write alone, for comparison.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(directory.join("bench-log"))
+        .unwrap_or_else(|_| std::fs::File::create(directory.join("bench-log")).unwrap());
+    let record = vec![7_u8; 120];
+    let started = Instant::now();
+    for _ in 0..count {
+        file.write_all(&record).unwrap();
+        file.sync_data().unwrap();
+    }
+    println!(
+        "log write + sync_data alone: {:?}",
+        started.elapsed() / count as u32
+    );
+}
