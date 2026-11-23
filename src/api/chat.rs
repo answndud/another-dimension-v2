@@ -213,9 +213,10 @@ pub(crate) fn chat_request_history_restore(
     request: Request<'_>,
 ) -> io::Result<()> {
     let Request { body, .. } = request;
-    let Some(operation) = owned_chat_operation(&state, body) else {
+    let Some(operation) = owned_chat_operation(&state, body).cloned() else {
         return reject(stream, "404 Not Found");
     };
+    drop(state);
     if !operation
         .snapshot
         .lock()
@@ -302,7 +303,7 @@ pub(crate) fn chat_link_identity(
     let Some((operation_id, previous_peer_id)) = body.split_once('\n') else {
         return reject(stream, "400 Bad Request");
     };
-    let Some(operation) = owned_chat_operation(&state, operation_id) else {
+    let Some(operation) = owned_chat_operation(&state, operation_id).cloned() else {
         return reject(stream, "404 Not Found");
     };
     if history::decode_peer_id(previous_peer_id).is_err() {
@@ -312,6 +313,9 @@ pub(crate) fn chat_link_identity(
     if peer_chat_active(&state, &previous_peer_id) {
         return reject(stream, "409 Conflict");
     }
+    let identity = state.identity.as_ref().cloned();
+    // The disk reads and the wait for the worker below must not hold the state.
+    drop(state);
     let Ok(snapshot) = operation.snapshot.lock() else {
         return reject(stream, "503 Service Unavailable");
     };
@@ -324,14 +328,14 @@ pub(crate) fn chat_link_identity(
         return reject(stream, "409 Conflict");
     }
     drop(snapshot);
-    let Some(identity) = state.identity.as_ref() else {
+    let Some(identity) = identity else {
         return reject(stream, IDENTITY_REQUIRED);
     };
-    let contact_directory = contacts::directory_for(identity)?;
+    let contact_directory = contacts::directory_for(&identity)?;
     let Ok(previous_peer_key) = history::decode_peer_id(&previous_peer_id) else {
         return reject(stream, "400 Bad Request");
     };
-    if contacts::load(&contact_directory, identity, previous_peer_key).is_err() {
+    if contacts::load(&contact_directory, &identity, previous_peer_key).is_err() {
         return reject(stream, "409 Conflict");
     }
     let (result_sender, result_receiver) = mpsc::channel();
@@ -396,9 +400,11 @@ pub(crate) fn chat_send(
     {
         return reject(stream, "400 Bad Request");
     }
-    let Some(operation) = owned_chat_operation(&state, operation_id) else {
+    let Some(operation) = owned_chat_operation(&state, operation_id).cloned() else {
         return reject(stream, "404 Not Found");
     };
+    // Waiting for the worker below can take seconds; nothing else may wait on the state.
+    drop(state);
     let Ok(snapshot) = operation.snapshot.lock() else {
         return reject(stream, "503 Service Unavailable");
     };

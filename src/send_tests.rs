@@ -1106,6 +1106,16 @@ fn the_route_table_has_no_duplicates_and_only_the_code_exchange_skips_the_sessio
 
 fn closed_test_operation(owner: &str, peer: &str, count: usize, epoch: u64) -> Arc<ChatOperation> {
     let (sender, _) = mpsc::channel();
+    closed_test_operation_with_sender(owner, peer, count, epoch, sender)
+}
+
+fn closed_test_operation_with_sender(
+    owner: &str,
+    peer: &str,
+    count: usize,
+    epoch: u64,
+    sender: mpsc::Sender<ChatCommand>,
+) -> Arc<ChatOperation> {
     Arc::new(ChatOperation {
         owner_identity_id: owner.to_owned(),
         history_state_lock: Mutex::new(()),
@@ -1782,6 +1792,56 @@ fn restore_merge_api_returns_202_without_waiting_and_status_reports_completion()
     );
     assert!(failure.contains("\"historyRestoreState\":\"failed\""));
     assert!(failure.contains("시간이 초과"));
+}
+
+/// A connected chat whose worker never answers: the commands pile up in the receiver.
+fn stalled_worker_operation(
+    owner: &str,
+    peer: &str,
+) -> (Arc<ChatOperation>, mpsc::Receiver<ChatCommand>) {
+    let (sender, receiver) = mpsc::channel();
+    let operation = closed_test_operation_with_sender(owner, peer, 0, 0, sender);
+    operation.cancelled.store(false, Ordering::SeqCst);
+    operation.snapshot.lock().unwrap().phase = "connected";
+    (operation, receiver)
+}
+
+#[test]
+fn a_stalled_chat_worker_does_not_freeze_the_rest_of_the_api() {
+    // These requests wait for the worker (ten seconds for a send, three for a restore
+    // request), which may be stuck writing to a relay. Waiting with the global state
+    // locked froze every other request, status polls of other chats included.
+    for (path, body) in [
+        ("/api/chat/send", "stalled\nhello"),
+        ("/api/chat/request-history-restore", "stalled"),
+    ] {
+        let (identity, _) = Identity::create().unwrap();
+        let owner = identity.public_id().to_owned();
+        let peer = "7c".repeat(32);
+        let (operation, receiver) = stalled_worker_operation(&owner, &peer);
+        let mut chats = HashMap::new();
+        chats.insert("stalled".to_owned(), operation);
+        let state = test_state(Some(Arc::new(identity)), chats);
+        let waiting = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || call_test_api(&state, path, body, "test-session"))
+        };
+        // The request is waiting once the worker's queue holds its command.
+        let command = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        let asked = Instant::now();
+        let status = call_test_api(&state, "/api/chat/status", "stalled", "test-session");
+        assert!(status.starts_with("HTTP/1.1 200 OK"), "{path}: {status}");
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "{path}: the status request waited {:?} behind it",
+            asked.elapsed()
+        );
+        // Dropping the command and the receiver ends the waiting request at once.
+        drop(command);
+        drop(receiver);
+        let response = waiting.join().unwrap();
+        assert!(!response.starts_with("HTTP/1.1 200"), "{path}: {response}");
+    }
 }
 
 #[test]
