@@ -19,6 +19,25 @@
 
 ## 기록
 
+## SF-015 Tor 모드에서 모든 relay 연결이 같은 회로를 공유할 수 있었음
+
+- 날짜: 2026-11-23
+- 심각도: Low
+- 위치: `src/relay.rs`의 `connect_socks5`
+- 발견: 서브에이전트의 프로토콜 리뷰가 지적했고 코드로 확인했습니다. SOCKS5 협상이 "인증 없음"(메서드 0)만 제안했습니다. Tor는 SOCKS 사용자 이름과 비밀번호가 서로 다른 스트림을 서로 다른 회로에 올리는데(`IsolateSOCKSAuth`), 자격 증명을 보내지 않으니 모든 스트림이 같은 회로를 쓸 수 있었습니다.
+- 영향: 여러 relay에 대한 연결과 랑데부, 세션이 같은 회로를 지나면 Tor 출구나 중간 노드가 이들을 한 사용자의 활동으로 묶기 쉽습니다. 더 직접적으로는, 프록시가 인증을 요구하도록 설정되어 있으면 **옛 코드는 아예 연결하지 못했습니다**("no-authentication mode를 거부했다"). 테스트로 확인했습니다.
+- 수정: 메서드 목록을 `[0, 2]`(인증 없음, 사용자 이름/비밀번호)로 제안합니다. 프록시가 2를 고르면 RFC 1929에 따라 **연결마다 새로 만든 무작위 자격 증명**(사용자 이름과 비밀번호 각 16바이트 hex)을 보내고, 0을 고르면 그대로 진행합니다. 프록시가 0xff(수용 불가)이거나 제안하지 않은 메서드를 고르면 실패하며 **직접 연결로 우회하지 않습니다**(기존 원칙 유지). 비밀번호 버퍼는 `Zeroizing`입니다.
+- 회귀 테스트:
+  - `socks_connection_offers_username_authentication_so_tor_can_isolate_circuits`: 메서드 2를 제안하고 무작위 자격 증명을 보낸다. 옛 코드에서 실패하는 것을 먼저 확인했습니다.
+  - `every_socks_connection_uses_credentials_of_its_own`: 연결마다 자격 증명이 다르다. 항상 같은 값으로 바꾸면 실패하는 것을 확인했습니다.
+  - `a_proxy_that_needs_no_authentication_still_works_and_gets_no_credentials`, `a_proxy_that_accepts_none_of_our_methods_is_an_error_not_a_direct_connection`, `a_proxy_that_rejects_the_credentials_is_an_error`, 기존의 `socks_proxy_failure_never_falls_back_to_direct_relay_connection`(새 협상에 맞게 고침).
+- **증명하지 못한 것:** "relay별·세션별로 실제로 다른 회로를 쓴다"는 최종 효과입니다. 그것은 사용자의 Tor가 `IsolateSOCKSAuth`를 켠 상태에서 자격 증명에 따라 회로를 나누는 동작이며, Tor 데몬 없이는 관찰할 수 없습니다. 테스트가 보장하는 것은 "연결마다 서로 다른 무작위 자격 증명을 RFC 1929대로 보낸다"까지입니다.
+- 남은 한계:
+  - 격리는 사용자의 Tor 설정에 달려 있습니다. 앱은 프록시가 Tor인지도, 격리가 켜져 있는지도 확인하지 않습니다(README에 이미 적은 한계).
+  - 같은 연결 안의 모든 트래픽은 당연히 한 회로입니다. 세션 하나가 쓰는 여러 relay는 서로 다른 회로로 가지만, 한 relay와의 연결은 그 세션 내내 같은 회로입니다.
+  - 인증을 요구하지 않는 일반 SOCKS 프록시에서는 아무 자격 증명도 보내지 않으므로 격리와 무관합니다.
+  - 기존 테스트의 낡은 인사말 단언을 고치다가, 한 번은 같은 블록이 두 테스트에 있어서 스크립트가 아무것도 적용하지 않고 멈췄습니다. 적용되지 않은 것을 확인한 뒤 순서를 바꿔 다시 했습니다.
+
 ## SF-014 비밀이 지워지지 않는 임시 문자열로 남던 곳과 relay 수락 문구의 무방비
 
 - 날짜: 2026-11-23

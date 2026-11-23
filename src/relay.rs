@@ -644,17 +644,59 @@ fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, RelayError> {
     })))
 }
 
+/// SOCKS5 method numbers (RFC 1928, RFC 1929).
+const SOCKS_NO_AUTHENTICATION: u8 = 0;
+const SOCKS_USERNAME_PASSWORD: u8 = 2;
+const SOCKS_NO_ACCEPTABLE_METHOD: u8 = 0xff;
+
+/// RFC 1929 username and password sub-negotiation with fresh random credentials. The
+/// proxy is not asked to check them: for Tor they only select a circuit.
+fn authenticate_socks5(stream: &mut TcpStream) -> Result<(), RelayError> {
+    let user = random_hex(16)?;
+    let password = Zeroizing::new(random_hex(16)?);
+    let mut request = Zeroizing::new(Vec::with_capacity(3 + user.len() + password.len()));
+    request.push(1);
+    request.push(u8::try_from(user.len()).map_err(|_| RelayError::InvalidEndpoint)?);
+    request.extend_from_slice(user.as_bytes());
+    request.push(u8::try_from(password.len()).map_err(|_| RelayError::InvalidEndpoint)?);
+    request.extend_from_slice(password.as_bytes());
+    stream.write_all(&request)?;
+    let mut reply = [0; 2];
+    stream.read_exact(&mut reply)?;
+    if reply != [1, 0] {
+        return Err(RelayError::Io(io::Error::other(
+            "SOCKS5 proxy rejected the credentials",
+        )));
+    }
+    Ok(())
+}
+
 fn connect_socks5(proxy: SocketAddr, host: &str, port: u16) -> Result<TcpStream, RelayError> {
     let mut stream = TcpStream::connect_timeout(&proxy, CONNECT_TIMEOUT)?;
     stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
     stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
-    stream.write_all(&[5, 1, 0])?;
+    // Offer both methods. Tor puts streams with different credentials on different
+    // circuits (IsolateSOCKSAuth), so every connection presents credentials of its own
+    // and relays and sessions do not share a circuit. A proxy that needs none is fine.
+    stream.write_all(&[5, 2, SOCKS_NO_AUTHENTICATION, SOCKS_USERNAME_PASSWORD])?;
     let mut selection = [0; 2];
     stream.read_exact(&mut selection)?;
-    if selection != [5, 0] {
-        return Err(RelayError::Io(io::Error::other(
-            "SOCKS5 proxy rejected no-authentication mode",
-        )));
+    if selection[0] != 5 {
+        return Err(RelayError::Io(io::Error::other("invalid SOCKS5 response")));
+    }
+    match selection[1] {
+        SOCKS_NO_AUTHENTICATION => {}
+        SOCKS_USERNAME_PASSWORD => authenticate_socks5(&mut stream)?,
+        SOCKS_NO_ACCEPTABLE_METHOD => {
+            return Err(RelayError::Io(io::Error::other(
+                "SOCKS5 proxy accepts neither no authentication nor username and password",
+            )))
+        }
+        _ => {
+            return Err(RelayError::Io(io::Error::other(
+                "SOCKS5 proxy chose an authentication method that was not offered",
+            )))
+        }
     }
     let host = host.as_bytes();
     let host_len = u8::try_from(host.len()).map_err(|_| RelayError::InvalidEndpoint)?;
@@ -2659,31 +2701,122 @@ mod tests {
         assert!(InviteCode::parse(&legacy).is_none());
     }
 
-    #[test]
-    fn socks_connection_sends_the_relay_hostname_to_the_proxy() {
+    /// What a fake SOCKS5 proxy saw during one connection.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct SocksTranscript {
+        offered_methods: Vec<u8>,
+        credentials: Option<(Vec<u8>, Vec<u8>)>,
+        hostname: Vec<u8>,
+    }
+
+    /// A one-connection SOCKS5 proxy. `choose` is the method the proxy selects from
+    /// those offered (0 = no authentication, 2 = username and password, 0xff = none
+    /// acceptable). It accepts any username and password.
+    fn fake_socks_proxy(choose: u8) -> (std::net::SocketAddr, thread::JoinHandle<SocksTranscript>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let proxy = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
+        let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut greeting = [0; 3];
-            stream.read_exact(&mut greeting).unwrap();
-            assert_eq!(greeting, [5, 1, 0]);
-            stream.write_all(&[5, 0]).unwrap();
-
+            let mut transcript = SocksTranscript::default();
+            let mut head = [0; 2];
+            stream.read_exact(&mut head).unwrap();
+            assert_eq!(head[0], 5);
+            transcript.offered_methods = vec![0; head[1] as usize];
+            stream.read_exact(&mut transcript.offered_methods).unwrap();
+            stream.write_all(&[5, choose]).unwrap();
+            if choose == 0xff {
+                return transcript;
+            }
+            if choose == 2 {
+                let mut version = [0; 2];
+                stream.read_exact(&mut version).unwrap();
+                assert_eq!(version[0], 1, "RFC 1929 sub-negotiation version");
+                let mut user = vec![0; version[1] as usize];
+                stream.read_exact(&mut user).unwrap();
+                let mut password_length = [0];
+                stream.read_exact(&mut password_length).unwrap();
+                let mut password = vec![0; password_length[0] as usize];
+                stream.read_exact(&mut password).unwrap();
+                transcript.credentials = Some((user, password));
+                stream.write_all(&[1, 0]).unwrap();
+            }
             let mut request = [0; 5];
             stream.read_exact(&mut request).unwrap();
             assert_eq!(&request[..4], &[5, 1, 0, 3]);
-            let mut hostname = vec![0; request[4] as usize];
-            stream.read_exact(&mut hostname).unwrap();
-            assert_eq!(hostname, b"relay.example");
+            transcript.hostname = vec![0; request[4] as usize];
+            stream.read_exact(&mut transcript.hostname).unwrap();
             let mut port = [0; 2];
             stream.read_exact(&mut port).unwrap();
-            assert_eq!(u16::from_be_bytes(port), 443);
             stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+            transcript
         });
+        (proxy, server)
+    }
 
-        let stream = super::connect_socks5(proxy, "relay.example", 443).unwrap();
-        drop(stream);
+    #[test]
+    fn socks_connection_offers_username_authentication_so_tor_can_isolate_circuits() {
+        let (proxy, server) = fake_socks_proxy(2);
+        drop(super::connect_socks5(proxy, "relay.example", 443).unwrap());
+        let transcript = server.join().unwrap();
+        assert!(transcript.offered_methods.contains(&2), "{transcript:?}");
+        assert_eq!(transcript.hostname, b"relay.example");
+        let (user, password) = transcript.credentials.expect("credentials were sent");
+        // RFC 1929 allows 1 to 255 bytes; random hex is long enough to be unique.
+        assert!(user.len() >= 16 && password.len() >= 16);
+        assert!(user.iter().chain(&password).all(u8::is_ascii_hexdigit));
+    }
+
+    #[test]
+    fn every_socks_connection_uses_credentials_of_its_own() {
+        // Tor gives streams with different credentials different circuits, so two
+        // relays, or two sessions, must never present the same ones.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..5 {
+            let (proxy, server) = fake_socks_proxy(2);
+            drop(super::connect_socks5(proxy, "relay.example", 443).unwrap());
+            let credentials = server.join().unwrap().credentials.unwrap();
+            assert!(seen.insert(credentials), "credentials were reused");
+        }
+    }
+
+    #[test]
+    fn a_proxy_that_needs_no_authentication_still_works_and_gets_no_credentials() {
+        let (proxy, server) = fake_socks_proxy(0);
+        drop(super::connect_socks5(proxy, "relay.example", 443).unwrap());
+        let transcript = server.join().unwrap();
+        assert_eq!(transcript.credentials, None);
+        assert_eq!(transcript.hostname, b"relay.example");
+    }
+
+    #[test]
+    fn a_proxy_that_accepts_none_of_our_methods_is_an_error_not_a_direct_connection() {
+        let (proxy, server) = fake_socks_proxy(0xff);
+        let error = super::connect_socks5(proxy, "relay.example", 443).unwrap_err();
+        assert!(format!("{error:?}").contains("authentication"), "{error:?}");
+        assert_eq!(server.join().unwrap().hostname, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn a_proxy_that_rejects_the_credentials_is_an_error() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = [0; 2];
+            stream.read_exact(&mut head).unwrap();
+            let mut methods = vec![0; head[1] as usize];
+            stream.read_exact(&mut methods).unwrap();
+            stream.write_all(&[5, 2]).unwrap();
+            let mut version = [0; 2];
+            stream.read_exact(&mut version).unwrap();
+            let mut rest = vec![0; version[1] as usize + 1];
+            stream.read_exact(&mut rest).unwrap();
+            let mut password = vec![0; *rest.last().unwrap() as usize];
+            stream.read_exact(&mut password).unwrap();
+            stream.write_all(&[1, 1]).unwrap();
+        });
+        let error = super::connect_socks5(proxy, "relay.example", 443).unwrap_err();
+        assert!(format!("{error:?}").contains("rejected"), "{error:?}");
         server.join().unwrap();
     }
 
@@ -2721,9 +2854,9 @@ mod tests {
         let proxy = proxy_listener.local_addr().unwrap();
         let proxy_server = thread::spawn(move || {
             let (mut stream, _) = proxy_listener.accept().unwrap();
-            let mut greeting = [0; 3];
+            let mut greeting = [0; 4];
             stream.read_exact(&mut greeting).unwrap();
-            assert_eq!(greeting, [5, 1, 0]);
+            assert_eq!(greeting, [5, 2, 0, 2]);
             stream.write_all(&[5, 0]).unwrap();
 
             let mut request = [0; 5];
