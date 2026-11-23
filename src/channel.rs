@@ -570,9 +570,10 @@ impl ActiveChannel {
 }
 
 /// Relay-compatible envelope ordering for one confirmed Noise session. The
-/// relay sees a per-session tag, direction-local sequence, and ciphertext; it
-/// cannot read the application payload. The tag is linkable within this
-/// session, but is derived from fresh handshake material, not the identity.
+/// relay sees the event's topic tag, a direction-local sequence number and
+/// ciphertext; it cannot read the application payload. Events of one session
+/// share a topic, so they are linkable to each other, but nothing in them is
+/// derived from the identity.
 pub struct SessionTransport {
     channel: ActiveChannel,
     send_sequence: u64,

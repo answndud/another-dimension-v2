@@ -1,7 +1,7 @@
 //! Minimal NIP-01 rendezvous and WebSocket adapter for Noise sessions.
 //!
 //! It publishes only kind-20000 ephemeral events. The relay still observes the
-//! session tag, timing, size, and connection IP in direct mode. Callers select
+//! topic tag, timing, size, and connection IP in direct mode. Callers select
 //! an optional loopback SOCKS5 proxy; proxy failures never fall back to direct.
 
 use crate::channel::MAX_ENVELOPE;
@@ -46,9 +46,9 @@ const EPOCH_INFO: &[u8] = b"another-dimension-v2/reconnect-epoch/v3";
 const MAX_EVENT_AGE_SECONDS: u64 = 5 * 60;
 const READY_REQUEST_PREFIX: &[u8] = b"\0AD2-READY-1:";
 const READY_ACK_PREFIX: &[u8] = b"\0AD2-READY-ACK-1:";
-/// The largest frame exchanged while a session is being set up. These frames are padded
-/// like chat messages, so the smallest size class plus its tag is the usual size and the
-/// limit has to allow for it.
+/// The largest frame exchanged while a session is being set up. Unlike chat messages
+/// these frames are not padded: each is as long as its content (the identity proof is the
+/// longest), and all fit in the smallest padded chat frame, which is used as the limit.
 const MAX_BOOTSTRAP_FRAME: usize = crate::channel::SMALLEST_PADDED_FRAME;
 const MAX_RELAY_MESSAGE: usize = 20 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_millis(250);
