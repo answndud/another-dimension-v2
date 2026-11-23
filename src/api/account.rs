@@ -70,6 +70,9 @@ pub(crate) fn identity_logout(
         let _ = operation.sender.send(ChatCommand::Cancel);
     }
     state.identity = None;
+    // The snapshots of ended chats hold the plaintext of their messages. Nothing can
+    // read them once the identity is gone, so they should not stay in memory.
+    forget_finished_chats(&mut state);
     // Logging out ends every session, including this one, and prints a new
     // connection code. Otherwise a copied token would still work for the
     // next identity that logs in.

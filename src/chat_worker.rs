@@ -848,7 +848,7 @@ pub(crate) fn spawn_chat_worker(
                                                 snapshot.message_epoch.wrapping_add(1);
                                         });
                                     })
-                                    .map_err(|error| error.to_string()),
+                                    .map_err(|error| client_message("이전 신원 연결", &error)),
                                 None => Err("현재 대화 기록을 사용할 수 없습니다.".to_owned()),
                             }
                         } else {

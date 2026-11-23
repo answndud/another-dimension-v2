@@ -1845,6 +1845,76 @@ fn a_stalled_chat_worker_does_not_freeze_the_rest_of_the_api() {
 }
 
 #[test]
+fn a_chunk_cannot_be_appended_to_an_upload_while_an_import_is_running() {
+    let data = TestDataDirectory::new();
+    let _ = &data;
+    let (identity, _) = Identity::create().unwrap();
+    let state = test_state_for(identity);
+    let started = call_test_api(
+        &state,
+        "/api/history/backup-transfer",
+        r#"{"action":"upload-start"}"#,
+        "test-session",
+    );
+    let started: serde_json::Value =
+        serde_json::from_str(started.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let id = started["transferId"].as_str().unwrap().to_owned();
+    let chunk = |offset: u64| {
+        serde_json::json!({
+            "action": "upload-chunk", "transferId": id,
+            "offset": offset, "data": BASE64.encode(b"abc")
+        })
+        .to_string()
+    };
+    let first = call_test_api(
+        &state,
+        "/api/history/backup-transfer",
+        &chunk(0),
+        "test-session",
+    );
+    assert!(first.starts_with("HTTP/1.1 200 OK"), "{first}");
+    state.lock().unwrap().history_import_active = true;
+    let during = call_test_api(
+        &state,
+        "/api/history/backup-transfer",
+        &chunk(3),
+        "test-session",
+    );
+    assert!(during.starts_with("HTTP/1.1 409 Conflict"), "{during}");
+    state.lock().unwrap().history_import_active = false;
+    let after = call_test_api(
+        &state,
+        "/api/history/backup-transfer",
+        &chunk(3),
+        "test-session",
+    );
+    assert!(
+        after.starts_with("HTTP/1.1 200 OK"),
+        "the refused chunk wrote nothing: {after}"
+    );
+}
+
+#[test]
+fn logging_out_forgets_the_plaintext_of_finished_chats_but_not_running_ones() {
+    let (identity, _) = Identity::create().unwrap();
+    let owner = identity.public_id().to_owned();
+    let finished = closed_test_operation(&owner, &"7d".repeat(32), 1, 0);
+    let (running, _receiver) = stalled_worker_operation(&owner, &"7e".repeat(32));
+    let mut chats = HashMap::new();
+    chats.insert("finished".to_owned(), finished);
+    chats.insert("running".to_owned(), running);
+    let state = test_state(Some(Arc::new(identity)), chats);
+    let response = call_test_api(&state, "/api/identity/logout", "", "test-session");
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let state = state.lock().unwrap();
+    assert!(!state.chats.contains_key("finished"));
+    assert!(
+        state.chats.contains_key("running"),
+        "a chat that is still running must stay reachable for its cancellation"
+    );
+}
+
+#[test]
 fn chat_operation_apis_are_scoped_to_the_creating_identity() {
     let (identity_a, _) = Identity::create().unwrap();
     let owner_id = identity_a.public_id().to_owned();

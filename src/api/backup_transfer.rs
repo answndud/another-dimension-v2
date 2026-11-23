@@ -172,6 +172,11 @@ pub(crate) fn history_backup_transfer(
             response_json(stream, serde_json::json!({"transferId": id}))
         }
         "upload-chunk" => {
+            // An import reads its transfer file while the State lock is released. A
+            // chunk appended meanwhile would change what it is reading.
+            if state.history_import_active {
+                return reject(stream, "409 Conflict");
+            }
             let Some(id) = fields
                 .remove("transferId")
                 .and_then(|v| v.as_str().map(str::to_owned))

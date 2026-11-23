@@ -37,6 +37,16 @@ pub(crate) fn peer_chat_active(state: &State, peer_id: &str) -> bool {
     })
 }
 
+/// Drops the chats that have ended, with the plaintext their snapshots keep. A chat that
+/// is still running, or still merging a restore, stays.
+pub(crate) fn forget_finished_chats(state: &mut State) {
+    state.chats.retain(|_, operation| {
+        operation.snapshot.lock().map_or(true, |snapshot| {
+            !matches!(snapshot.phase, "closed" | "failed" | "disconnected")
+        })
+    });
+}
+
 pub(crate) fn any_chat_active(state: &State) -> bool {
     state.chats.values().any(|operation| {
         operation
