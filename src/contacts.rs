@@ -117,15 +117,32 @@ fn save_inner(
     let path = directory.join(format!("{name}.peer"));
     // Existing records must never be silently replaced by another secret.
     if path.exists() {
-        let old = load(directory, identity, contact.peer_key)?;
-        if old.rendezvous_secret.as_ref() == contact.rendezvous_secret.as_ref() {
-            return Ok(());
-        }
-        if !replace_confirmed {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "contact conflict",
-            ));
+        match load(directory, identity, contact.peer_key) {
+            Ok(old) => {
+                if old.rendezvous_secret.as_ref() == contact.rendezvous_secret.as_ref() {
+                    return Ok(());
+                }
+                if !replace_confirmed {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "contact conflict",
+                    ));
+                }
+            }
+            // A record that cannot be authenticated holds no secret worth protecting
+            // from replacement. Without this a damaged file blocked every later
+            // confirmation of the same peer until someone deleted it by hand. Only a
+            // fresh mutual confirmation may replace it, and the old bytes stay aside.
+            Err(error) if replace_confirmed && error.kind() == io::ErrorKind::InvalidData => {
+                let mut tag = [0; 6];
+                crate::random::fill(&mut tag)?;
+                let aside = directory.join(format!(
+                    "{name}.peer.damaged-{}",
+                    tag.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                ));
+                fs::hard_link(&path, &aside)?;
+            }
+            Err(error) => return Err(error),
         }
     }
     let mut nonce = [0; 12];
@@ -464,6 +481,40 @@ mod tests {
             [4; 32]
         );
         // The upgrade must not have broken the legacy path for other records.
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_record_does_not_block_a_fresh_confirmation_and_is_kept_aside() {
+        let directory = scratch_directory("damaged-record");
+        let (identity, _) = Identity::create().unwrap();
+        save(&directory, &identity, &contact(5)).unwrap();
+        let path = directory.join(format!("{}.peer", filename(&identity, &[7; 32])));
+        let mut damaged = fs::read(&path).unwrap();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 1;
+        fs::write(&path, &damaged).unwrap();
+
+        // Saving without a confirmation still refuses: nothing may overwrite a record on
+        // the strength of its being unreadable alone.
+        assert!(save(&directory, &identity, &contact(6)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+
+        // A fresh mutual confirmation replaces it, and the bytes are not thrown away.
+        save_after_confirmation(&directory, &identity, &contact(6)).unwrap();
+        assert_eq!(
+            *load(&directory, &identity, [7; 32])
+                .unwrap()
+                .rendezvous_secret,
+            [6; 32]
+        );
+        let kept: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.to_string_lossy().contains(".damaged-"))
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read(&kept[0]).unwrap(), damaged);
         fs::remove_dir_all(directory).unwrap();
     }
 
