@@ -272,6 +272,10 @@ pub struct History {
     file_version: HistoryFileVersion,
     format: LogFormat,
     integrity_warning: Option<IntegrityWarning>,
+    /// Set when a write path found the log inconsistent with the anchor. The anchor is
+    /// then left as it was, so the finding is not erased by the next write and the next
+    /// open of the conversation reports it.
+    anchor_suspect: bool,
     operation_lock: Arc<Mutex<()>>,
 }
 

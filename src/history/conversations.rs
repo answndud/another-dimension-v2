@@ -242,6 +242,7 @@ impl History {
                 file_version: version,
                 format,
                 integrity_warning: None,
+                anchor_suspect: false,
                 operation_lock: Arc::clone(&operation_lock),
             };
             history.replace_filtered_unlocked(&mut reader, keep, validate)

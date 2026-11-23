@@ -720,6 +720,7 @@ impl History {
             file_version,
             format,
             integrity_warning: None,
+            anchor_suspect: false,
             operation_lock: Arc::clone(&operation_lock),
         };
         history.check_anchor();
@@ -816,6 +817,7 @@ impl History {
             file_version,
             format,
             integrity_warning: None,
+            anchor_suspect: false,
             operation_lock: Arc::clone(&operation_lock),
         };
         history.check_anchor();
@@ -879,7 +881,7 @@ impl History {
         register_conversation(identity, &identity_id, &peer_id, &directory)?;
         unlock_conversation_file(file_lock);
         drop(operation_guard);
-        Ok(Self {
+        let mut history = Self {
             file,
             path,
             key,
@@ -889,8 +891,11 @@ impl History {
             file_version,
             format,
             integrity_warning: None,
+            anchor_suspect: false,
             operation_lock,
-        })
+        };
+        history.guard_anchor(&format, next_index);
+        Ok(history)
     }
 
     pub(crate) fn directory(&self) -> &std::path::Path {
@@ -909,6 +914,9 @@ impl History {
     /// Records the log's current generation and length. The log is already durable, so
     /// a failure here leaves the anchor behind the log, which is the safe direction.
     pub(crate) fn record_anchor(&self) {
+        if self.anchor_suspect {
+            return;
+        }
         let Some(generation) = self.generation() else {
             return;
         };
@@ -931,6 +939,9 @@ impl History {
     /// Records the generation a replacement is about to install, before the rename, so a
     /// crash right after it is not mistaken for tampering.
     pub(crate) fn announce_replacement(&self, next: &LogFormat) -> io::Result<()> {
+        if self.anchor_suspect {
+            return Ok(());
+        }
         let LogFormat::V3 { generation } = next else {
             return Ok(());
         };
@@ -961,21 +972,24 @@ impl History {
         )
     }
 
-    /// Compares the log that was just opened with the recorded state, remembers any
-    /// finding, and records the log's state from now on.
-    pub(crate) fn check_anchor(&mut self) {
+    /// Compares a log's generation and record count with the recorded state.
+    fn anchor_finding(&self, format: &LogFormat, records: u64) -> Option<IntegrityWarning> {
         let loaded = crate::anchor::load(
             &self.key,
             &self.identity_id,
             self.directory(),
             &self.peer_id,
         );
-        self.integrity_warning = match (&loaded, self.generation()) {
+        let generation = match format {
+            LogFormat::V3 { generation } => Some(*generation),
+            LogFormat::V1 | LogFormat::V2 => None,
+        };
+        match (&loaded, generation) {
             (Err(_), _) => Some(IntegrityWarning::AnchorUnreadable),
             // A log of an older format cannot have been the one this program anchored.
             (Ok(anchor), None) => anchor.map(|_| IntegrityWarning::UnknownGeneration),
             (Ok(anchor), Some(generation)) => {
-                match crate::anchor::verify(anchor.as_ref(), generation, self.next_index) {
+                match crate::anchor::verify(anchor.as_ref(), generation, records) {
                     crate::anchor::Verdict::Unanchored | crate::anchor::Verdict::Consistent => None,
                     crate::anchor::Verdict::Truncated { recorded, found } => {
                         Some(IntegrityWarning::Truncated { recorded, found })
@@ -985,8 +999,36 @@ impl History {
                     }
                 }
             }
-        };
+        }
+    }
+
+    /// Compares the log that was just opened with the recorded state, remembers any
+    /// finding, and records the log's state from now on.
+    pub(crate) fn check_anchor(&mut self) {
+        self.integrity_warning = self.anchor_finding(&self.format, self.next_index);
+        self.anchor_suspect = false;
         self.record_anchor();
+    }
+
+    /// For a path that takes whatever log is on disk (a refresh before an append, a
+    /// rewrite, a merge): checks the log against the anchor before the anchor is
+    /// brought in line with it. On a finding the anchor is left as it was, so the write
+    /// does not erase the evidence, and the next open of the conversation reports it.
+    pub(crate) fn guard_anchor(&mut self, format: &LogFormat, records: u64) {
+        if let Some(finding) = self.anchor_finding(format, records) {
+            self.integrity_warning.get_or_insert(finding);
+            self.anchor_suspect = true;
+        }
+    }
+
+    /// A finding made after the conversation was opened, once. `integrity_warning` keeps
+    /// the open-time finding for the caller that reads it right after opening.
+    pub(crate) fn take_integrity_finding(&mut self) -> Option<IntegrityWarning> {
+        if self.anchor_suspect {
+            self.integrity_warning.take()
+        } else {
+            None
+        }
     }
 
     pub(crate) fn integrity_warning(&self) -> Option<IntegrityWarning> {
@@ -1150,6 +1192,7 @@ impl History {
                 }
             }
             validate(reader.index())?;
+            self.guard_anchor(&reader.format, reader.index());
             #[cfg(test)]
             if test_failure_once(FAIL_HISTORY_DELETE_SYNC) {
                 return Err(io::Error::other("injected history delete sync failure"));
@@ -1230,6 +1273,7 @@ impl History {
             }
             format = reader.format;
         }
+        self.guard_anchor(&format, next_index);
         let file = crate::fsutil::private_options()
             .read(true)
             .append(true)

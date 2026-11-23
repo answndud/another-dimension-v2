@@ -19,6 +19,17 @@
 
 ## 기록
 
+## SF-021 롤백 탐지가 대화를 "여는" 경로에만 있었음 (SF-019 보완)
+
+- 날짜: 2026-11-23
+- 심각도: Medium
+- 위치: `src/history/log.rs`(`refresh_for_append`, `replace_filtered_unlocked`, `open_for_streaming_merge`, 새 `guard_anchor`·`anchor_finding`·`take_integrity_finding`, `record_anchor`·`announce_replacement`의 `anchor_suspect` 검사), `src/chat_worker.rs`(`append_and_check`)
+- 발견: 최종 리뷰에서 지적하고 리뷰어가 복사본에서 재현했습니다. SF-019의 앵커 비교는 `open`/`open_for_chat`에만 있었고, 디스크의 로그를 그대로 받아들이는 다른 경로가 비교 없이 **앵커를 그 로그에 맞춰 덮어썼습니다**: ① 채팅이 열린 동안의 `append`(`refresh_for_append`) ② 날짜 범위·선택 삭제 ③ 상대 기록 복원 병합.
+- 영향: ① 대화가 열린 동안 로그를 레코드 경계에서 자르거나 옛 복사본으로 바꾸면 다음 메시지 저장이 줄어든 개수를 앵커에 기록해 흔적이 사라졌고, ② 앱이 꺼진 사이 로그를 자른 뒤 기록 관리에서 날짜 범위를 삭제하면 새 세대가 경고 없이 기록됐습니다. SECURITY.md가 말한 "파일 하나만 건드리면 탐지"가 이 경로들에서는 성립하지 않았습니다.
+- 수정: 이 세 경로는 로그를 받아들이기 전에 앵커와 비교합니다(`guard_anchor`). 불일치가 나오면 `anchor_suspect`를 켜고, 그 핸들은 **앵커를 갱신하지도 새 세대를 예고하지도 않습니다.** 그래서 증거가 지워지지 않고, 다음에 대화를 열 때 `UnknownGeneration`(교체·삭제·병합 뒤) 또는 `Truncated`로 보고됩니다. 채팅이 열린 동안의 발견은 `append_and_check`가 화면의 저장 상태 안내로 즉시 알립니다(한 번).
+- 회귀 테스트: `a_log_cut_while_the_chat_is_open_is_reported_by_the_next_append`, `a_log_cut_while_the_app_was_off_is_not_forgotten_by_a_range_delete`, `a_log_cut_while_the_app_was_off_is_not_forgotten_by_a_restore_merge`, `the_chat_worker_gets_a_notice_when_an_append_finds_the_log_cut`, 거짓 경보 방지 `a_second_handle_appending_is_not_mistaken_for_tampering`(두 핸들이 번갈아 추가하고 다른 핸들이 삭제해 세대가 바뀌는 정상 사용). 변이 검사: 세 경로의 `guard_anchor` 호출을 각각 빼면 해당 테스트만, `record_anchor`나 `announce_replacement`에서 `anchor_suspect` 검사를 빼면 삭제·병합 테스트 둘이 실패하는 것을 확인했습니다.
+- 남은 한계: 채팅 중 발견은 화면 안내로만 알리고 기록을 막지 않습니다. `anchor_suspect`인 핸들이 살아 있는 동안 앵커는 갱신되지 않으므로, 그 사이 정상적으로 쌓인 메시지는 다음에 대화를 열 때 한 번 더 비교한 뒤 앵커에 반영됩니다. 채팅 중 알림이 실제로 화면에 나오는지는 `append_and_check`를 직접 부르는 테스트까지만 확인했고 워커의 호출 지점 두 곳은 별도 테스트가 없습니다. 삭제한 대화를 옛 파일로 되살리는 경우는 이 수정이 다루지 않습니다(PLAN 5.2).
+
 ## SF-020 서명된 최대 길이 메시지 하나가 대화의 백업 검증과 복원을 막음
 
 - 날짜: 2026-11-23

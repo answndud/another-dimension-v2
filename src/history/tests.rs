@@ -1781,6 +1781,123 @@ fn a_log_cut_at_a_record_boundary_is_reported_once() {
 }
 
 #[test]
+fn a_log_cut_while_the_chat_is_open_is_reported_by_the_next_append() {
+    // The append path takes whatever log is on disk. It used to count the shortened log
+    // and write that count into the anchor, which erased the only record of the cut.
+    let _data = IsolatedData::new();
+    let (identity, _) = Identity::create().unwrap();
+    let peer = "91".repeat(32);
+    let (mut history, _, _) = History::open_for_chat(&identity, &peer).unwrap();
+    for index in 0..3 {
+        history.append(&message(index, "text")).unwrap();
+    }
+    let path = conversation_path(&identity, &peer);
+    let bytes = std::fs::read(&path).unwrap();
+    let (_, records) = records_of(&bytes);
+    std::fs::write(&path, &bytes[..records[1].end]).unwrap();
+    history.append(&message(9, "after the cut")).unwrap();
+    assert_eq!(
+        history.take_integrity_finding(),
+        Some(super::IntegrityWarning::Truncated {
+            recorded: 3,
+            found: 2
+        })
+    );
+    assert_eq!(history.take_integrity_finding(), None, "reported once");
+}
+
+#[test]
+fn the_chat_worker_gets_a_notice_when_an_append_finds_the_log_cut() {
+    let _data = IsolatedData::new();
+    let (identity, _) = Identity::create().unwrap();
+    let peer = "96".repeat(32);
+    let (history, _, _) = History::open_for_chat(&identity, &peer).unwrap();
+    let mut history = Some(history);
+    for index in 0..3 {
+        let (error, note) =
+            crate::chat_worker::append_and_check(&mut history, &message(index, "t"));
+        assert!(
+            error.is_none() && note.is_none(),
+            "ordinary appends are quiet"
+        );
+    }
+    let path = conversation_path(&identity, &peer);
+    let bytes = std::fs::read(&path).unwrap();
+    let (_, records) = records_of(&bytes);
+    std::fs::write(&path, &bytes[..records[1].end]).unwrap();
+    let (error, note) = crate::chat_worker::append_and_check(&mut history, &message(9, "t"));
+    assert!(error.is_none());
+    let note = note.expect("the cut is reported to the page");
+    assert!(note.contains("3개였는데 2개"), "{note}");
+    let (_, note) = crate::chat_worker::append_and_check(&mut history, &message(10, "t"));
+    assert!(note.is_none(), "reported once");
+}
+
+#[test]
+fn a_log_cut_while_the_app_was_off_is_not_forgotten_by_a_range_delete() {
+    let _data = IsolatedData::new();
+    let (identity, _) = Identity::create().unwrap();
+    let peer = "92".repeat(32);
+    append_messages(&identity, &peer, 4);
+    let path = conversation_path(&identity, &peer);
+    let bytes = std::fs::read(&path).unwrap();
+    let (_, records) = records_of(&bytes);
+    std::fs::write(&path, &bytes[..records[2].end]).unwrap();
+    // The rewrite starts a new generation. It used to record that generation as if the
+    // cut log were the real one, so opening afterwards had nothing to compare.
+    History::delete_time_range(&identity, &peer, 0, 0).unwrap();
+    assert_eq!(
+        warning_on_open(&identity, &peer),
+        Some(super::IntegrityWarning::UnknownGeneration)
+    );
+    assert_eq!(warning_on_open(&identity, &peer), None, "reported once");
+}
+
+#[test]
+fn a_log_cut_while_the_app_was_off_is_not_forgotten_by_a_restore_merge() {
+    let _data = IsolatedData::new();
+    let (identity, _) = Identity::create().unwrap();
+    let peer = "93".repeat(32);
+    append_messages(&identity, &peer, 3);
+    let path = conversation_path(&identity, &peer);
+    let bytes = std::fs::read(&path).unwrap();
+    let (_, records) = records_of(&bytes);
+    std::fs::write(&path, &bytes[..records[1].end]).unwrap();
+    let mut staging = RestoreStaging::create(&identity, &peer, &"94".repeat(32)).unwrap();
+    staging.append_verified(&message(50, "restored")).unwrap();
+    staging.finish().unwrap();
+    let mut history = History::open_for_streaming_merge(&identity, &peer).unwrap();
+    history
+        .merge_restore_staging(&identity, &mut staging)
+        .unwrap();
+    drop(history);
+    assert_eq!(
+        warning_on_open(&identity, &peer),
+        Some(super::IntegrityWarning::UnknownGeneration)
+    );
+}
+
+#[test]
+fn a_second_handle_appending_is_not_mistaken_for_tampering() {
+    let _data = IsolatedData::new();
+    let (identity, _) = Identity::create().unwrap();
+    let peer = "95".repeat(32);
+    let (mut first, _, _) = History::open_for_chat(&identity, &peer).unwrap();
+    first.append(&message(1, "one")).unwrap();
+    let (mut second, _, _) = History::open_for_chat(&identity, &peer).unwrap();
+    second.append(&message(2, "two")).unwrap();
+    // The first handle now finds a longer log than it wrote, and a replace by another
+    // handle, which changes the generation, is just as legitimate.
+    first.append(&message(3, "three")).unwrap();
+    assert_eq!(first.take_integrity_finding(), None);
+    History::delete_time_range(&identity, &peer, 1, 1).unwrap();
+    first.append(&message(4, "four")).unwrap();
+    assert_eq!(first.take_integrity_finding(), None);
+    drop((first, second));
+    assert_eq!(warning_on_open(&identity, &peer), None);
+}
+
+#[test]
 fn an_older_copy_of_the_log_is_reported_after_a_replace() {
     let _data = IsolatedData::new();
     let (identity, _) = Identity::create().unwrap();

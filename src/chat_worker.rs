@@ -753,14 +753,18 @@ pub(crate) fn spawn_chat_worker(
                                     .history_state_lock
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner());
-                                let save_error = match history.as_mut() {
-                                    Some(history) => history.append(&entry).err(),
-                                    None => Some(io::Error::other("history unavailable")),
-                                };
+                                let (save_error, integrity_note) =
+                                    append_and_check(&mut history, &entry);
                                 if save_error.is_some() {
                                     history = None;
                                 }
                                 chat_update(&operation, |snapshot| {
+                                    if let Some(note) = &integrity_note {
+                                        snapshot.storage_error = Some(append_error_detail(
+                                            snapshot.storage_error.take(),
+                                            note,
+                                        ));
+                                    }
                                     snapshot.message_count =
                                         snapshot.message_count.saturating_add(1);
                                     snapshot.messages.push(ChatEntry {
@@ -1113,14 +1117,18 @@ pub(crate) fn spawn_chat_worker(
                                 .history_state_lock
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner());
-                            let save_error = match history.as_mut() {
-                                Some(history) => history.append(&entry).err(),
-                                None => Some(io::Error::other("history unavailable")),
-                            };
+                            let (save_error, integrity_note) =
+                                append_and_check(&mut history, &entry);
                             if save_error.is_some() {
                                 history = None;
                             }
                             chat_update(&operation, |snapshot| {
+                                if let Some(note) = &integrity_note {
+                                    snapshot.storage_error = Some(append_error_detail(
+                                        snapshot.storage_error.take(),
+                                        note,
+                                    ));
+                                }
                                 snapshot.message_count = snapshot.message_count.saturating_add(1);
                                 snapshot.messages.push(chat_entry(entry));
                                 if save_error.is_some() {
@@ -1984,6 +1992,25 @@ pub(crate) fn now_seconds() -> u64 {
 /// file name is still enough to find a temporary file by hand.
 /// The notice shown when a conversation's log does not match what this program last
 /// recorded for it. It says what was seen and what it does not prove.
+/// Appends to the open conversation. Besides the save error it returns a notice when
+/// the append had to adopt a log that no longer matches what was last written (it was cut
+/// short or swapped while the chat was open), which the page then shows.
+pub(crate) fn append_and_check(
+    history: &mut Option<history::History>,
+    entry: &history::StoredMessage,
+) -> (Option<io::Error>, Option<String>) {
+    match history.as_mut() {
+        Some(history) => {
+            let error = history.append(entry).err();
+            let note = history
+                .take_integrity_finding()
+                .map(history_integrity_message);
+            (error, note)
+        }
+        None => (Some(io::Error::other("history unavailable")), None),
+    }
+}
+
 pub(crate) fn history_integrity_message(warning: history::IntegrityWarning) -> String {
     match warning {
         history::IntegrityWarning::Truncated { recorded, found } => format!(
