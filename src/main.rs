@@ -3,11 +3,13 @@ mod contacts;
 pub mod history;
 mod identity;
 pub mod relay;
+mod session;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use identity::Identity;
 use relay::{InviteCode, RelayError, RelayRendezvous, RelaySession, RelayUpdate, DEFAULT_RELAY};
+use session::SessionStore;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{create_dir_all, rename, File, OpenOptions};
 use std::io::{self, BufRead, Read, Seek, Write};
@@ -31,6 +33,9 @@ const MAX_BODY: usize = 2 * 1024 * 1024;
 const CHAT_CONTROL_PREFIX: &[u8] = b"[AD2-CONTROL/1] ";
 const CODE_LIFETIME: Duration = Duration::from_secs(300);
 const MAX_ATTEMPTS: u8 = 5;
+/// Returned when the session is valid but no identity is logged in. A rejected or
+/// expired session is a plain 401 instead, so the page can tell the two apart.
+const IDENTITY_REQUIRED: &str = "412 Precondition Failed";
 const PEER_HEARTBEAT_FRAME: &[u8] = &[0xff, b'A', b'D', b'2', b'-', b'H', b'B', b'2'];
 const PEER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const PEER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
@@ -46,7 +51,7 @@ struct State {
     code: String,
     issued: Instant,
     attempts: u8,
-    sessions: Vec<String>,
+    sessions: SessionStore,
     identity: Option<Arc<Identity>>,
     chats: HashMap<String, Arc<ChatOperation>>,
     history_deletions: HashMap<String, Arc<HistoryDeletionOperation>>,
@@ -859,7 +864,7 @@ mod send_tests {
             code: String::new(),
             issued: Instant::now(),
             attempts: 0,
-            sessions: vec!["test-session".to_owned()],
+            sessions: SessionStore::with_token("test-session"),
             identity: Some(Arc::new(identity)),
             chats: HashMap::new(),
             history_deletions: HashMap::new(),
@@ -955,7 +960,7 @@ mod send_tests {
             code: String::new(),
             issued: Instant::now(),
             attempts: 0,
-            sessions: vec!["test-session".to_owned()],
+            sessions: SessionStore::with_token("test-session"),
             identity: Some(Arc::new(identity)),
             chats: HashMap::new(),
             history_deletions: HashMap::new(),
@@ -990,6 +995,110 @@ mod send_tests {
         );
         assert!(written.starts_with("HTTP/1.1 200 OK"), "{written}");
         id
+    }
+
+    fn status_line(response: &str) -> &str {
+        response.lines().next().unwrap_or("")
+    }
+
+    #[test]
+    fn rejected_session_is_401_but_missing_identity_is_412() {
+        let _data = TestDataDirectory::new();
+        let (identity, _) = Identity::create().unwrap();
+        let state = test_state_for(identity);
+        state.lock().unwrap().identity = None;
+        // A valid session with no identity logged in is a precondition failure, not an
+        // authentication failure, so the page does not send the user back to pairing.
+        for route in [
+            "/api/identity/status",
+            "/api/history/list",
+            "/api/history/backup-transfer",
+            "/api/contacts/export-backup",
+        ] {
+            let valid = call_test_api(&state, route, "{}", "test-session");
+            assert!(
+                status_line(&valid).starts_with("HTTP/1.1 412"),
+                "{route}: {valid}"
+            );
+            let wrong = call_test_api(&state, route, "{}", "not-a-session");
+            assert!(
+                status_line(&wrong).starts_with("HTTP/1.1 401"),
+                "{route}: {wrong}"
+            );
+            let missing = call_test_api(&state, route, "{}", "");
+            assert!(
+                status_line(&missing).starts_with("HTTP/1.1 401"),
+                "{route}: {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_connection_code_ends_every_existing_session() {
+        let _data = TestDataDirectory::new();
+        let (identity, _) = Identity::create().unwrap();
+        let state = test_state_for(identity);
+        state.lock().unwrap().identity = None;
+        let first_code = {
+            let mut guard = state.lock().unwrap();
+            issue_code(&mut guard).unwrap();
+            guard.code.clone()
+        };
+        let paired = call_test_api(&state, "/api/connect", &first_code, "");
+        assert!(status_line(&paired).starts_with("HTTP/1.1 200"), "{paired}");
+        let token = paired.split("\r\n\r\n").nth(1).unwrap().to_owned();
+        let status = |token: &str| {
+            status_line(&call_test_api(&state, "/api/identity/status", "", token)).to_owned()
+        };
+        assert!(status(&token).starts_with("HTTP/1.1 412"), "session works");
+        // Issuing the first code already ended the fixture session.
+        assert!(status("test-session").starts_with("HTTP/1.1 401"));
+
+        // Pressing Enter in the terminal issues a new code.
+        issue_code(&mut state.lock().unwrap()).unwrap();
+        assert!(
+            status(&token).starts_with("HTTP/1.1 401"),
+            "paired session ended"
+        );
+        // The old connection code no longer works either.
+        let replay = call_test_api(&state, "/api/connect", &first_code, "");
+        assert!(status_line(&replay).starts_with("HTTP/1.1 403"), "{replay}");
+    }
+
+    #[test]
+    fn logout_ends_every_session_and_offers_a_new_connection_code() {
+        let _data = TestDataDirectory::new();
+        let (identity, _) = Identity::create().unwrap();
+        let state = test_state_for(identity);
+        state
+            .lock()
+            .unwrap()
+            .sessions
+            .issue("other-session".to_owned(), Instant::now());
+        let status = |token: &str| {
+            status_line(&call_test_api(&state, "/api/identity/status", "", token)).to_owned()
+        };
+        assert!(status("test-session").starts_with("HTTP/1.1 200"));
+        assert!(status("other-session").starts_with("HTTP/1.1 200"));
+
+        let logged_out = call_test_api(&state, "/api/identity/logout", "", "test-session");
+        assert!(
+            status_line(&logged_out).starts_with("HTTP/1.1 200"),
+            "{logged_out}"
+        );
+        // A copied token must not survive the logout, or it would work for whoever
+        // logs in next.
+        assert!(status("test-session").starts_with("HTTP/1.1 401"));
+        assert!(status("other-session").starts_with("HTTP/1.1 401"));
+        assert!(state.lock().unwrap().identity.is_none());
+
+        // The user can pair again with the code printed at logout.
+        let code = state.lock().unwrap().code.clone();
+        assert!(!code.is_empty(), "logout issues a new connection code");
+        let paired = call_test_api(&state, "/api/connect", &code, "");
+        assert!(status_line(&paired).starts_with("HTTP/1.1 200"), "{paired}");
+        let token = paired.split("\r\n\r\n").nth(1).unwrap().to_owned();
+        assert!(status(&token).starts_with("HTTP/1.1 412"));
     }
 
     #[test]
@@ -1139,7 +1248,7 @@ mod send_tests {
             code: String::new(),
             issued: Instant::now(),
             attempts: 0,
-            sessions: vec!["test-session".to_owned()],
+            sessions: SessionStore::with_token("test-session"),
             identity: None,
             chats: HashMap::new(),
             history_deletions: HashMap::new(),
@@ -1866,7 +1975,7 @@ mod send_tests {
             code: String::new(),
             issued: Instant::now(),
             attempts: 0,
-            sessions: vec!["test-session".to_owned()],
+            sessions: SessionStore::with_token("test-session"),
             identity: Some(Arc::new(test_identity)),
             chats,
             history_deletions: HashMap::new(),
@@ -2010,7 +2119,7 @@ mod send_tests {
             code: String::new(),
             issued: Instant::now(),
             attempts: 0,
-            sessions: vec!["test-session".to_owned()],
+            sessions: SessionStore::with_token("test-session"),
             identity: Some(Arc::new(identity_b)),
             chats,
             history_deletions: HashMap::new(),
@@ -2296,7 +2405,7 @@ mod send_tests {
             code: String::new(),
             issued: Instant::now(),
             attempts: 0,
-            sessions: vec!["test-session".to_owned()],
+            sessions: SessionStore::with_token("test-session"),
             identity: Some(Arc::new(restored_identity)),
             chats: HashMap::from([("count-operation".to_owned(), Arc::clone(&operation))]),
             history_deletions: HashMap::new(),
@@ -2629,7 +2738,7 @@ mod send_tests {
             code: String::new(),
             issued: Instant::now(),
             attempts: 0,
-            sessions: Vec::new(),
+            sessions: SessionStore::default(),
             identity: None,
             chats: HashMap::from([
                 ("a".to_owned(), Arc::clone(&operation_a)),
@@ -2687,7 +2796,7 @@ mod send_tests {
             code: String::new(),
             issued: Instant::now(),
             attempts: 0,
-            sessions: vec!["test-session".to_owned()],
+            sessions: SessionStore::with_token("test-session"),
             identity: Some(Arc::new(Identity::from_code(&code_a).unwrap())),
             chats: HashMap::from([
                 ("closed-a".to_owned(), Arc::clone(&operation_a)),
@@ -4816,10 +4925,13 @@ fn take_legacy_policy(
     }
 }
 
+/// Issues a fresh one-time connection code. Every existing session ends, so a
+/// token that leaked earlier cannot outlive the pairing it came from.
 fn issue_code(state: &mut State) -> io::Result<()> {
     state.code = random_token()?;
     state.issued = Instant::now();
     state.attempts = 0;
+    state.sessions.revoke_all();
     println!("로컬 연결 코드: {}", state.code);
     println!("새 연결 코드를 발급하려면 Enter를 누르세요.");
     Ok(())
@@ -5174,7 +5286,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         }
         let token = random_token()?;
         state.code.clear();
-        state.sessions.push(token.clone());
+        state.sessions.issue(token.clone(), Instant::now());
         return respond(
             &mut stream,
             "200 OK",
@@ -5186,15 +5298,11 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         .as_deref()
         .and_then(|value| value.strip_prefix("Bearer "))
         .unwrap_or("");
-    let Some(index) = state
-        .sessions
-        .iter()
-        .position(|item| equal_token(item, token))
-    else {
+    if !state.sessions.authorize(token, Instant::now()) {
         return reject(&mut stream, "401 Unauthorized");
-    };
+    }
     if first == "POST /api/disconnect HTTP/1.1" {
-        state.sessions.remove(index);
+        state.sessions.revoke(token);
         return respond(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok");
     }
     if first == "POST /api/network/mode HTTP/1.1" {
@@ -5295,7 +5403,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     }
     if first == "POST /api/identity/add-code HTTP/1.1" {
         let Some(identity) = state.identity.as_ref() else {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         };
         if !body.is_empty() {
             return reject(&mut stream, "400 Bad Request");
@@ -5310,14 +5418,14 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     }
     if first == "POST /api/identity/replace HTTP/1.1" {
         if state.identity.is_none() {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         }
         if !body.is_empty() || any_chat_active(&state) || !state.active_history_deletions.is_empty()
         {
             return reject(&mut stream, "409 Conflict");
         }
         let Some(current) = state.identity.as_ref() else {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         };
         let (replacement, code) = Identity::create()?;
         if current.copy_local_data_to(&replacement).is_err() {
@@ -5340,7 +5448,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             return reject(&mut stream, "409 Conflict");
         }
         if state.identity.is_none() {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         }
         let invite = InviteCode::generate()?;
         return respond(
@@ -5362,7 +5470,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
             return reject(&mut stream, "409 Conflict");
         }
         let Some(identity) = state.identity.as_ref().cloned() else {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         };
         let (code, expected_peer, reconnect_role) = if first == "POST /api/chat/reconnect HTTP/1.1"
         {
@@ -5628,7 +5736,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         }
         drop(snapshot);
         let Some(identity) = state.identity.as_ref() else {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         };
         let contact_directory = history::data_directory()?
             .join(identity.public_id())
@@ -5800,7 +5908,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     }
     if first == "POST /api/contacts/export-backup HTTP/1.1" {
         let Some(identity) = state.identity.as_ref() else {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         };
         let Ok(peer) = history::decode_peer_id(body) else {
             return reject(&mut stream, "400 Bad Request");
@@ -5822,7 +5930,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     }
     if first == "POST /api/contacts/import-backup HTTP/1.1" {
         let Some(identity) = state.identity.as_ref() else {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         };
         if any_chat_active(&state) || !state.active_history_deletions.is_empty() {
             return reject(&mut stream, "409 Conflict");
@@ -5856,7 +5964,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     }
     if first == "POST /api/history/list HTTP/1.1" {
         let Some(identity) = state.identity.as_ref().cloned() else {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         };
         drop(state);
         let summaries = match history::History::list(&identity) {
@@ -5893,7 +6001,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     }
     if first == "POST /api/history/messages HTTP/1.1" {
         let Some(identity) = state.identity.as_ref().cloned() else {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         };
         let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
             return reject(&mut stream, "400 Bad Request");
@@ -5968,7 +6076,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     }
     if first == "POST /api/history/delete-status HTTP/1.1" {
         let Some(identity_id) = state.identity.as_ref().map(|identity| identity.public_id()) else {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         };
         let Some(operation) = state.history_deletions.get(body) else {
             return reject(&mut stream, "404 Not Found");
@@ -5995,7 +6103,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     }
     if first == "POST /api/history/delete-messages HTTP/1.1" {
         let Some(identity) = state.identity.as_ref().cloned() else {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         };
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
             return reject(&mut stream, "400 Bad Request");
@@ -6072,7 +6180,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     }
     if first == "POST /api/history/delete-range HTTP/1.1" {
         let Some(identity) = state.identity.as_ref().cloned() else {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         };
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
             return reject(&mut stream, "400 Bad Request");
@@ -6129,7 +6237,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     }
     if first == "POST /api/history/delete-conversation HTTP/1.1" {
         let Some(identity) = state.identity.as_ref() else {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         };
         if peer_chat_active(&state, body)
             || history_delete_active(&state, &identity.public_id(), body)
@@ -6149,7 +6257,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
     }
     if first == "POST /api/history/backup-transfer HTTP/1.1" {
         let Some(identity) = state.identity.as_ref() else {
-            return reject(&mut stream, "401 Unauthorized");
+            return reject(&mut stream, IDENTITY_REQUIRED);
         };
         let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(body) else {
             return reject(&mut stream, "400 Bad Request");
@@ -6629,7 +6737,7 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
         }
         "POST /api/identity/status HTTP/1.1" => {
             let Some(identity) = state.identity.as_ref() else {
-                return reject(&mut stream, "401 Unauthorized");
+                return reject(&mut stream, IDENTITY_REQUIRED);
             };
             return respond(
                 &mut stream,
@@ -6649,6 +6757,10 @@ fn handle(mut stream: TcpStream, expected_host: &str, state: &Arc<Mutex<State>>)
                 let _ = operation.sender.send(ChatCommand::Cancel);
             }
             state.identity = None;
+            // Logging out ends every session, including this one, and prints a new
+            // connection code. Otherwise a copied token would still work for the
+            // next identity that logs in.
+            issue_code(&mut state)?;
         }
         _ => {}
     }
@@ -6679,7 +6791,7 @@ fn main() -> io::Result<()> {
         code: String::new(),
         issued: Instant::now(),
         attempts: 0,
-        sessions: Vec::new(),
+        sessions: SessionStore::default(),
         identity: None,
         chats: HashMap::new(),
         history_deletions: HashMap::new(),

@@ -53,7 +53,7 @@ flowchart LR
 1. `127.0.0.1`의 임의 포트에만 바인딩합니다.
 2. 모든 요청의 `Host`가 `127.0.0.1:<포트>`와 정확히 일치해야 합니다 (DNS rebinding 방어).
 3. 모든 POST는 정확한 `Origin`과 고정 `Content-Type`을 요구하며, 본문을 읽기 전에 검사합니다 (CSRF 방어).
-4. 터미널에 출력된 256비트 일회용 연결 코드(TTL 5분, 시도 5회)로 세션 토큰을 받고, 이후 요청은 `Authorization: Bearer`로 인증합니다. 토큰은 `sessionStorage`에만 둡니다.
+4. 터미널에 출력된 256비트 일회용 연결 코드(TTL 5분, 시도 5회)로 세션 토큰을 받고, 이후 요청은 `Authorization: Bearer`로 인증합니다. 토큰은 `sessionStorage`에만 둡니다. 세션은 1시간 동안 쓰지 않으면, 어떤 경우에도 12시간이 지나면 만료되고, 새 연결 코드 발급·로그아웃·연결 해제 때 끝납니다(동시 세션은 최대 4개). 토큰이 무효이면 401, 세션은 유효하지만 신원이 로그인되어 있지 않으면 412를 돌려주므로 화면이 두 경우를 구분합니다.
 5. 응답은 CSP(`default-src 'none'`, `script-src 'self'`, `frame-ancestors 'none'`), `nosniff`, `no-store`를 포함하며 CORS 헤더는 보내지 않습니다.
 6. 정적 파일은 `include_bytes!`로 내장해 파일 경로를 다루지 않습니다.
 

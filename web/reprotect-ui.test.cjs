@@ -2409,7 +2409,7 @@ test('invite room creation keeps the code until an operation id is received and 
 test('room creation explicit failures preserve the invite and response loss is reported as unknown', async (t) => {
   const failures = [
     [400, /유효하지 않은 형식/],
-    [401, /로그인이 필요/],
+    [412, /로그인이 필요/],
     [409, /연결 작업이 생성되지 않았습니다.*재시작 후 복원되지 않습니다.*새 초대 코드를 생성해 상대에게 다시 전달/],
     [500, /연결 작업 생성 여부.*안전성은.*확인할 수 없습니다/],
   ];
@@ -3184,4 +3184,74 @@ test('history list marks messages without a signature as unverified, in text', (
   assert.match(time.textContent, /\[상대\]/);
   assert.equal(marker.textContent, '서명 없음 · 미검증');
   assert.equal(body.children.map((child) => child.textContent).join(''), 'unsigned message');
+});
+
+test('a 401 for the active session ends it and returns to the connection-code screen', async () => {
+  const h = createHarness();
+  h.evaluate(`token = 'session-A'; identityId.textContent = 'identity-A'; sessionStorage.setItem(sessionKey, 'session-A'); show('active')`);
+  const pending = h.evaluate("request('/api/history/list')");
+  h.requestFor('/api/history/list').resolve(response('', 401));
+  await pending;
+  assert.equal(h.evaluate('token'), null);
+  assert.equal(h.evaluate('sessionStorage.getItem(sessionKey)'), null);
+  assert.equal(h.evaluate('bridgeForm.hidden'), false, 'the connection-code form is shown');
+  assert.equal(h.evaluate('active.hidden'), true);
+  assert.equal(h.evaluate('identityId.textContent'), '');
+  assert.match(h.element('#message').textContent, /세션이 끝났습니다.*연결 코드/);
+});
+
+test('a 401 for an older session does not end the current one', async () => {
+  const h = createHarness();
+  h.evaluate("token = 'session-B'; identityId.textContent = 'identity-B'; show('active')");
+  const pending = h.evaluate("request('/api/history/list', '', 'session-A')");
+  h.requestFor('/api/history/list').resolve(response('', 401));
+  await pending;
+  assert.equal(h.evaluate('token'), 'session-B');
+  assert.equal(h.evaluate('bridgeForm.hidden'), true);
+  assert.equal(h.evaluate('active.hidden'), false);
+});
+
+test('a 412 means no identity is logged in: show the identity screen and keep the session', async () => {
+  const h = createHarness();
+  h.evaluate("token = 'session-A'; show('active')");
+  const refreshing = h.evaluate('refreshIdentity()');
+  h.requestFor('/api/identity/status').resolve(response('', 412));
+  assert.equal(await refreshing, false);
+  assert.equal(h.evaluate('token'), 'session-A', 'the session is untouched');
+  assert.equal(h.evaluate('entry.hidden'), false, 'the identity login screen is shown');
+  assert.equal(h.evaluate('bridgeForm.hidden'), true);
+});
+
+test('a 401 from the identity status check lands on the connection-code screen, not the identity screen', async () => {
+  const h = createHarness();
+  h.evaluate("token = 'session-A'; show('active')");
+  const refreshing = h.evaluate('refreshIdentity()');
+  h.requestFor('/api/identity/status').resolve(response('', 401));
+  assert.equal(await refreshing, false);
+  assert.equal(h.evaluate('token'), null);
+  assert.equal(h.evaluate('bridgeForm.hidden'), false);
+  assert.equal(h.evaluate('entry.hidden'), true);
+});
+
+test('logout ends the session and asks for the new connection code', async () => {
+  const h = createHarness();
+  h.evaluate(`token = 'session-A'; identityId.textContent = 'identity-A'; sessionStorage.setItem(sessionKey, 'session-A'); show('active')`);
+  await h.click('#logout');
+  assert.equal(h.evaluate('token'), null);
+  assert.equal(h.evaluate('sessionStorage.getItem(sessionKey)'), null);
+  assert.equal(h.evaluate('bridgeForm.hidden'), false);
+  assert.match(h.element('#message').textContent, /로그아웃했습니다.*새로 표시된 연결 코드/);
+});
+
+test('polling stops when the session ends and does not retry with a dead token', async () => {
+  const h = createHarness();
+  h.evaluate("token = 'session-A'; identityId.textContent = 'identity-A'; operationId = 'operation-A'; show('chat')");
+  const polling = h.evaluate('pollChat()');
+  h.requestFor('/api/chat/status').resolve(response('', 401));
+  await polling;
+  assert.equal(h.evaluate('operationId'), null);
+  assert.equal(h.evaluate('token'), null);
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  assert.equal(h.requests.filter((item) => item.path === '/api/chat/status').length, 1,
+    'no further poll is scheduled after the session ended');
 });

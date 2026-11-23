@@ -360,7 +360,43 @@ returnToChat.addEventListener('click', () => {
 async function request(path, body = '', session = token) {
   const headers = { 'Content-Type': 'text/plain;charset=UTF-8' };
   if (session) headers.Authorization = `Bearer ${session}`;
-  return fetch(path, { method: 'POST', headers, body, cache: 'no-store' });
+  const response = await fetch(path, { method: 'POST', headers, body, cache: 'no-store' });
+  // 401 means the session itself ended (idle or lifetime expiry, a new connection code,
+  // or logout). "Not logged in to an identity" is 412 and must not end the session.
+  // A stale response for an older session (session !== token) is ignored.
+  if (response.status === 401 && session && session === token) handleSessionExpired();
+  return response;
+}
+
+// Everything that belongs to the current session, dropped when the session ends.
+function leaveSession(notice) {
+  token = null;
+  stopPolling();
+  operationId = null;
+  sendingMessage = false;
+  clearChatDrafts();
+  sendStatus.textContent = '';
+  sendStatus.hidden = true;
+  chatText.value = '';
+  resizeChatInput();
+  lastPhase = '';
+  updateSendButton();
+  canReturnToChat = false;
+  latestChatSnapshot = null;
+  clearConversationMessages();
+  sessionStorage.removeItem(operationKey);
+  sessionStorage.removeItem(sessionKey);
+  identityId.textContent = '';
+  show('bridge');
+  message.textContent = notice;
+}
+
+function handleSessionExpired() {
+  identitySessionGeneration += 1;
+  clearBackupImportState();
+  chatViewGeneration += 1;
+  pendingConfirmationFocus = null;
+  leaveSession('세션이 끝났습니다. 터미널에 표시된 연결 코드를 입력하세요. 코드가 보이지 않으면 터미널에서 Enter를 눌러 새 코드를 발급받으세요.');
 }
 
 const backupTransferChunkBytes = 256 * 1024;
@@ -479,13 +515,15 @@ async function saveBackupTransfer(action, payload, suggestedName, isCurrent = ()
 
 async function refreshIdentity() {
   const response = await request('/api/identity/status');
-  if (response.status === 401) {
+  if (response.status === 412) {
     identitySessionGeneration += 1;
     clearBackupImportState();
     pendingConfirmationFocus = null;
     show('entry');
     return false;
   }
+  // The session ended; request() already returned to the connection-code screen.
+  if (response.status === 401) return false;
   if (!response.ok) throw new Error('status failed');
   const currentIdentityId = await response.text();
   const previousIdentityId = identityId.textContent.trim();
@@ -1253,7 +1291,7 @@ async function startChat(path, code) {
   try {
     const response = await request(path, code);
     if (!response.ok) {
-      message.textContent = response.status === 401
+      message.textContent = response.status === 412
         ? '로그인이 필요합니다.'
         : response.status === 409
           ? '연결 모드 설정을 적용하려면 터미널에서 프로그램을 종료한 뒤 다시 실행하세요.'
@@ -1485,8 +1523,11 @@ document.querySelector('#logout').addEventListener('click', async () => {
     clearConversationMessages();
     historyMessages.replaceChildren();
     historyList.replaceChildren();
-    show('entry');
-    message.textContent = '';
+    // The server ends every session at logout and prints a new connection code.
+    token = null;
+    sessionStorage.removeItem(sessionKey);
+    show('bridge');
+    message.textContent = '로그아웃했습니다. 다시 사용하려면 터미널에 새로 표시된 연결 코드를 입력하세요.';
   } catch (_) {
     message.textContent = '로그아웃하지 못했습니다. 로컬 프로그램을 종료하세요.';
     if (operationId) pollChat();
@@ -1502,25 +1543,7 @@ document.querySelectorAll('.disconnect').forEach((button) => button.addEventList
     const response = await request('/api/disconnect');
     if (!response.ok && response.status !== 401) throw new Error('disconnect failed');
   } catch (_) { message.textContent = '연결을 해제하지 못했습니다. 로컬 프로그램을 종료하세요.'; return; }
-  token = null;
-  stopPolling();
-  operationId = null;
-  sendingMessage = false;
-  clearChatDrafts();
-  sendStatus.textContent = '';
-  sendStatus.hidden = true;
-  chatText.value = '';
-  resizeChatInput();
-  lastPhase = '';
-  updateSendButton();
-  canReturnToChat = false;
-  latestChatSnapshot = null;
-  clearConversationMessages();
-  sessionStorage.removeItem(operationKey);
-  sessionStorage.removeItem(sessionKey);
-  identityId.textContent = '';
-  show('bridge');
-  message.textContent = '터미널에서 새 코드를 발급받으세요.';
+  leaveSession('터미널에서 새 코드를 발급받으세요.');
 }));
 
 document.querySelector('#create-invite').addEventListener('click', async () => {
@@ -1542,7 +1565,7 @@ document.querySelector('#create-invite').addEventListener('click', async () => {
     const response = await request('/api/invite/create', '', requestToken);
     if (!isCurrentRequest()) return;
     if (response.status === 409) { message.textContent = '연결 모드 설정을 적용하려면 프로그램을 다시 실행하세요.'; return; }
-    if (response.status === 401) { message.textContent = '초대 코드를 만들려면 먼저 로그인하세요.'; return; }
+    if (response.status === 412) { message.textContent = '초대 코드를 만들려면 먼저 로그인하세요.'; return; }
     if (!response.ok) throw new Error('invite generation failed');
     const generatedInvite = await response.text();
     if (!isCurrentRequest()) return;
@@ -1606,7 +1629,7 @@ document.querySelector('#start-room').addEventListener('click', async () => {
       if (!isCurrentRequest()) return;
       if (response.status === 400) {
         message.textContent = '서버가 초대 코드를 유효하지 않은 형식으로 거부했습니다. 코드는 화면에 보존했습니다. 새 초대 코드를 생성해 다시 시작하세요.';
-      } else if (response.status === 401) {
+      } else if (response.status === 412) {
         message.textContent = '로그인이 필요해 방 생성을 거부했습니다. 초대 코드는 화면에 보존했습니다. 로그인 상태를 확인한 뒤 진행하세요.';
       } else if (response.status === 409) {
         message.textContent = '연결 설정이 적용되지 않아 방 생성을 거부했습니다. 이 응답에서는 연결 작업이 생성되지 않았습니다. 현재 초대 코드는 재시작 후 복원되지 않습니다. 프로그램을 다시 실행한 뒤 새 초대 코드를 생성해 상대에게 다시 전달하세요.';

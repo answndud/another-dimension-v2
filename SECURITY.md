@@ -36,6 +36,7 @@ Please do not open a public issue for a vulnerability. Use GitHub's private vuln
 - History, contact records and current-format backups are authenticated and encrypted. A modified file is rejected instead of being silently accepted.
 - In Tor mode, every relay connection goes through the configured SOCKS proxy with remote name resolution, and the application never falls back to a direct connection.
 - The local web server binds to loopback only, checks `Host` and `Origin`, requires a 256-bit bearer token, and sends no CORS headers.
+- A session token expires after one hour without use and after twelve hours in any case. A new connection code, a logout, or an explicit disconnect ends sessions, so a copied token does not outlive the pairing it came from. At most four sessions exist at once.
 
 ## What it does not guarantee
 
@@ -53,16 +54,15 @@ These are known and documented, not hidden. Items are removed from this list onl
 
 1. **Legacy backup formats can still be imported after confirmation.** ADBACK2, ADBACK6, ADPACK1 and ADPACK2 are rejected by default and are accepted only when the user confirms a format-specific warning (see SF-002). ADBACK2 derives its key from the password alone and its messages are unsigned, so a user who confirms it for a file from an untrusted source can still be given forged history. Those messages are marked "서명 없음 · 미검증" (unsigned, unverified) in the history manager and the restore preview, but not yet in the live chat view.
 2. **The access code is not protected by a secret.** The AD2 code contains its own wrapping key, so it is a per-code encoding of the seed, not encryption. Treat the code itself as the secret.
-3. **Session tokens do not expire** and are not revoked on logout or when a new pairing code is issued.
-4. **The HTTP server handles one connection at a time** and has no overall request deadline, so a local client that sends bytes slowly can block the UI.
-5. **The fingerprint is shown as 64 hex characters** with no commitment step. Users who compare only a prefix are exposed to a partial-collision search by an attacker who also holds the invite code.
-6. **A single lost relay event stalls the chat.** Ephemeral events are not retransmitted, so a sequence gap eventually ends the session.
-7. **Reconnects reuse the same relay topic and key**, which lets a relay link the sessions of one pair over time.
-8. **The local history log has no generation id or end marker**, so a rolled-back or truncated file at a record boundary is not detected. An attacker who can replace every file together can always roll back; that case cannot be fully prevented on a single device.
-9. **Renames are not followed by a directory fsync**, so a crash can lose an operation that was reported as successful.
-10. **Secrets are not fully zeroized.** Key material is wrapped in `Zeroizing` where practical, but decrypted message text and some library-held keys are not wiped.
-11. **No audit and limited fuzzing.** The test suite is extensive but the parsers have not been fuzzed.
-12. **Dependency advisories.** `cargo audit` reports 9 `unsound` warnings for `heapless` 0.8.0, which `nostr` pulls in through `faster-hex`. They are not exploitable vulnerabilities in this application as far as I can tell, but I cannot remove them without upgrading the pinned `nostr` version.
+3. **The HTTP server handles one connection at a time** and has no overall request deadline, so a local client that sends bytes slowly can block the UI.
+4. **The fingerprint is shown as 64 hex characters** with no commitment step. Users who compare only a prefix are exposed to a partial-collision search by an attacker who also holds the invite code.
+5. **A single lost relay event stalls the chat.** Ephemeral events are not retransmitted, so a sequence gap eventually ends the session.
+6. **Reconnects reuse the same relay topic and key**, which lets a relay link the sessions of one pair over time.
+7. **The local history log has no generation id or end marker**, so a rolled-back or truncated file at a record boundary is not detected. An attacker who can replace every file together can always roll back; that case cannot be fully prevented on a single device.
+8. **Renames are not followed by a directory fsync**, so a crash can lose an operation that was reported as successful.
+9. **Secrets are not fully zeroized.** Key material is wrapped in `Zeroizing` where practical, but decrypted message text and some library-held keys are not wiped.
+10. **No audit and limited fuzzing.** The test suite is extensive but the parsers have not been fuzzed.
+11. **Dependency advisories.** `cargo audit` reports 9 `unsound` warnings for `heapless` 0.8.0, which `nostr` pulls in through `faster-hex`. They are not exploitable vulnerabilities in this application as far as I can tell, but I cannot remove them without upgrading the pinned `nostr` version.
 
 ## Supply chain
 
