@@ -101,7 +101,7 @@ node --check web/app.js
 node --test web/reprotect-ui.test.cjs
 ```
 
-`cargo test`는 약 10초 걸립니다. 64 MiB 초과 파일이나 10만 건 이상의 기록을 다루는 대용량 테스트 6개는 느려서(약 2~3분) 기본으로는 건너뛰며, `cargo test -- --ignored --skip live_relay`로 실행합니다. 이 테스트는 CI에서 주 1회 돌고, 같은 주기로 의존성 권고도 점검합니다. 실제 대화 데이터를 건드리지 않도록 테스트는 임시 디렉터리를 사용합니다. 앱을 직접 실행해 시험할 때는 `ANOTHER_DIMENSION_DATA_DIR`에 임시 절대 경로(`chmod 700`)를 지정하세요.
+`cargo test`는 약 25초 걸립니다. 64 MiB 초과 파일이나 10만 건 이상의 기록을 다루는 대용량 테스트 6개는 느려서(약 2~3분) 기본으로는 건너뛰며, `cargo test -- --ignored --skip live_relay --skip manual_`로 실행합니다. 이 테스트는 CI에서 주 1회 돌고, 같은 주기로 의존성 권고도 점검합니다. 실제 대화 데이터를 건드리지 않도록 테스트는 임시 디렉터리를 사용합니다. 앱을 직접 실행해 시험할 때는 `ANOTHER_DIMENSION_DATA_DIR`에 임시 절대 경로(`chmod 700`)를 지정하세요.
 
 ## 라이선스
 

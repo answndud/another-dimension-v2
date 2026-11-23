@@ -3939,7 +3939,7 @@ mod mutated_backups {
 /// `cargo test --release anchor_cost -- --ignored --nocapture`; it prints numbers and asserts nothing.
 #[test]
 #[ignore = "benchmark; prints timings"]
-fn anchor_cost_per_append_and_per_conversation_count() {
+fn manual_anchor_cost_per_append_and_per_conversation_count() {
     use std::time::Instant;
     let _data = IsolatedData::new();
     let (identity, _) = Identity::create().unwrap();

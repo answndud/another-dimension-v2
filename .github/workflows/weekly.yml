@@ -35,5 +35,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
-      # --skip live_relay: that test needs a public relay and is run by hand.
-      - run: cargo test --locked -- --ignored --skip live_relay
+      # Hand-run tests are skipped: live_relay needs a public relay, and every
+      # test named manual_* needs a local Tor or only prints a benchmark.
+      # Name a new hand-run test manual_* so this list does not need editing.
+      - run: cargo test --locked -- --ignored --skip live_relay --skip manual_

@@ -3,8 +3,8 @@
 ## 실행
 
 ```bash
-cargo test --locked           # 전체 (속성 테스트 포함, 약 20초)
-cargo test --locked -- --ignored --skip live_relay   # 느린 스트레스 테스트
+cargo test --locked           # 전체 (속성 테스트 포함, 약 25초)
+cargo test --locked -- --ignored --skip live_relay --skip manual_   # 느린 스트레스 테스트
 node --test web/reprotect-ui.test.cjs   # 프런트엔드 (가짜 DOM)
 ```
 
@@ -45,10 +45,10 @@ CI의 `ci.yml`이 push마다 포맷·clippy·`cargo test`·JS 테스트를 돌�
 | 시험 | 환경 변수 | 확인하는 것 |
 |---|---|---|
 | `live_relay_two_party_channel_roundtrip` | `AD_LIVE_CONFIRM_PAUSE_SECS`, `AD_LIVE_NO_KEEPALIVE` | 실제 relay에서의 연결, 긴 확인 대기에서 `keep_alive`의 필요성 |
-| `live_tor_puts_each_connection_on_its_own_circuit` | `AD_TOR_SOCKS`, `AD_TOR_CONTROL`, `AD_TOR_COOKIE` | 실제 Tor에서 연결마다 다른 회로를 쓰는지 |
-| `anchor_cost_per_append_and_per_conversation_count` | 없음 | 앵커 갱신이 추가에 더하는 시간 |
+| `manual_tor_puts_each_connection_on_its_own_circuit` | `AD_TOR_SOCKS`, `AD_TOR_CONTROL`, `AD_TOR_COOKIE` | 실제 Tor에서 연결마다 다른 회로를 쓰는지 |
+| `manual_anchor_cost_per_append_and_per_conversation_count` | 없음 | 앵커 갱신이 추가에 더하는 시간 |
 
-결과와 한계는 [security-fixes.md](security-fixes.md)의 SF-012, SF-015, SF-019에 있습니다. 모두 CI에서는 돌지 않습니다.
+결과와 한계는 [security-fixes.md](security-fixes.md)의 SF-012, SF-015, SF-019에 있습니다. 모두 CI에서는 돌지 않습니다(이름이 `manual_`로 시작하거나 `live_relay`라 주간 작업이 건너뜁니다).
 
 ## 알려진 한계
 

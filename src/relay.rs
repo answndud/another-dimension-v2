@@ -2975,7 +2975,7 @@ mod tests {
     /// `--ignored --nocapture`.
     #[test]
     #[ignore = "needs a running Tor; prints which circuit each stream used"]
-    fn live_tor_puts_each_connection_on_its_own_circuit() {
+    fn manual_tor_puts_each_connection_on_its_own_circuit() {
         let socks: std::net::SocketAddr = std::env::var("AD_TOR_SOCKS").unwrap().parse().unwrap();
         let control = std::env::var("AD_TOR_CONTROL").unwrap();
         let cookie = std::fs::read(std::env::var("AD_TOR_COOKIE").unwrap()).unwrap();
