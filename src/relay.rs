@@ -739,7 +739,7 @@ impl InviteCode {
     fn from_secret(secret: Zeroizing<[u8; 32]>) -> Self {
         let mut display = Zeroizing::new(String::with_capacity(INVITE_PREFIX.len() + 64));
         display.push_str(INVITE_PREFIX);
-        display.push_str(&hex(secret.as_ref()));
+        push_secret_hex(&mut display, secret.as_ref());
         Self { secret, display }
     }
 
@@ -1414,6 +1414,17 @@ fn new_subscription_id() -> Result<SubscriptionId, RelayError> {
         "{SUBSCRIPTION_ID}-{}",
         random_hex(12)?
     )))
+}
+
+/// Appends the hex form of secret bytes to a string that is wiped when dropped, without
+/// building an intermediate `String` that would be freed with the secret still in it.
+fn push_secret_hex(target: &mut Zeroizing<String>, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    target.reserve(bytes.len() * 2);
+    for byte in bytes {
+        target.push(HEX[(byte >> 4) as usize] as char);
+        target.push(HEX[(byte & 0x0f) as usize] as char);
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -2102,6 +2113,43 @@ mod tests {
             rendezvous.receive_frame("third"),
             Err(RelayError::TimedOut("third"))
         ));
+    }
+
+    #[test]
+    fn secret_hex_is_the_same_text_as_the_ordinary_hex() {
+        let mut every_byte = Vec::new();
+        for byte in 0..=255_u8 {
+            every_byte.push(byte);
+        }
+        for bytes in [
+            &[][..],
+            &[0][..],
+            &[0xff][..],
+            &[0x0a, 0xb0][..],
+            &every_byte[..],
+        ] {
+            let mut secret = zeroize::Zeroizing::new(String::new());
+            super::push_secret_hex(&mut secret, bytes);
+            assert_eq!(secret.as_str(), super::hex(bytes));
+        }
+        // Appending keeps what is already there, as the invite code display relies on.
+        let mut prefixed = zeroize::Zeroizing::new(String::from("ADI3-"));
+        super::push_secret_hex(&mut prefixed, &[1, 2, 3]);
+        assert_eq!(prefixed.as_str(), "ADI3-010203");
+    }
+
+    #[test]
+    fn an_invite_code_still_round_trips_after_the_display_is_built_without_a_temporary() {
+        let invite = InviteCode::generate().unwrap();
+        let shown = invite.code().to_owned();
+        assert!(shown.starts_with("ADI3-"));
+        assert_eq!(shown.len(), "ADI3-".len() + 64);
+        let parsed = InviteCode::parse(&shown).unwrap();
+        assert_eq!(parsed.code(), shown);
+        assert_eq!(
+            parsed.relay_material().unwrap().0,
+            invite.relay_material().unwrap().0
+        );
     }
 
     #[test]

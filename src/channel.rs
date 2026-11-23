@@ -243,7 +243,7 @@ impl IdentityPending {
         frame: &[u8],
         expected_peer: Option<[u8; 32]>,
     ) -> Result<(RevealPending, Vec<u8>), HandshakeError> {
-        let mut proof = decrypt(&mut self.transport, frame, PROOF_SIZE)?;
+        let proof = decrypt(&mut self.transport, frame, PROOF_SIZE)?;
         if proof.len() != PROOF_SIZE || proof[0] != self.role.peer().byte() {
             return Err(HandshakeError::InvalidProof);
         }
@@ -276,13 +276,12 @@ impl IdentityPending {
         verifying_key
             .verify_strict(&signed, &signature)
             .map_err(|_| HandshakeError::InvalidProof)?;
-        proof.fill(0);
 
-        let mut reveal = Vec::with_capacity(REVEAL_SIZE);
+        // The nonce is secret until revealed, so the plaintext frame is wiped on drop.
+        let mut reveal = Zeroizing::new(Vec::with_capacity(REVEAL_SIZE));
         reveal.push(self.role.byte());
         reveal.extend_from_slice(self.nonce.as_ref());
         let reveal_frame = encrypt(&mut self.transport, &reveal)?;
-        reveal.fill(0);
         Ok((
             RevealPending {
                 hash: self.hash,

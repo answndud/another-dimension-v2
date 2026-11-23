@@ -3306,3 +3306,33 @@ test('a snapshot without a confirmation code shows an empty code, never the old 
   assert.equal(h.element('#confirmation-code').textContent, '');
   assert.notEqual(h.element('#confirmation-code').textContent, 'cd'.repeat(32));
 });
+
+test('a relay acceptance is never worded as the peer having received the message', () => {
+  const snapshot = (extra) => `updateChatView(${JSON.stringify({ phase: 'connected', messageCount: 0, messageEpoch: 1, identityTransition: [], ...extra })})`;
+  const status = (h) => h.element('#delivery-status').textContent;
+
+  const accepted = createHarness();
+  accepted.evaluate(snapshot({ relayAck: 'accepted', pendingSends: 0 }));
+  assert.match(status(accepted), /relay가 이벤트를 수락했습니다/);
+  assert.match(status(accepted), /수신이나 저장을 뜻하지 않습니다/);
+  assert.doesNotMatch(status(accepted), /전달되었|전달됨|받았|도착/, 'acceptance must not read as delivery');
+
+  const pending = createHarness();
+  pending.evaluate(snapshot({ relayAck: 'pending', pendingSends: 2 }));
+  assert.match(status(pending), /relay 접수 확인 대기 중 \(2건\)/);
+  assert.match(status(pending), /수신이나 저장은 확인되지 않습니다/);
+
+  const rejected = createHarness();
+  rejected.evaluate(snapshot({ relayAck: 'rejected', pendingSends: 0 }));
+  assert.match(status(rejected), /relay가 이벤트를 거부했습니다/);
+
+  const unknown = createHarness();
+  unknown.evaluate(snapshot({ relayAck: 'unknown', pendingSends: 0 }));
+  assert.match(status(unknown), /전달 결과를 확인할 수 없습니다/);
+
+  // No status at all when the relay has said nothing.
+  const none = createHarness();
+  none.evaluate(snapshot({ pendingSends: 0 }));
+  assert.equal(status(none), '');
+  assert.equal(none.element('#delivery-status').hidden, true);
+});
