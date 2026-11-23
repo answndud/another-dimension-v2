@@ -151,7 +151,7 @@ pub(crate) fn read_index(
     directory: &std::path::Path,
 ) -> io::Result<Vec<String>> {
     let path = directory.join("conversations.idx");
-    let bytes = match std::fs::read(path) {
+    let bytes = match crate::fsutil::read_regular_file(path, crate::fsutil::MAX_STATE_FILE_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),

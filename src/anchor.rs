@@ -91,7 +91,10 @@ fn peer_bytes(peer_id: &str) -> io::Result<[u8; 32]> {
 type Entries = Vec<([u8; 32], Anchor)>;
 
 fn read_all(storage_key: &[u8; 32], identity_id: &str, directory: &Path) -> io::Result<Entries> {
-    let bytes = match std::fs::read(directory.join(FILE_NAME)) {
+    let bytes = match crate::fsutil::read_regular_file(
+        directory.join(FILE_NAME),
+        crate::fsutil::MAX_STATE_FILE_BYTES,
+    ) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),

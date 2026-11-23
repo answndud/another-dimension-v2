@@ -190,7 +190,10 @@ pub fn load(
     peer_key: [u8; 32],
 ) -> io::Result<VerifiedContact> {
     let name = filename(identity, &peer_key);
-    let bytes = fs::read(directory.join(format!("{name}.peer")))?;
+    let bytes = crate::fsutil::read_regular_file(
+        directory.join(format!("{name}.peer")),
+        crate::fsutil::MAX_STATE_FILE_BYTES,
+    )?;
     if bytes.len() != 8 + 12 + 32 + 16 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

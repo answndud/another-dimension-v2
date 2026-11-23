@@ -36,6 +36,54 @@ pub(crate) fn create_private_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     builder.create(path)
 }
 
+/// Like `create_dir`, not recursive and failing if the directory exists, but the new
+/// directory is owner-only from the moment it exists.
+pub(crate) fn create_private_dir(path: impl AsRef<Path>) -> io::Result<()> {
+    let mut builder = DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+/// The largest state file (index, anchor, key store, contact record) that is read whole.
+/// It is far above what any of them reaches, and exists only so that a file swapped for
+/// something huge cannot make the program allocate without bound.
+pub(crate) const MAX_STATE_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Reads a small state file whole. Only a regular file is accepted, and opening never
+/// waits: a named pipe put in the file's place would otherwise block the open, or the
+/// read, for as long as nothing writes to it. At most `limit` bytes are read; a larger
+/// file is an error rather than a truncated read.
+pub(crate) fn read_regular_file(path: impl AsRef<Path>, limit: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut options = private_options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "state file must be a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "state file is larger than allowed",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Flushes a directory's entries to disk.
 #[cfg(unix)]
 fn sync_dir(path: &Path) -> io::Result<()> {
@@ -241,6 +289,54 @@ mod tests {
         text
     }
 
+    #[test]
+    fn a_state_file_is_read_whole_up_to_the_limit_and_not_one_byte_more() {
+        let directory = scratch("read-limit");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("state");
+        fs::write(&path, [7u8; 100]).unwrap();
+        assert_eq!(read_regular_file(&path, 100).unwrap(), vec![7u8; 100]);
+        let error = read_regular_file(&path, 99).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let missing = read_regular_file(directory.join("missing"), 100).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_named_pipe_in_place_of_a_state_file_is_refused_without_waiting() {
+        let directory = scratch("fifo");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("conversations.anchor");
+        let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (done, result) = std::sync::mpsc::channel();
+        let reader = path.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(read_regular_file(reader, 1024));
+        });
+        let outcome = result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reading a named pipe must not block");
+        assert_eq!(outcome.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_private_directory_is_owner_only_and_must_not_exist_yet() {
+        let directory = scratch("private-dir");
+        fs::create_dir_all(&directory).unwrap();
+        let child = directory.join("child");
+        create_private_dir(&child).unwrap();
+        assert_eq!(mode(&child), 0o700);
+        assert_eq!(
+            create_private_dir(&child).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn calls_outside_the_helpers(source: &str) -> Vec<String> {
         let mut problems = Vec::new();
         for (number, line) in production_part(source).lines().enumerate() {
@@ -248,7 +344,12 @@ mod tests {
             if code.contains("OpenOptions::new()") {
                 problems.push(format!("line {}: OpenOptions::new()", number + 1));
             }
-            for (needle, allowed_prefix) in [("create_dir_all(", "private_"), ("rename(", "")] {
+            for (needle, allowed_prefix) in [
+                ("create_dir_all(", "private_"),
+                ("create_dir(", ""),
+                ("fs::read(", ""),
+                ("rename(", ""),
+            ] {
                 for (index, _) in code.match_indices(needle) {
                     let before = &code[..index];
                     if !allowed_prefix.is_empty() && before.ends_with(allowed_prefix) {

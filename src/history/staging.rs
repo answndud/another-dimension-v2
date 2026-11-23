@@ -7,6 +7,7 @@ use super::*;
 const STAGED_PLAIN_FIXED: usize = 8 + 1 + 4 + 1;
 const STAGED_PROOF_BYTES: usize = 16 + 32 + 32 + 64;
 const AEAD_TAG_BYTES: usize = 16;
+const RESTORE_INDEX_LABEL: &[u8] = b"another-dimension-v2/restore-merge-index-hmac/v1";
 /// Smallest and largest encrypted record the reader accepts (nonce excluded). The largest
 /// is a signed message of the longest accepted text, tag included.
 const STAGED_RECORD_MIN: usize = STAGED_PLAIN_FIXED + 1 + AEAD_TAG_BYTES;
@@ -42,7 +43,7 @@ impl RestoreStaging {
         set_private_directory(&root)?;
         cleanup_stale_restore_staging(&root)?;
         let directory = root.join(crate::hex::encode(&random_nonce()?));
-        std::fs::create_dir(&directory)?;
+        crate::fsutil::create_private_dir(&directory)?;
         set_private_directory(&directory)?;
         let result = (|| {
             let lock = crate::fsutil::private_options()
@@ -396,7 +397,8 @@ impl RestoreDiskIndex {
         Ok(Self {
             file,
             capacity,
-            key: Zeroizing::new(*staging.key),
+            // The staging key encrypts the records, so the index gets a key of its own.
+            key: crate::identity::purpose_key(&staging.key, RESTORE_INDEX_LABEL),
         })
     }
 

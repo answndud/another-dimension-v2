@@ -151,7 +151,7 @@ pub(crate) fn read_linked_keys(identity: &Identity, peer_id: &str) -> io::Result
     let identity_id = identity.public_id();
     let peer_id = peer_id.to_ascii_lowercase();
     let path = linked_key_path(identity, &peer_id)?;
-    let bytes = match std::fs::read(path) {
+    let bytes = match crate::fsutil::read_regular_file(path, crate::fsutil::MAX_STATE_FILE_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok((HashSet::new(), HashSet::new()))

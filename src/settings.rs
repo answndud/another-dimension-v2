@@ -63,19 +63,13 @@ pub(crate) fn load_settings() -> io::Result<AppSettings> {
 pub(crate) const MAX_SETTINGS_BYTES: usize = 4096;
 
 pub(crate) fn load_settings_from_path(path: &std::path::Path) -> io::Result<AppSettings> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
+    let bytes = match crate::fsutil::read_regular_file(path, MAX_SETTINGS_BYTES as u64) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(AppSettings::default()),
         Err(error) => return Err(error),
     };
-    if file.metadata()?.len() > MAX_SETTINGS_BYTES as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "settings file is too large",
-        ));
-    }
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
+    let contents = String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "settings file is invalid"))?;
     let value: serde_json::Value = serde_json::from_str(&contents)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "settings file is invalid"))?;
     let tor_socks = match value.get("torSocks") {

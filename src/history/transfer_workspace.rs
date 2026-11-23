@@ -34,7 +34,7 @@ pub(crate) fn create_backup_transfer_workspace(
     for _ in 0..8 {
         let owner_id = crate::hex::encode(&random_nonce()?);
         let path = root.join(format!(".process-{owner_id}"));
-        match std::fs::create_dir(&path) {
+        match crate::fsutil::create_private_dir(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
