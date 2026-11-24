@@ -1748,8 +1748,9 @@ fn a_header_cut_short_by_a_crash_is_rewritten() {
 }
 
 fn warning_on_open(identity: &Identity, peer: &str) -> Option<super::IntegrityWarning> {
-    let (history, _, _) = History::open_for_chat(identity, peer).unwrap();
-    history.integrity_warning()
+    // As the chat worker does: the finding is shown, and only then adopted.
+    let (mut history, _, _) = History::open_for_chat(identity, peer).unwrap();
+    history.acknowledge_integrity_warning()
 }
 
 fn append_messages(identity: &Identity, peer: &str, count: u64) {
@@ -1797,13 +1798,17 @@ fn a_log_cut_while_the_chat_is_open_is_reported_by_the_next_append() {
     std::fs::write(&path, &bytes[..records[1].end]).unwrap();
     history.append(&message(9, "after the cut")).unwrap();
     assert_eq!(
-        history.take_integrity_finding(),
+        history.acknowledge_integrity_warning(),
         Some(super::IntegrityWarning::Truncated {
             recorded: 3,
             found: 2
         })
     );
-    assert_eq!(history.take_integrity_finding(), None, "reported once");
+    assert_eq!(
+        history.acknowledge_integrity_warning(),
+        None,
+        "reported once"
+    );
 }
 
 #[test]
@@ -1854,6 +1859,82 @@ fn a_log_cut_while_the_app_was_off_is_not_forgotten_by_a_range_delete() {
 }
 
 #[test]
+fn a_finding_is_kept_until_a_caller_shows_it() {
+    // The merge thread of a peer restore, a contact-backup import and other callers open
+    // the log without showing warnings. Opening used to adopt the cut log at once, so
+    // the only caller that showed warnings later found nothing.
+    let _data = IsolatedData::new();
+    let (identity, _) = Identity::create().unwrap();
+    let peer = "97".repeat(32);
+    append_messages(&identity, &peer, 3);
+    let path = conversation_path(&identity, &peer);
+    let bytes = std::fs::read(&path).unwrap();
+    let (_, records) = records_of(&bytes);
+    std::fs::write(&path, &bytes[..records[1].end]).unwrap();
+    drop(History::open(&identity, &peer).unwrap());
+    // As the chat worker's merge thread does: open, merge, never show anything.
+    let mut staging = RestoreStaging::create(&identity, &peer, &"98".repeat(32)).unwrap();
+    staging.append_verified(&message(50, "restored")).unwrap();
+    staging.finish().unwrap();
+    let (mut silent, _, _) = History::open_for_chat(&identity, &peer).unwrap();
+    silent
+        .merge_restore_staging(&identity, &mut staging)
+        .unwrap();
+    drop(silent);
+    assert!(
+        warning_on_open(&identity, &peer).is_some(),
+        "the open that shows warnings still reports it"
+    );
+    assert_eq!(
+        warning_on_open(&identity, &peer),
+        None,
+        "and then only once"
+    );
+}
+
+#[test]
+fn a_cut_found_during_a_chat_is_reported_there_once_and_then_adopted() {
+    let _data = IsolatedData::new();
+    let (identity, _) = Identity::create().unwrap();
+    let peer = "99".repeat(32);
+    let (mut history, _, _) = History::open_for_chat(&identity, &peer).unwrap();
+    for index in 0..5 {
+        history.append(&message(index, "text")).unwrap();
+    }
+    let path = conversation_path(&identity, &peer);
+    let bytes = std::fs::read(&path).unwrap();
+    let (_, records) = records_of(&bytes);
+    std::fs::write(&path, &bytes[..records[1].end]).unwrap();
+    history.append(&message(10, "after")).unwrap();
+    assert_eq!(
+        history.acknowledge_integrity_warning(),
+        Some(super::IntegrityWarning::Truncated {
+            recorded: 5,
+            found: 2
+        })
+    );
+    // Shown once; later appends start from the adopted state, so neither they nor the
+    // next open repeat it, and the anchor tracks the log again.
+    for index in 11..14 {
+        history.append(&message(index, "more")).unwrap();
+        assert_eq!(history.acknowledge_integrity_warning(), None);
+    }
+    drop(history);
+    assert_eq!(warning_on_open(&identity, &peer), None);
+    let bytes = std::fs::read(&path).unwrap();
+    let (_, records) = records_of(&bytes);
+    std::fs::write(&path, &bytes[..records[4].end]).unwrap();
+    assert_eq!(
+        warning_on_open(&identity, &peer),
+        Some(super::IntegrityWarning::Truncated {
+            recorded: 6,
+            found: 5
+        }),
+        "the adopted count protects the log again"
+    );
+}
+
+#[test]
 fn a_log_cut_while_the_app_was_off_is_not_forgotten_by_a_restore_merge() {
     let _data = IsolatedData::new();
     let (identity, _) = Identity::create().unwrap();
@@ -1889,10 +1970,10 @@ fn a_second_handle_appending_is_not_mistaken_for_tampering() {
     // The first handle now finds a longer log than it wrote, and a replace by another
     // handle, which changes the generation, is just as legitimate.
     first.append(&message(3, "three")).unwrap();
-    assert_eq!(first.take_integrity_finding(), None);
+    assert_eq!(first.acknowledge_integrity_warning(), None);
     History::delete_time_range(&identity, &peer, 1, 1).unwrap();
     first.append(&message(4, "four")).unwrap();
-    assert_eq!(first.take_integrity_finding(), None);
+    assert_eq!(first.acknowledge_integrity_warning(), None);
     drop((first, second));
     assert_eq!(warning_on_open(&identity, &peer), None);
 }

@@ -879,8 +879,6 @@ impl History {
         }
         let file_version = history_file_version(&file)?;
         register_conversation(identity, &identity_id, &peer_id, &directory)?;
-        unlock_conversation_file(file_lock);
-        drop(operation_guard);
         let mut history = Self {
             file,
             path,
@@ -892,9 +890,13 @@ impl History {
             format,
             integrity_warning: None,
             anchor_suspect: false,
-            operation_lock,
+            operation_lock: Arc::clone(&operation_lock),
         };
+        // Compared while the log is still locked: an append by another handle after the
+        // unlock would otherwise look like a log shorter than its anchor.
         history.guard_anchor(&format, next_index);
+        unlock_conversation_file(file_lock);
+        drop(operation_guard);
         Ok(history)
     }
 
@@ -1002,11 +1004,13 @@ impl History {
         }
     }
 
-    /// Compares the log that was just opened with the recorded state, remembers any
-    /// finding, and records the log's state from now on.
+    /// Compares the log that was just opened with the recorded state. Without a finding
+    /// the log's state is recorded from now on. With one, the anchor is left as it was
+    /// until a caller has shown the finding to the user (`acknowledge_integrity_warning`),
+    /// so opening the log somewhere that does not show warnings cannot erase it.
     pub(crate) fn check_anchor(&mut self) {
         self.integrity_warning = self.anchor_finding(&self.format, self.next_index);
-        self.anchor_suspect = false;
+        self.anchor_suspect = self.integrity_warning.is_some();
         self.record_anchor();
     }
 
@@ -1021,16 +1025,19 @@ impl History {
         }
     }
 
-    /// A finding made after the conversation was opened, once. `integrity_warning` keeps
-    /// the open-time finding for the caller that reads it right after opening.
-    pub(crate) fn take_integrity_finding(&mut self) -> Option<IntegrityWarning> {
+    /// Hands over the finding, if any, for the caller to show to the user, and only then
+    /// brings the anchor in line with the log. Each finding is therefore reported once,
+    /// by whoever displays it, and never lost to a caller that does not.
+    pub(crate) fn acknowledge_integrity_warning(&mut self) -> Option<IntegrityWarning> {
+        let warning = self.integrity_warning.take();
         if self.anchor_suspect {
-            self.integrity_warning.take()
-        } else {
-            None
+            self.anchor_suspect = false;
+            self.record_anchor();
         }
+        warning
     }
 
+    #[cfg(test)]
     pub(crate) fn integrity_warning(&self) -> Option<IntegrityWarning> {
         self.integrity_warning
     }

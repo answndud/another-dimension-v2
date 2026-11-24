@@ -551,16 +551,27 @@ pub(crate) fn spawn_chat_worker(
                 session
             };
             let (history, entries, message_count, storage_error, pending_previous_ids) = match history::History::open_for_chat(&identity, &peer_id) {
-                Ok((history, message_count, recovered_partial)) => {
+                Ok((mut history, message_count, recovered_partial)) => {
                     let (pending, link_error) = match history::pending_local_identity_links(&identity, &peer_id, &previous_identity_ids) {
                         Ok(pending) => (pending, None),
                         Err(error) => (previous_identity_ids.clone(), Some(format!("이전 신원 연결 정보를 읽지 못했습니다. 재확인이 필요합니다: {error}"))),
                     };
                     let entries = Vec::new();
-                    let warning = link_error
-                        .or_else(|| history.integrity_warning().map(history_integrity_message))
-                        .or_else(|| recovered_partial
-                            .then(|| "대화 기록의 마지막 불완전 항목을 제거했습니다.".to_owned()));
+                    // The integrity finding is shown alongside any other notice: taking it
+                    // here is what lets the anchor move on, so it must not be dropped.
+                    let integrity = history
+                        .acknowledge_integrity_warning()
+                        .map(history_integrity_message);
+                    let notices: Vec<String> = [
+                        link_error,
+                        integrity,
+                        recovered_partial
+                            .then(|| "대화 기록의 마지막 불완전 항목을 제거했습니다.".to_owned()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    let warning = (!notices.is_empty()).then(|| notices.join(" "));
                     (Some(history), entries, message_count, warning, pending)
                 }
                 Err(_) => (None, Vec::new(), 0, Some("대화 기록을 열지 못했습니다. 이번 대화는 프로그램을 종료하면 사라질 수 있습니다.".to_owned()), previous_identity_ids.clone()),
@@ -759,12 +770,6 @@ pub(crate) fn spawn_chat_worker(
                                     history = None;
                                 }
                                 chat_update(&operation, |snapshot| {
-                                    if let Some(note) = &integrity_note {
-                                        snapshot.storage_error = Some(append_error_detail(
-                                            snapshot.storage_error.take(),
-                                            note,
-                                        ));
-                                    }
                                     snapshot.message_count =
                                         snapshot.message_count.saturating_add(1);
                                     snapshot.messages.push(ChatEntry {
@@ -776,6 +781,13 @@ pub(crate) fn spawn_chat_worker(
                                     snapshot.pending_sends = pending_events.len();
                                     if save_error.is_some() {
                                         snapshot.storage_error = Some("대화 기록을 저장하지 못했습니다. 프로그램을 종료하면 이 메시지를 잃을 수 있습니다.".to_owned());
+                                    }
+                                    // After the save error, which replaces the text.
+                                    if let Some(note) = &integrity_note {
+                                        snapshot.storage_error = Some(append_error_detail(
+                                            snapshot.storage_error.take(),
+                                            note,
+                                        ));
                                     }
                                 });
                                 let _ = processed.send(Ok(()));
@@ -1123,17 +1135,18 @@ pub(crate) fn spawn_chat_worker(
                                 history = None;
                             }
                             chat_update(&operation, |snapshot| {
-                                if let Some(note) = &integrity_note {
-                                    snapshot.storage_error = Some(append_error_detail(
-                                        snapshot.storage_error.take(),
-                                        note,
-                                    ));
-                                }
                                 snapshot.message_count = snapshot.message_count.saturating_add(1);
                                 snapshot.messages.push(chat_entry(entry));
                                 if save_error.is_some() {
                                     snapshot.storage_error =
                                         Some("메시지를 기록에 저장하지 못했습니다.".to_owned());
+                                }
+                                // After the save error, which replaces the text.
+                                if let Some(note) = &integrity_note {
+                                    snapshot.storage_error = Some(append_error_detail(
+                                        snapshot.storage_error.take(),
+                                        note,
+                                    ));
                                 }
                             });
                             continue;
@@ -2003,7 +2016,7 @@ pub(crate) fn append_and_check(
         Some(history) => {
             let error = history.append(entry).err();
             let note = history
-                .take_integrity_finding()
+                .acknowledge_integrity_warning()
                 .map(history_integrity_message);
             (error, note)
         }
