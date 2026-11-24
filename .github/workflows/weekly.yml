@@ -18,14 +18,15 @@ jobs:
     name: Dependency advisories
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: read
-      checks: write
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@1.96.0
+      # Plain cargo audit fails on a vulnerability and only prints unsound or
+      # unmaintained warnings. The audit-check action tried to open an issue
+      # for those on scheduled runs, which needs a write token this job does
+      # not get.
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
 
   stress:
     name: Slow stress tests
