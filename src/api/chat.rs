@@ -310,12 +310,18 @@ pub(crate) fn chat_link_identity(
         return reject(stream, "400 Bad Request");
     }
     let previous_peer_id = previous_peer_id.to_ascii_lowercase();
-    if peer_chat_active(&state, &previous_peer_id) {
+    let identity = state.identity.as_ref().cloned();
+    // Linking copies the previous conversation and then deletes it. A chat with that
+    // peer or a deletion of its history must not be running, and the state stays locked
+    // until the worker answers so that neither can start meanwhile, nor a second link.
+    // This is the one wait on the worker that keeps the lock (see SF-022).
+    if peer_chat_active(&state, &previous_peer_id)
+        || identity.as_ref().is_some_and(|identity| {
+            history_delete_active(&state, &identity.public_id(), &previous_peer_id)
+        })
+    {
         return reject(stream, "409 Conflict");
     }
-    let identity = state.identity.as_ref().cloned();
-    // The disk reads and the wait for the worker below must not hold the state.
-    drop(state);
     let Ok(snapshot) = operation.snapshot.lock() else {
         return reject(stream, "503 Service Unavailable");
     };

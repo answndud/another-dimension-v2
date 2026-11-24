@@ -1915,6 +1915,42 @@ fn logging_out_forgets_the_plaintext_of_finished_chats_but_not_running_ones() {
 }
 
 #[test]
+fn an_identity_link_waits_for_no_deletion_of_the_previous_conversation() {
+    // Linking copies the previous conversation and deletes it, so it must not run while
+    // that conversation's history is being deleted.
+    let _data = TestDataDirectory::new();
+    let (identity, _) = Identity::create().unwrap();
+    let owner = identity.public_id().to_owned();
+    let previous = "7f".repeat(32);
+    contacts::save(
+        &contacts::directory_for(&identity).unwrap(),
+        &identity,
+        &contacts::VerifiedContact {
+            peer_key: history::decode_peer_id(&previous).unwrap(),
+            rendezvous_secret: zeroize::Zeroizing::new([3; 32]),
+        },
+    )
+    .unwrap();
+    let (operation, receiver) = stalled_worker_operation(&owner, &"80".repeat(32));
+    operation.snapshot.lock().unwrap().identity_transition = Some(vec![previous.clone()]);
+    let mut chats = HashMap::new();
+    chats.insert("linking".to_owned(), operation);
+    let state = test_state(Some(Arc::new(identity)), chats);
+    state
+        .lock()
+        .unwrap()
+        .active_history_deletions
+        .insert(conversation_history_key(&owner, &previous));
+    let body = format!("linking\n{previous}");
+    let refused = call_test_api(&state, "/api/chat/link-identity", &body, "test-session");
+    assert!(refused.starts_with("HTTP/1.1 409 Conflict"), "{refused}");
+    assert!(
+        receiver.try_recv().is_err(),
+        "the worker was not asked to link"
+    );
+}
+
+#[test]
 fn chat_operation_apis_are_scoped_to_the_creating_identity() {
     let (identity_a, _) = Identity::create().unwrap();
     let owner_id = identity_a.public_id().to_owned();
