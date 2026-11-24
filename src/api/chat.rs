@@ -117,6 +117,9 @@ pub(crate) fn chat_start(
     } else {
         RoleForChat::Join
     });
+    // Ended chats are dropped when a new one starts as well as at logout, so their
+    // plaintext does not pile up over a long run.
+    forget_finished_chats(&mut state);
     state
         .chats
         .insert(operation_id.clone(), Arc::clone(&operation));

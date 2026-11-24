@@ -507,6 +507,11 @@ pub(crate) fn history_backup_transfer(
             )
         }
         "cleanup" => {
+            // Removing the file an import is reading would make the import report a
+            // failed cleanup after it succeeded.
+            if state.history_import_active {
+                return reject(stream, "409 Conflict");
+            }
             let Some(id) = fields
                 .remove("transferId")
                 .and_then(|v| v.as_str().map(str::to_owned))

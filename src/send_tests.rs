@@ -1881,6 +1881,14 @@ fn a_chunk_cannot_be_appended_to_an_upload_while_an_import_is_running() {
         "test-session",
     );
     assert!(during.starts_with("HTTP/1.1 409 Conflict"), "{during}");
+    let cleanup = serde_json::json!({"action": "cleanup", "transferId": id}).to_string();
+    let removed = call_test_api(
+        &state,
+        "/api/history/backup-transfer",
+        &cleanup,
+        "test-session",
+    );
+    assert!(removed.starts_with("HTTP/1.1 409 Conflict"), "{removed}");
     state.lock().unwrap().history_import_active = false;
     let after = call_test_api(
         &state,
@@ -1900,9 +1908,13 @@ fn logging_out_forgets_the_plaintext_of_finished_chats_but_not_running_ones() {
     let owner = identity.public_id().to_owned();
     let finished = closed_test_operation(&owner, &"7d".repeat(32), 1, 0);
     let (running, _receiver) = stalled_worker_operation(&owner, &"7e".repeat(32));
+    // Closed, but its merge thread is still writing the conversation.
+    let merging = closed_test_operation(&owner, &"81".repeat(32), 1, 0);
+    merging.snapshot.lock().unwrap().history_restore_state = "merging";
     let mut chats = HashMap::new();
     chats.insert("finished".to_owned(), finished);
     chats.insert("running".to_owned(), running);
+    chats.insert("merging".to_owned(), merging);
     let state = test_state(Some(Arc::new(identity)), chats);
     let response = call_test_api(&state, "/api/identity/logout", "", "test-session");
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
@@ -1911,6 +1923,10 @@ fn logging_out_forgets_the_plaintext_of_finished_chats_but_not_running_ones() {
     assert!(
         state.chats.contains_key("running"),
         "a chat that is still running must stay reachable for its cancellation"
+    );
+    assert!(
+        state.chats.contains_key("merging"),
+        "a merge still running keeps its chat, which blocks conflicting imports"
     );
 }
 

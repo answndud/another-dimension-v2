@@ -1265,10 +1265,16 @@ impl RelayRendezvous {
         if frame.is_empty() || frame.len() > MAX_BOOTSTRAP_FRAME {
             return Err(RelayError::InvalidEvent);
         }
+        self.publish_content(crate::hex::encode(frame))
+    }
+
+    /// Publishes an event with the given content. Only `publish_frame` (and tests that
+    /// need malformed content) call it.
+    fn publish_content(&mut self, content: String) -> Result<(), RelayError> {
         let role = role_tag(self.role);
         // The time is stamped here, from the same clock the receiver's freshness check
         // uses, so the two cannot drift apart or depend on a library default.
-        let event = EventBuilder::new(Kind::Custom(EVENT_KIND), crate::hex::encode(frame))
+        let event = EventBuilder::new(Kind::Custom(EVENT_KIND), content)
             .custom_created_at(Timestamp::from_secs((self.clock)()))
             .tag(Tag::custom("t", [self.listen[self.publish].0.as_str()]))
             .tag(Tag::custom("r", [role]))
@@ -1408,9 +1414,14 @@ impl RelayRendezvous {
                                 self.seen.remove(&oldest);
                             }
                         }
-                        let frame = decode_hex(&event.content).ok_or(RelayError::InvalidEvent)?;
+                        // A malformed frame is dropped like any other unusable event:
+                        // anyone holding the invite key could otherwise send one to end
+                        // the rendezvous.
+                        let Some(frame) = decode_hex(&event.content) else {
+                            return Ok(None);
+                        };
                         if frame.is_empty() || frame.len() > MAX_BOOTSTRAP_FRAME {
-                            return Err(RelayError::InvalidEvent);
+                            return Ok(None);
                         }
                         Ok(Some(frame))
                     }
@@ -3206,6 +3217,17 @@ mod tests {
             .seen_order
             .iter()
             .all(|id| receiver.seen.contains(id)));
+    }
+
+    #[test]
+    fn a_malformed_frame_from_the_topic_is_dropped_not_fatal() {
+        let (mut sender, mut receiver) = rendezvous_pair(&reconnect_invite(), now, now);
+        sender.publish_content("not hex".to_owned()).unwrap();
+        sender
+            .publish_content("ab".repeat(super::MAX_BOOTSTRAP_FRAME + 1))
+            .unwrap();
+        sender.publish_frame(b"valid").unwrap();
+        assert_eq!(receiver.receive_frame("test").unwrap(), b"valid");
     }
 
     #[test]

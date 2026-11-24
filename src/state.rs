@@ -42,7 +42,9 @@ pub(crate) fn peer_chat_active(state: &State, peer_id: &str) -> bool {
 pub(crate) fn forget_finished_chats(state: &mut State) {
     state.chats.retain(|_, operation| {
         operation.snapshot.lock().map_or(true, |snapshot| {
+            // A merge thread keeps writing after its chat has closed.
             !matches!(snapshot.phase, "closed" | "failed" | "disconnected")
+                || matches!(snapshot.history_restore_state, "merge-queued" | "merging")
         })
     });
 }
