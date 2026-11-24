@@ -1037,11 +1037,6 @@ impl History {
         warning
     }
 
-    #[cfg(test)]
-    pub(crate) fn integrity_warning(&self) -> Option<IntegrityWarning> {
-        self.integrity_warning
-    }
-
     pub fn append(&mut self, message: &StoredMessage) -> io::Result<()> {
         let operation_lock = Arc::clone(&self.operation_lock);
         let _operation_guard = operation_lock
